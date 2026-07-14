@@ -1,0 +1,31 @@
+{
+ "threshold": 0.14334476166424515,
+ "features": [
+  "rsi14",
+  "pctB",
+  "bw",
+  "ext",
+  "adx14",
+  "atr_norm",
+  "body",
+  "up_wick",
+  "dn_wick",
+  "bull",
+  "dist_hi20",
+  "dist_lo20",
+  "bars_since_flip",
+  "ret5_atr",
+  "d1_state",
+  "d1_rsi",
+  "d1_aligned",
+  "hour",
+  "dow",
+  "dir_b",
+  "sym_c"
+ ],
+ "select_q": 0.95,
+ "n_train": 317134,
+ "threshold_method": "oos-walk-forward-5y",
+ "bars_since_flip_clip": 300,
+ "runtime": "onnx-float32"
+}
