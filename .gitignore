@@ -1,0 +1,23 @@
+# --- SECRETS : ne JAMAIS pousser ---
+.env
+
+# --- donnees lourdes / caches / artefacts locaux ---
+*.parquet
+*.npy
+v4_macro/data/
+v4_macro/cache/
+v4_macro/history/
+v3_outcome/raw_dataset/
+__pycache__/
+*.log
+*.tmp
+
+# --- projets de recherche non necessaires au VPS ---
+MIKAEL_IA/
+v2_imitation/
+v3_outcome/*
+!v3_outcome/ExportCalendar.mq5
+
+# --- divers ---
+.claude/
+*.csv

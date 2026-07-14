@@ -1,0 +1,25 @@
+{
+  "features": [
+    "rsi",
+    "atrn",
+    "trend200",
+    "emax",
+    "hour",
+    "dow",
+    "sym_c",
+    "cal_s24",
+    "cal_s72",
+    "fred_dgs2",
+    "fred_curve"
+  ],
+  "formulation": "regression label -1/0/+1",
+  "threshold_abs_score": 0.3601,
+  "score": "long si >0 ; trade si |score|>=threshold",
+  "train": "2015-2025 (holdout 2026 exclu)",
+  "validation_2024_25": {
+    "N": 921,
+    "R_net": -0.0383,
+    "spearman": 0.0515
+  },
+  "verdict": "NO-GO backtest \u2014 FORWARD DEMO UNIQUEMENT, jamais compte reel"
+}
