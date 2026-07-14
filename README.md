@@ -33,13 +33,18 @@ compte réel sans GO documenté** (voir `v4_macro/CRITERES_GO.md`).
    (1 run/heure ; alimente `macro_features.csv` + l'historique forward).
    Le .bat se relance seul si Python crashe (`service_restarts.log`).
 
-   **Démarrage automatique au boot du VPS** (PowerShell administrateur,
-   adapter le chemin) :
+   **Mode VPS RECOMMANDE — le Planificateur fait tout** : au lieu du .bat en
+   boucle (processus permanent = point de defaillance), programmer un run
+   UNIQUE par heure via `run_once.bat`. Meme si un run plante, le suivant
+   part quand meme : l'OS est le watchdog, les donnees restent fraiches en
+   continu et la limite des 12 h ne peut plus etre atteinte que si le VPS
+   lui-meme est mort (PowerShell administrateur, adapter le chemin) :
    ```
-   schtasks /Create /TN "MikaelX_MacroService" /SC ONLOGON ^
-     /TR "C:\chemin\vers\Mikael-X\v4_macro\start_service.bat" /RL LIMITED /F
+   schtasks /Create /TN "MikaelX_MacroHourly" /SC HOURLY ^
+     /TR "C:\chemin\vers\Mikael-X\v4_macro\run_once.bat" /RL LIMITED /F
    ```
-   Et activer la reconnexion/logon automatique du VPS pour que la session
+   (Alternative : `start_service.bat` en boucle, a lancer au logon.)
+   Activer la reconnexion/logon automatique du VPS pour que la session
    s'ouvre au redemarrage (MT5 en a besoin de toute facon).
 
    **Chaine de robustesse** : run horaire -> fraicheur max 12 h
