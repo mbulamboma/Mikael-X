@@ -31,6 +31,23 @@ compte réel sans GO documenté** (voir `v4_macro/CRITERES_GO.md`).
    `MQL5\Files\calendar_history.csv`. À refaire ~1×/semaine.
 7. **Service data** : lancer `v4_macro/start_service.bat` et le laisser ouvert
    (1 run/heure ; alimente `macro_features.csv` + l'historique forward).
+   Le .bat se relance seul si Python crashe (`service_restarts.log`).
+
+   **Démarrage automatique au boot du VPS** (PowerShell administrateur,
+   adapter le chemin) :
+   ```
+   schtasks /Create /TN "MikaelX_MacroService" /SC ONLOGON ^
+     /TR "C:\chemin\vers\Mikael-X\v4_macro\start_service.bat" /RL LIMITED /F
+   ```
+   Et activer la reconnexion/logon automatique du VPS pour que la session
+   s'ouvre au redemarrage (MT5 en a besoin de toute facon).
+
+   **Chaine de robustesse** : run horaire -> fraicheur max 12 h
+   (`InpMacroMaxAgeH`) = 11 runs de marge avant que MIKAEL_MACRO ne se mette
+   en securite ; GDELT en panne -> reprise des derniers scores (<24 h) ;
+   FRED/calendrier en panne -> valeurs precedentes conservees dans le CSV.
+   Si le VPS peut rester eteint plus de 12 h, augmenter `InpMacroMaxAgeH`
+   (au prix de features plus rassises pour le modele).
 
 ## Lancement du forward-test (3 instances, magics distincts)
 
