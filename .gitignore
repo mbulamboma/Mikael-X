@@ -21,3 +21,4 @@ v3_outcome/*
 # --- divers ---
 .claude/
 *.csv
+.ipynb_checkpoints/

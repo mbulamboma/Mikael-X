@@ -38,10 +38,16 @@ compte réel sans GO documenté** (voir `v4_macro/CRITERES_GO.md`).
    UNIQUE par heure via `run_once.bat`. Meme si un run plante, le suivant
    part quand meme : l'OS est le watchdog, les donnees restent fraiches en
    continu et la limite des 12 h ne peut plus etre atteinte que si le VPS
-   lui-meme est mort (PowerShell administrateur, adapter le chemin) :
+   lui-meme est mort. Commande TESTEE (invite de commandes ou PowerShell,
+   droits utilisateur suffisants — adapter le chemin) :
    ```
-   schtasks /Create /TN "MikaelX_MacroHourly" /SC HOURLY ^
-     /TR "C:\chemin\vers\Mikael-X\v4_macro\run_once.bat" /RL LIMITED /F
+   schtasks /create /tn "MikaelX_MacroService_Hourly" /sc hourly /mo 1 /f ^
+     /tr "C:\chemin\vers\Mikael-X\v4_macro\run_once.bat"
+   ```
+   Verifier puis declencher un run test :
+   ```
+   schtasks /query /tn "MikaelX_MacroService_Hourly" /v /fo list
+   schtasks /run   /tn "MikaelX_MacroService_Hourly"
    ```
    (Alternative : `start_service.bat` en boucle, a lancer au logon.)
    Activer la reconnexion/logon automatique du VPS pour que la session
@@ -65,6 +71,38 @@ compte réel sans GO documenté** (voir `v4_macro/CRITERES_GO.md`).
 Vérifier dans l'onglet **Experts** la ligne `init OK` de chaque instance
 (paires (8), sent_filter/veto ON, risk %). Puis **ne plus rien toucher** :
 règles et durée dans `v4_macro/CRITERES_GO.md`.
+
+## Vérification post-déploiement (5 min, dans l'ordre)
+
+1. **Service data** : `MQL5\Files\macro_features.csv` existe, en-tête =
+   `ccy;sent24;sent72;sentmom;cnt24;surprise24;surprise72;fredmom;curvemom;updated_utc`
+   (**10 colonnes**) et `updated_utc` < 1 h. 8 devises attendues (EUR USD JPY GBP AUD NZD CAD CHF).
+2. **Tâche planifiée** : `schtasks /query /tn "MikaelX_MacroService_Hourly"`
+   → Statut `Prêt`, prochaine exécution dans l'heure. Un `service_runs.log`
+   apparaît dans `v4_macro/` après le premier run planifié.
+3. **EA** : onglet Experts → ligne `init OK` de chaque instance, puis AUCUNE
+   ligne `[MACRO] macro_features.csv absent/perime/ancien format`.
+4. **Journaux** : `MQL5\Files\MIKAEL_MACRO_journal.csv` s'alimente à chaque
+   bougie H4 (signal ou raison de skip).
+
+## Dépannage (pannes réellement rencontrées)
+
+| Symptôme | Cause | Remède |
+|---|---|---|
+| `[MACRO] ... ancien format — AUCUN trade` alors que le CSV est frais | Le service tournait avec un **code périmé chargé en mémoire** (Python ne recharge pas un script modifié) → CSV 8 colonnes | Tuer/relancer le service après CHAQUE mise à jour de `macro_service.py` (le mode Planificateur est immunisé : chaque run recharge le code) |
+| `CUDA failure 801 ... GPU=-1` en boucle dans les logs | Le runtime ONNX de MT5 sonde un GPU NVIDIA absent | **Bénin** — la ligne suivante `ONNX: CPU selected` confirme le repli CPU. Ignorer |
+| EA muet, log `== OBJECTIF DE PROFIT ATTEINT ==` inattendu | `InpInitialBalance` ≠ taille réelle du compte (ex. 10000 sur un compte 100k → cible +10 % « déjà atteinte ») | Mettre `InpInitialBalance` = solde initial réel du compte attaché |
+| `ExportCalendar` : CSV vide, `err 5401` | Base calendrier MT5 pas encore synchronisée (timeout) | Ouvrir l'onglet Boîte à outils → Calendrier, puis relancer le script (v2 : tranches annuelles + retries) |
+| `copy_rates_range` renvoie vide sur une grande plage | Téléchargement asynchrone de l'historique au 1er appel | Réessayer (les scripts font des tranches annuelles + retry) |
+
+## Ressources
+
+- **Clé FRED** (gratuite, requise) : https://fred.stlouisfed.org/docs/api/api_key.html
+- **Python 3.12+ Windows** : https://www.python.org/downloads/windows/
+- **MT5 FTMO** : espace client FTMO → Téléchargements (installer sur le VPS, compte DÉMO)
+- **Package `MetaTrader5`** (inclus dans `requirements.txt`) : nécessite le terminal MT5 **installé et lancé** sur la même machine
+- **FinBERT** (téléchargé automatiquement au 1er run, ~440 Mo) : cache dans `%USERPROFILE%\.cache\huggingface`
+- **Règles FTMO** (daily loss / max loss / Swing) : https://ftmo.com/en/trading-objectives/
 
 ## Garde-fous intégrés
 
