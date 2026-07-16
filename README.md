@@ -82,8 +82,11 @@ règles et durée dans `v4_macro/CRITERES_GO.md`.
    apparaît dans `v4_macro/` après le premier run planifié.
 3. **EA** : onglet Experts → ligne `init OK` de chaque instance, puis AUCUNE
    ligne `[MACRO] macro_features.csv absent/perime/ancien format`.
-4. **Journaux** : `MQL5\Files\MIKAEL_MACRO_journal.csv` s'alimente à chaque
-   bougie H4 (signal ou raison de skip).
+4. **Journaux** : un fichier PAR instance, suffixé par le magic —
+   `MQL5\Files\MIKAEL_DONCHIAN_journal_20260713.csv` (Donchian),
+   `..._20260715.csv` (Scalp), `MIKAEL_MACRO_journal_20260714.csv` (Macro) —
+   s'alimentent à chaque bougie (signal ou raison de skip). `InpInitialBalance`
+   par défaut = **100000** : l'ajuster si la taille du compte diffère.
 
 ## Dépannage (pannes réellement rencontrées)
 

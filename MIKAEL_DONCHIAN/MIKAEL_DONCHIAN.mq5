@@ -46,7 +46,7 @@
 //|  sur compte FINANCE, re-attacher MIKAEL_IA ou ajouter le module) |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "1.14"
+#property version   "1.15"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -103,7 +103,7 @@ input int    InpCooldownHours  = 0;        // pause par paire apres une perte (0
 input int    InpDayResetOffsetH= -1;       // -1 = AUTO (minuit CE(S)T) ; >=0 = decalage manuel serveur->FTMO
 input double InpMaxDriftSL     = 0.25;     // abandon d'un signal differe si derive prix > x*SL
 input double InpMinLotRiskMult = 2.0;      // skip si le lot min risque > mult x risque cible
-input double InpInitialBalance = 10000;    // solde initial FTMO : ref STATIQUE Max Loss + target ; 0 = repli peak
+input double InpInitialBalance = 100000;   // solde initial FTMO : ref STATIQUE Max Loss + target ; 0 = repli peak — DOIT = taille reelle du compte
 input double InpTargetPct      = 0.10;     // objectif de profit : stoppe les entrees une fois atteint
 input bool   InpDryRun         = false;    // false = ordres reels (forward-test DEMO). ⚠️ verifier que le compte connecte est bien un DEMO
 input string InpSymbols        = "EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,EURJPY,GBPJPY,AUDJPY"; // les 8 majeures du plan forward
@@ -674,7 +674,10 @@ int OnInit()
       }
    }
 
-   g_fileLog=FileOpen("MIKAEL_DONCHIAN_journal.csv",FILE_READ|FILE_WRITE|FILE_SHARE_READ|FILE_TXT|FILE_ANSI);
+   // journal PAR INSTANCE (suffixe magic) : deux strategies Donchian/Scalp qui
+   // partagent le meme fichier -> la 2e echoue en err 5004
+   g_fileLog=FileOpen("MIKAEL_DONCHIAN_journal_"+IntegerToString(InpMagic)+".csv",
+                      FILE_READ|FILE_WRITE|FILE_SHARE_READ|FILE_TXT|FILE_ANSI);
    if(g_fileLog==INVALID_HANDLE)
       Print("!! journal CSV indisponible (err ",GetLastError(),") — l'EA continue sans log fichier");
    else if(FileSize(g_fileLog)==0)

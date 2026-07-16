@@ -102,7 +102,7 @@
 //|  - garde-fou lot minimum (refuse de sur-risquer un petit compte) |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.12"
+#property version   "2.13"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -139,7 +139,7 @@ input int    InpCooldownHours  = 8;        // pause par paire apres une perte (0
 input int    InpDayResetOffsetH= -1;       // -1 = AUTO (minuit CE(S)T via GMT + DST europeen) ; >=0 = decalage manuel serveur->FTMO
 input double InpMaxDriftSL     = 0.25;     // abandon d'un signal differe si derive prix > x*SL
 input double InpMinLotRiskMult = 2.0;      // skip si le lot min risque > mult x risque cible
-input double InpInitialBalance = 10000;    // solde initial FTMO : ref STATIQUE Max Loss + target ; 0 = repli peak glissant
+input double InpInitialBalance = 100000;   // solde initial FTMO : ref STATIQUE Max Loss + target ; 0 = repli peak glissant — DOIT = taille reelle du compte
 input double InpTargetPct      = 0.10;     // objectif de profit : stoppe les entrees une fois atteint
 input bool   InpEnsureDayTrade = false;    // false=CHALLENGE/VERIF (jours mini supprimes) ; true=COMPTE FINANCE (anti-inactivite)
 input int    InpDayTradeHour   = 20;       // heure serveur du micro-lot de validation
@@ -892,7 +892,9 @@ int OnInit()
       }
    }
 
-   g_fileLog=FileOpen("MIKAEL_MACRO_journal.csv",FILE_READ|FILE_WRITE|FILE_SHARE_READ|FILE_TXT|FILE_ANSI);
+   // journal PAR INSTANCE (suffixe magic) — coherence avec MIKAEL_DONCHIAN
+   g_fileLog=FileOpen("MIKAEL_MACRO_journal_"+IntegerToString(InpMagic)+".csv",
+                      FILE_READ|FILE_WRITE|FILE_SHARE_READ|FILE_TXT|FILE_ANSI);
    if(g_fileLog==INVALID_HANDLE)
       Print("!! journal CSV indisponible (err ",GetLastError(),") — l'EA continue sans log fichier");
    else if(FileSize(g_fileLog)==0)
