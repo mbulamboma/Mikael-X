@@ -655,7 +655,7 @@ bool IsEuDst(const datetime gmt)
 datetime FtmoTime()
 {
    if(InpDayResetOffsetH>=0)
-      return TimeCurrent()-(long)InpDayResetOffsetH*3600;   // mode manuel
+      return (datetime)(TimeCurrent()-(long)InpDayResetOffsetH*3600);   // mode manuel
    datetime gmt=TimeGMT();
    return gmt+(IsEuDst(gmt)?2:1)*3600;                      // CE(S)T auto
 }
