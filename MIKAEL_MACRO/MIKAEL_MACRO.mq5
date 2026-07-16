@@ -102,7 +102,7 @@
 //|  - garde-fou lot minimum (refuse de sur-risquer un petit compte) |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.11"
+#property version   "2.12"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -164,7 +164,11 @@ int     g_nsym = 0;     // = ArraySize(SYMBOLS) apres parsing
 // index dans SYMBOLS[] (ordre de declaration, PAS l'ordre trie de sym_c)
 int SymIndex(const string s)
 {
-   for(int i=0;i<g_nsym;i++) if(SYMBOLS[i]==s) return i;
+   // g_nsym peut etre momentanement > ArraySize(SYMBOLS) lors d'un re-init
+   // (changement de TF/inputs : OnInit re-tourne avec les globales conservees)
+   // -> borne defensive, sinon array out of range et l'EA est retire du chart
+   int n=MathMin(g_nsym,ArraySize(SYMBOLS));
+   for(int i=0;i<n;i++) if(SYMBOLS[i]==s) return i;
    return -1;
 }
 int SymCode(const string s)
@@ -183,6 +187,7 @@ int SymCode(const string s)
 int ParseSymbols(const string csv)
 {
    ArrayResize(SYMBOLS,0);
+   g_nsym=0;                 // sync IMMEDIATE avec le tableau vide (anti-crash re-init)
    string parts[];
    int n=StringSplit(csv,',',parts);
    for(int i=0;i<n;i++){
