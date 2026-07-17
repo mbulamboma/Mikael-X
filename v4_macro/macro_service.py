@@ -29,9 +29,29 @@ from dotenv import load_dotenv
 
 ROOT      = Path(__file__).resolve().parent
 TRADING   = ROOT.parent
-TERM_FILES= Path(os.environ.get("MT5_FILES",
-            r"C:\Users\mbula\AppData\Roaming\MetaQuotes\Terminal"
-            r"\D0E8209F77C8CF37AD8BF550E51FF075\MQL5\Files"))
+
+def _resolve_mt5_files():
+    """Dossier MQL5\\Files du terminal MT5.
+    1) $MT5_FILES si defini et existant.
+    2) sinon on scanne %APPDATA%\\MetaQuotes\\Terminal\\<id>\\MQL5\\Files :
+       on prefere le terminal qui contient deja des fichiers MIKAEL_* (le live),
+       sinon le plus recemment modifie. Rend le service portable (VPS = autre id
+       que la machine de dev) et evite l'erreur 'non-existent directory'."""
+    env = os.environ.get("MT5_FILES", "").strip()
+    if env and Path(env).is_dir():
+        return Path(env)
+    base = Path(os.environ.get("APPDATA", r"C:\Users\%s\AppData\Roaming"
+                               % os.environ.get("USERNAME", ""))) / "MetaQuotes" / "Terminal"
+    cands = [p for p in base.glob("*/MQL5/Files") if p.is_dir()] if base.is_dir() else []
+    if not cands:
+        raise RuntimeError("Aucun dossier MT5 MQL5\\Files trouve sous %s "
+                           "-- definir MT5_FILES." % base)
+    def score(p):
+        has_mikael = any(p.glob("MIKAEL_*"))
+        return (has_mikael, p.stat().st_mtime)
+    return max(cands, key=score)
+
+TERM_FILES= _resolve_mt5_files()
 OUT_CSV   = TERM_FILES / "macro_features.csv"
 HIST_DIR  = ROOT / "history";  HIST_DIR.mkdir(exist_ok=True)
 CACHE_DIR = ROOT / "cache";    CACHE_DIR.mkdir(exist_ok=True)
