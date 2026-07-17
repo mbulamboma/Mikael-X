@@ -45,8 +45,17 @@
 //|  NOTE : pas de module day-ticket (FTMO a supprime les jours mini;|
 //|  sur compte FINANCE, re-attacher MIKAEL_IA ou ajouter le module) |
 //+------------------------------------------------------------------+
+//| v2.00 : 3e moteur STRAT_CANDLE (patterns de bougies : englobante |
+//|  + pin bar, filtres tendance communs) + MARTINGALE PLAFONNEE     |
+//|  (multiplicateur par serie de pertes PAR PAIRE, plafond en pas   |
+//|  ET en % du capital, bride par le budget journalier prospectif   |
+//|  FTMO deja en place) + BREAKEVEN & TRAILING STOP ATR (une fois   |
+//|  le trade en profit, le SL suit — un gain ne redevient pas une   |
+//|  perte). Instance recommandee : magic 20260720 (JAMAIS un magic  |
+//|  adjacent a un autre EA : le day-ticket d'IA/MACRO vise magic+1).|
+//+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "1.15"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -63,7 +72,8 @@ enum ENUM_SL_MODE
 enum ENUM_STRATEGY
 {
    STRAT_DONCHIAN=0,  // Turtle : cassure de canal (defaut, tendance)
-   STRAT_SCALP=1      // Scalp : pullback sur EMA rapide dans le sens de la tendance
+   STRAT_SCALP=1,     // Scalp : pullback sur EMA rapide dans le sens de la tendance
+   STRAT_CANDLE=2     // Bougies : englobante / pin bar + martingale plafonnee + trailing
 };
 
 //--- INPUTS strategie
@@ -89,6 +99,24 @@ input int    InpScalpEMAslow  = 21;        // EMA lente (biais court terme)
 input double InpScalpSLATR    = 1.2;       // SL = mult x ATR14 (stop serre = scalp)
 input double InpScalpRR        = 0.0;      // 0 = PAS de TP (sortie au flip du biais EMA8/21 — regle CTA : la queue droite reste libre) ; >0 : TP = RR x SL
 input int    InpScalpRSIfloor = 45;        // long: RSI>=floor ; short: RSI<=100-floor (momentum, evite les rebonds morts). 0=off
+//--- PARAMETRES CANDLE (utilises seulement si InpStrategy=STRAT_CANDLE)
+input bool   InpCdlEngulfing  = true;      // pattern englobante (bull/bear engulfing)
+input bool   InpCdlPinbar     = true;      // pattern pin bar (marteau / etoile filante)
+input double InpCdlBodyATRmin = 0.25;      // corps minimal du signal en xATR (anti-doji/bruit)
+input double InpCdlSLBufATR   = 0.10;      // marge du SL au-dela de l'extreme du pattern (xATR)
+input double InpCdlSLATRFloor = 0.80;      // plancher du SL en xATR (anti-lot-enorme, meme esprit que 0.5xATR Donchian)
+input double InpCdlRR         = 1.5;       // TP = RR x SL. >=1 REQUIS pour que la martingale recupere les pertes
+//--- MARTINGALE PLAFONNEE (record de pertes PAR PAIRE ; 1 seule position/paire)
+input bool   InpMartEnable    = true;      // x le risque apres chaque perte, reset au 1er gain/BE
+input double InpMartMult      = 2.0;       // multiplicateur par perte consecutive
+input int    InpMartMaxSteps  = 2;         // pas max : risque plafonne a base x Mult^MaxSteps (2 -> x4 max)
+input double InpMartMaxRiskPct= 0.015;     // cap ABSOLU du risque d'un trade en % equity (garde FTMO)
+input int    InpMartLookbackD = 14;        // profondeur d'historique (jours) pour compter la serie de pertes
+//--- BREAKEVEN + TRAILING STOP (gestion ATR, tous moteurs ; 0 = off)
+input double InpBETriggerATR  = 1.0;       // profit >= x*ATR -> SL remonte a l'entree (+buffer) : le trade ne peut plus perdre
+input double InpBEBufferATR   = 0.05;      // buffer du breakeven (xATR) — couvre spread+commission
+input double InpTrailStartATR = 1.5;       // profit >= x*ATR -> trailing actif
+input double InpTrailATR      = 1.2;       // distance du trailing stop (xATR), ne fait que se RESSERRER
 //--- ARMATURE FTMO (identique MIKAEL_IA)
 input double InpRiskCashFixed  = 0.0;      // 0 = sizing INSTITUTIONNEL (fraction fixe du capital via InpRiskPerTrade). >0 = risque fixe en $ (mode nano-test)
 input double InpRiskPerTrade   = 0.005;    // risque par trade en % de l'equity (0.5%) — utilise seulement si InpRiskCashFixed=0
@@ -129,6 +157,7 @@ double   g_pendSlDist[];   // distance SL au moment du signal (prix)
 datetime g_pendExpiry[];
 double   g_pendRefPx[];
 datetime g_coolUntil[];
+double   g_lastAtr[];      // ATR14 TF signal par paire (rafraichi a chaque bougie) — trailing/BE
 
 int SymIndex(const string s)
 {
@@ -382,6 +411,136 @@ int ScalpSignal(const Indi &v, string &reason)
    return longSetup ? 1 : -1;
 }
 //+------------------------------------------------------------------+
+//| CANDLE : patterns de bougies sur la derniere bougie fermee.      |
+//| Englobante : le corps de la bougie signal AVALE le corps de la   |
+//| precedente, dans le sens oppose. Pin bar : meche dominante >=60% |
+//| du range, corps <=30%, cloture dans le tiers oppose a la meche.  |
+//| SL = extreme du pattern +/- buffer, plancher InpCdlSLATRFloor.   |
+//| Retourne +1/-1/0 ; les filtres communs (EMA200/ADX/sentiment)    |
+//| s'appliquent ensuite via FiltersAllow.                           |
+//+------------------------------------------------------------------+
+int CandleSignal(const MqlRates &r[], const Indi &v, double &slDist, string &pat)
+{
+   int n=ArraySize(r); if(n<3) return 0;
+   int i=n-1, p=n-2;
+   double o1=r[i].open, c1=r[i].close, h1=r[i].high, l1=r[i].low;
+   double o0=r[p].open, c0=r[p].close;
+   double body1=MathAbs(c1-o1), body0=MathAbs(c0-o0);
+   double range1=h1-l1;
+   double atr=v.atr;
+   pat=""; slDist=0.0;
+   if(atr<=0 || range1<=0) return 0;
+
+   int sig=0;
+   if(InpCdlEngulfing && body1>=InpCdlBodyATRmin*atr && body1>=body0){
+      // englobante haussiere : bougie prec baissiere, signal haussier qui l'avale
+      if(c1>o1 && c0<o0 && c1>=o0 && o1<=c0){ sig=+1; pat="engulf_bull"; }
+      // englobante baissiere : symetrique
+      else if(c1<o1 && c0>o0 && c1<=o0 && o1>=c0){ sig=-1; pat="engulf_bear"; }
+   }
+   if(sig==0 && InpCdlPinbar && range1>=0.8*atr && body1<=0.30*range1){
+      double upWick=h1-MathMax(o1,c1);
+      double dnWick=MathMin(o1,c1)-l1;
+      // marteau : longue meche basse (rejet des vendeurs), cloture dans le tiers haut
+      if(dnWick>=0.60*range1 && c1>=l1+0.66*range1){ sig=+1; pat="pin_hammer"; }
+      // etoile filante : symetrique
+      else if(upWick>=0.60*range1 && c1<=h1-0.66*range1){ sig=-1; pat="pin_star"; }
+   }
+   if(sig==0) return 0;
+
+   // SL au-dela de l'extreme du pattern, plancher anti-lot-enorme
+   double d=(sig>0)? (v.close-l1) : (h1-v.close);
+   slDist=MathMax(d+InpCdlSLBufATR*atr, InpCdlSLATRFloor*atr);
+   return sig;
+}
+//+------------------------------------------------------------------+
+//| MARTINGALE PLAFONNEE : multiplicateur = Mult^(pertes consecutives|
+//| PAR PAIRE, magic strict), plafonne en pas ET en % du capital.    |
+//| Serie relue depuis l'historique des deals (robuste aux restarts, |
+//| aucun etat a persister). Un BE/petit scratch (>-20% du risque de |
+//| base) NE compte PAS comme une perte (sinon le trailing BE ferait |
+//| doubler a tort). Le budget journalier prospectif (TryEnter) et le|
+//| kill switch FTMO restent au-dessus de tout.                      |
+//+------------------------------------------------------------------+
+double MartRiskMultiplier(const string sym)
+{
+   if(!InpMartEnable || InpMartMaxSteps<=0 || InpMartMult<=1.0) return 1.0;
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   double baseRisk=(InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade;
+   if(baseRisk<=0) return 1.0;
+   double lossThr=0.20*baseRisk;   // en-deca : scratch/BE, pas une vraie perte
+
+   int streak=0;
+   if(HistorySelect(TimeCurrent()-(long)InpMartLookbackD*86400,TimeCurrent())){
+      for(int h=HistoryDealsTotal()-1;h>=0 && streak<InpMartMaxSteps;h--){
+         ulong dl=HistoryDealGetTicket(h);
+         if(HistoryDealGetInteger(dl,DEAL_MAGIC)!=InpMagic) continue;
+         if(HistoryDealGetString(dl,DEAL_SYMBOL)!=sym) continue;
+         if(HistoryDealGetInteger(dl,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+         double pl=HistoryDealGetDouble(dl,DEAL_PROFIT)
+                  +HistoryDealGetDouble(dl,DEAL_SWAP)
+                  +HistoryDealGetDouble(dl,DEAL_COMMISSION);
+         if(pl<-lossThr) streak++;      // vraie perte : on monte d'un pas
+         else break;                    // gain ou scratch : serie terminee
+      }
+   }
+   if(streak<=0) return 1.0;
+   double mult=MathPow(InpMartMult,streak);
+   // cap absolu : le risque du trade ne depasse JAMAIS InpMartMaxRiskPct de l'equity
+   double capMult=(eq*InpMartMaxRiskPct)/baseRisk;
+   if(mult>capMult) mult=capMult;
+   return MathMax(mult,1.0);
+}
+//+------------------------------------------------------------------+
+//| BREAKEVEN + TRAILING (tous moteurs, toutes les 30 s, meme en     |
+//| halt : c'est de la GESTION, pas une entree).                     |
+//|  1) profit >= BETrigger x ATR  -> SL = entree +/- buffer          |
+//|  2) profit >= TrailStart x ATR -> SL = prix -/+ TrailATR x ATR    |
+//| Le SL ne fait QUE se resserrer — un gain ne redevient jamais     |
+//| une perte (demande utilisateur, regle "non-perte").              |
+//+------------------------------------------------------------------+
+void ManageBreakevenTrailing()
+{
+   if(InpBETriggerATR<=0 && InpTrailATR<=0) return;
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string sym=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      int s=SymIndex(sym); if(s<0) continue;
+      double atr=g_lastAtr[s]; if(atr<=0) continue;
+
+      bool   isLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+      double open=PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur =PositionGetDouble(POSITION_PRICE_CURRENT);
+      double sl  =PositionGetDouble(POSITION_SL);
+      double tp  =PositionGetDouble(POSITION_TP);
+      double prof=isLong? (cur-open) : (open-cur);
+      int    dg  =(int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
+      double pt  =SymbolInfoDouble(sym,SYMBOL_POINT);
+
+      double newSl=sl;
+      if(InpBETriggerATR>0 && prof>=InpBETriggerATR*atr){
+         double be=isLong? open+InpBEBufferATR*atr : open-InpBEBufferATR*atr;
+         if(sl<=0 || (isLong? be>newSl : be<newSl)) newSl=be;
+      }
+      if(InpTrailATR>0 && prof>=InpTrailStartATR*atr){
+         double tr=isLong? cur-InpTrailATR*atr : cur+InpTrailATR*atr;
+         if(newSl<=0 || (isLong? tr>newSl : tr<newSl)) newSl=tr;
+      }
+      newSl=NormalizeDouble(newSl,dg);
+      if(newSl==sl || newSl<=0) continue;
+      if(isLong? (sl>0 && newSl<=sl+pt) : (sl>0 && newSl>=sl-pt)) continue; // resserrement uniquement
+
+      // distance minimale broker
+      double minDist=SymbolInfoInteger(sym,SYMBOL_TRADE_STOPS_LEVEL)*pt;
+      if(MathAbs(cur-newSl)<minDist) continue;
+
+      ulong ticket=PositionGetInteger(POSITION_TICKET);
+      if(g_trade.PositionModify(ticket,newSl,tp))
+         Print("[TRAIL] ",sym," SL -> ",DoubleToString(newSl,dg),
+               (prof>=InpTrailStartATR*atr?" (trailing)":" (breakeven)"));
+   }
+}
+//+------------------------------------------------------------------+
 //| Portefeuille                                                     |
 //+------------------------------------------------------------------+
 int CcyCount(const string ccy)
@@ -559,18 +718,24 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
    { LogRow(row+"0;"+(InpDryRun?"1":"0")+";ccy_corr"); return true; }
 
    // SL/TP ancres sur le prix de SORTIE (bid=long, ask=short)
-   // RR selon le moteur : Donchian=InpRR (0=pas de TP, sortie canal) ; Scalp=InpScalpRR
-   double rr=(InpStrategy==STRAT_SCALP)?InpScalpRR:InpRR;
+   // RR selon le moteur : Donchian=InpRR (0=pas de TP, sortie canal) ;
+   // Scalp=InpScalpRR ; Candle=InpCdlRR (TP requis pour la recuperation martingale)
+   double rr=(InpStrategy==STRAT_SCALP)?InpScalpRR:
+             (InpStrategy==STRAT_CANDLE)?InpCdlRR:InpRR;
    int digits=(int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
    double base=longSig?tick.bid:tick.ask;
    double sl=NormalizeDouble(longSig?base-slDist:base+slDist,digits);
    double tp=(rr>0)? NormalizeDouble(longSig?base+rr*slDist:base-rr*slDist,digits) : 0.0;
    if(!StopsValid(sym,price,sl,tp)){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";stops_level"); return true; }
 
-   // sizing exact — risque en $ FIXE (InpRiskCashFixed>0) sinon % de l'equity
+   // sizing exact — risque en $ FIXE (InpRiskCashFixed>0) sinon % de l'equity,
+   // multiplie par la martingale plafonnee (1.0 si off / serie vierge)
    double eq=AccountInfoDouble(ACCOUNT_EQUITY);
    string why="";
-   double riskCash=(InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade;
+   double mart=MartRiskMultiplier(sym);
+   double riskCash=((InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade)*mart;
+   if(mart>1.0) Print("[MART] ",sym," serie de pertes -> risque x",DoubleToString(mart,2),
+                      " (",DoubleToString(riskCash,2),"$)");
    double lots=CalcLots(sym,longSig,price,sl,riskCash,why);
    if(lots<=0){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";"+why); return true; }
 
@@ -619,6 +784,8 @@ int OnInit()
    ArrayResize(g_pendExpiry,g_nsym);
    ArrayResize(g_pendRefPx,g_nsym);
    ArrayResize(g_coolUntil,g_nsym);
+   ArrayResize(g_lastAtr,g_nsym);
+   ArrayInitialize(g_lastAtr,0.0);
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(20);
@@ -689,13 +856,20 @@ int OnInit()
       stratStr="SCALP (pullback EMA"+IntegerToString(InpScalpEMAfast)+"/"+IntegerToString(InpScalpEMAslow)+
                ", SL="+DoubleToString(InpScalpSLATR,1)+"xATR, RR="+DoubleToString(InpScalpRR,2)+
                ", RSIfloor="+IntegerToString(InpScalpRSIfloor)+")";
+   else if(InpStrategy==STRAT_CANDLE)
+      stratStr="CANDLE (engulf="+(InpCdlEngulfing?"ON":"OFF")+" pin="+(InpCdlPinbar?"ON":"OFF")+
+               ", RR="+DoubleToString(InpCdlRR,2)+
+               ", MART="+(InpMartEnable?"x"+DoubleToString(InpMartMult,1)+"^"+IntegerToString(InpMartMaxSteps)+
+               " cap "+DoubleToString(InpMartMaxRiskPct*100,1)+"%":"OFF")+
+               ", BE@"+DoubleToString(InpBETriggerATR,1)+"ATR trail@"+DoubleToString(InpTrailStartATR,1)+
+               "/"+DoubleToString(InpTrailATR,1)+"ATR)";
    else
       stratStr="DONCHIAN (canal "+IntegerToString(InpEntryPeriod)+"/"+IntegerToString(InpExitPeriod)+
                ", SL_mode="+EnumToString(InpSLMode)+", S&R="+(InpStopAndReverse?"ON":"OFF")+
                ", RR="+DoubleToString(InpRR,2)+(InpRR<=0?" [sortie canal]":"")+")";
    string riskStr=(InpRiskCashFixed>0)? DoubleToString(InpRiskCashFixed,2)+"$/trade (FIXE)"
                                       : DoubleToString(InpRiskPerTrade*100,2)+"% equity";
-   Print("MIKAEL_DONCHIAN v1.14 init OK | sent_filter=",
+   Print("MIKAEL_DONCHIAN v2.00 init OK | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
          " | ",stratStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),
@@ -773,6 +947,7 @@ void ManageScalpBiasExit(const string sym, const Indi &v)
 void OnTimer()
 {
    EnforceTimeStop();
+   ManageBreakevenTrailing();   // BE + trailing a chaque cycle (gestion, tourne meme en halt)
 
    // --- ancre journaliere + kill switches (copie MIKAEL_IA) ---
    MqlDateTime now; TimeToStruct(TimeCurrent(),now);
@@ -840,6 +1015,7 @@ void OnTimer()
 
       Indi v;
       if(!ComputeIndi(r,v)) continue;
+      g_lastAtr[s]=v.atr;               // cache ATR pour le trailing inter-bougies
 
       bool friday=(now.day_of_week==5 && now.hour>=InpNoFridayAfter);
 
@@ -881,6 +1057,13 @@ void OnTimer()
          if(!breakUp && !breakDn) continue;
          longSig=breakUp; haveSignal=true;
          slDist=SlDistance(longSig,v);
+      }else if(InpStrategy==STRAT_CANDLE){
+         string pat="";
+         int sig=CandleSignal(r,v,slDist,pat);
+         if(sig==0) continue;
+         longSig=(sig>0); haveSignal=true;
+         Print("[CANDLE] ",sym," pattern ",pat," ",(longSig?"Buy":"Sell"),
+               " sl_dist=",DoubleToString(slDist/SymbolInfoDouble(sym,SYMBOL_POINT),0),"pt");
       }else{ // STRAT_SCALP
          int sig=ScalpSignal(v,why);
          if(sig==0){

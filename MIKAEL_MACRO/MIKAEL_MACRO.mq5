@@ -102,7 +102,7 @@
 //|  - garde-fou lot minimum (refuse de sur-risquer un petit compte) |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.13"
+#property version   "2.14"
 #property strict
 
 #include <Trade\Trade.mqh>

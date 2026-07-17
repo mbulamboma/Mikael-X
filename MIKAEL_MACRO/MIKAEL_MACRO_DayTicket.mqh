@@ -34,6 +34,13 @@ void DayTicket_Cleanup()
    for(int i=PositionsTotal()-1;i>=0;i--){
       PositionGetSymbol(i);
       if(PositionGetInteger(POSITION_MAGIC)!=InpMagic+1) continue;
+      // ⚠️ garde CRITIQUE : magic+1 peut appartenir a un AUTRE EA si les magics
+      // des instances sont consecutifs (20260714+1 = 20260715 = Scalp !).
+      // Le 16-17 juil 2026, ce cleanup a referme CHAQUE position du Scalp
+      // ~24 s apres l'ouverture (29 trades, hemorragie spread+commission).
+      // On ne touche desormais qu'aux tickets dont le commentaire est
+      // "day-ticket" (pose par DayTicket_Execute) ET dont le volume est micro.
+      if(PositionGetString(POSITION_COMMENT)!="day-ticket") continue;
       ulong tk=PositionGetInteger(POSITION_TICKET);
       if(g_trade.PositionClose(tk))
          Print("[DAY-TICKET] micro-lot residuel referme (ticket ",tk,")");
@@ -152,8 +159,10 @@ bool DayTicket_Execute(const string sym, const bool isLong, const double pred)
 void DayTicket_Run(const bool canTrade)
 {
    if(InpDryRun || !canTrade) return;
-   DayTicket_Cleanup();
+   // cleanup APRES le garde EnsureDayTrade : module OFF = ZERO PositionClose,
+   // quoi qu'il arrive (defense en profondeur contre la collision de magics)
    if(!InpEnsureDayTrade || g_halted) return;
+   DayTicket_Cleanup();
 
    MqlDateTime now; TimeToStruct(TimeCurrent(),now);
    if(now.day_of_week==0 || now.day_of_week==6) return;
