@@ -1,33 +1,34 @@
 //+------------------------------------------------------------------+
-//| MIKAEL_DONCHIAN.mq5 — 2 moteurs (Donchian / Scalp), armature FTMO|
-//| v1.02 : InpStrategy = STRAT_DONCHIAN (defaut) ou STRAT_SCALP.    |
-//|  SCALP = pullback sur EMA rapide (EMA8/21) dans le sens du biais |
-//|  court terme + reprise ; SL serre (1.2xATR), TP=1.5xSL, filtre   |
-//|  de tendance EMA200 + ADX en couche commune. Regler InpSignalTF  |
-//|  sur M5 ou M15. ⚠️ scalp FX : le spread+commission mange une part|
-//|  enorme d'un petit TP — valider en dry-run/testeur AVANT le reel.|
-//| Turtle / Donchian Channel, armature FTMO                         |
-//| Derive de MIKAEL_IA v1.79 : TOUTE la gestion du risque FTMO est  |
-//| conservee a l'identique ; le moteur de prediction ONNX est       |
-//| remplace par la strategie Donchian (Turtle Traders) :            |
+//| MIKAEL_DONCHIAN.mq5 — moteur UNIQUE : CANDLE, armature FTMO      |
+//| v2.10 : les moteurs Donchian (Turtle) et Scalp (pullback EMA)   |
+//|  ont ete RETIRES. Il ne reste que le moteur CANDLE (patterns de |
+//|  bougies) + martingale plafonnee + breakeven/trailing ATR. Le   |
+//|  nom de fichier, le magic et les prefixes de variables globales |
+//|  sont conserves a l'identique pour ne pas casser la continuite  |
+//|  de l'instance en forward-test sur le VPS.                       |
 //|                                                                  |
-//|  ENTREE  : cloture au-dela du canal InpEntryPeriod (defaut 20)   |
-//|  SORTIE  : cloture au-dela du canal oppose InpExitPeriod (10) ;  |
-//|            si InpStopAndReverse, position inverse ouverte si les |
-//|            filtres l'autorisent (jamais contre la tendance EMA)  |
-//|  STOP    : InpSLMode = MEDIAN (ligne mediane, defaut) /          |
-//|            OPPOSITE (bande opposee) / ATR (InpSLATRMult x ATR14) |
-//|  TP      : InpRR=0 (defaut) -> PAS de TP, la sortie de canal     |
-//|            laisse courir la tendance (esprit Turtle) ;           |
-//|            InpRR>0 -> TP = RR x distance SL                      |
+//| MOTEUR CANDLE :                                                  |
+//|  ENTREE  : pattern de bougie sur la derniere bougie FERMEE du TF |
+//|            de signal (englobante bull/bear ou pin bar), corps    |
+//|            minimal InpCdlBodyATRmin x ATR (anti-doji)            |
+//|  STOP    : extreme du pattern +/- InpCdlSLBufATR x ATR, plancher |
+//|            InpCdlSLATRFloor x ATR (anti-lot-enorme)             |
+//|  TP      : InpCdlRR x distance SL (>=1 requis pour que la        |
+//|            martingale recupere les pertes)                       |
+//|  GESTION : breakeven + trailing ATR (un gain ne redevient jamais |
+//|            une perte) + martingale plafonnee par serie de pertes |
 //|                                                                  |
-//|  FILTRES anti-fausse-cassure (ranges) :                          |
+//|  FILTRES communs (couche partagee) :                             |
 //|   - EMA InpEMAPeriod (200) sur le TF de signal : long ssi        |
 //|     close>EMA, short ssi close<EMA (0=off)                       |
-//|   - SMA InpTrendMAD1 (200) sur D1 : tendance de fond (0=off)     |
-//|   - ADX14 >= InpMinADX (20) : force de tendance requise (0=off)  |
-//|   - RSI14 : pas d'achat en surachat (> InpRSICap, 70) ni de      |
-//|     vente en survente (< 100-InpRSICap) (InpRSICap=100 -> off)   |
+//|   - SMA InpTrendMAD1 sur D1 : tendance de fond (0=off)           |
+//|   - ADX14 >= InpMinADX : force de tendance requise (0=off)       |
+//|   - RSI14 : cap surachat/survente (InpRSICap=100 -> off)         |
+//|   - sentiment macro (macro_features.csv) : veto anti-flux (fail-open) |
+//|                                                                  |
+//| MARTINGALE PLAFONNEE : multiplicateur par serie de pertes PAR    |
+//|  PAIRE, plafond en pas ET en % du capital, bride par le budget   |
+//|  journalier prospectif FTMO deja en place.                       |
 //|                                                                  |
 //| ARMATURE FTMO (copie conforme MIKAEL_IA v1.79) :                 |
 //|  - sizing exact tick value, risque % par trade                   |
@@ -38,53 +39,22 @@
 //|  - objectif de profit -> stoppe les entrees (gains acquis)       |
 //|  - regle gap-trading : rien vendredi apres InpNoFridayAfter      |
 //|  - file d'attente spread 90 min + garde anti-derive 0.25xSL      |
-//|  - cooldown apres perte (defaut 0 ici : le stop&reverse doit     |
-//|    pouvoir s'executer ; les filtres EMA/ADX tiennent le range)   |
-//|  - time-stop optionnel (defaut 0 : une tendance se laisse courir)|
+//|  - cooldown optionnel apres perte (defaut 0)                     |
+//|  - time-stop optionnel (defaut 0)                                |
 //|  - fill type par symbole (anti-10030), retry requote, stops level|
 //|  NOTE : pas de module day-ticket (FTMO a supprime les jours mini;|
 //|  sur compte FINANCE, re-attacher MIKAEL_IA ou ajouter le module) |
-//+------------------------------------------------------------------+
-//| v2.00 : 3e moteur STRAT_CANDLE (patterns de bougies : englobante |
-//|  + pin bar, filtres tendance communs) + MARTINGALE PLAFONNEE     |
-//|  (multiplicateur par serie de pertes PAR PAIRE, plafond en pas   |
-//|  ET en % du capital, bride par le budget journalier prospectif   |
-//|  FTMO deja en place) + BREAKEVEN & TRAILING STOP ATR (une fois   |
-//|  le trade en profit, le SL suit — un gain ne redevient pas une   |
-//|  perte). Instance recommandee : magic 20260720 (JAMAIS un magic  |
-//|  adjacent a un autre EA : le day-ticket d'IA/MACRO vise magic+1).|
+//|  Instance recommandee : magic 20260720 (JAMAIS un magic adjacent |
+//|  a un autre EA : le day-ticket d'IA/MACRO vise magic+1).         |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 #include <Trade\Trade.mqh>
 
-//--- mode de placement du stop loss
-enum ENUM_SL_MODE
-{
-   SL_MEDIAN=0,    // ligne mediane du canal d'entree
-   SL_OPPOSITE=1,  // bande opposee du canal d'entree
-   SL_ATR=2        // InpSLATRMult x ATR14
-};
-
-//--- choix du moteur de signaux
-enum ENUM_STRATEGY
-{
-   STRAT_DONCHIAN=0,  // Turtle : cassure de canal (defaut, tendance)
-   STRAT_SCALP=1,     // Scalp : pullback sur EMA rapide dans le sens de la tendance
-   STRAT_CANDLE=2     // Bougies : englobante / pin bar + martingale plafonnee + trailing
-};
-
-//--- INPUTS strategie
-input ENUM_STRATEGY InpStrategy = STRAT_DONCHIAN; // MOTEUR : Donchian (tendance) ou Scalp (pullback EMA). Pour scalper: mettre STRAT_SCALP + InpSignalTF=M5/M15
-input ENUM_TIMEFRAMES InpSignalTF   = PERIOD_H1; // timeframe des signaux — H1 = config forward-test (instance scalp: M15 + magic 20260715)
-input int    InpEntryPeriod   = 20;        // canal d'ENTREE (cassure du plus haut/bas N barres)
-input int    InpExitPeriod    = 10;        // canal de SORTIE (canal oppose N barres)
-input ENUM_SL_MODE InpSLMode  = SL_MEDIAN; // placement du SL initial
-input double InpSLATRMult     = 2.0;       // multiplicateur ATR si InpSLMode=SL_ATR
-input double InpRR            = 0.0;       // 0 = pas de TP (sortie par canal) ; >0 : TP = RR x SL
-input bool   InpStopAndReverse= true;      // sortie de canal -> position inverse (si filtres OK)
+//--- INPUTS strategie (moteur unique : CANDLE)
+input ENUM_TIMEFRAMES InpSignalTF   = PERIOD_H1; // timeframe des signaux (bougie fermee)
 //--- FILTRES anti-fausse-cassure
 input int    InpEMAPeriod     = 200;       // EMA tendance sur TF de signal (0=off) — SEUL filtre de tendance par defaut
 input int    InpTrendMAD1     = 0;         // SMA D1 tendance de fond (0=off) — desactive : double filtre trop strict (etouffait les cassures)
@@ -93,13 +63,7 @@ input double InpRSICap        = 100.0;     // pas d'achat si RSI>cap, pas de ven
 //--- FILTRE SENTIMENT/MACRO (macro_features.csv ecrit par v4_macro\macro_service.py)
 input double InpSentThreshold = 0.15;      // veto : pas de Buy si sent(base)-sent(quote) < -seuil, pas de Sell si > +seuil. 0=off
 input int    InpSentMaxAgeH   = 12;        // fraicheur max du fichier (h) ; perime/absent = filtre INACTIF (log) — jamais bloquant
-//--- PARAMETRES SCALP (utilises seulement si InpStrategy=STRAT_SCALP)
-input int    InpScalpEMAfast  = 8;         // EMA rapide (declencheur pullback)
-input int    InpScalpEMAslow  = 21;        // EMA lente (biais court terme)
-input double InpScalpSLATR    = 1.2;       // SL = mult x ATR14 (stop serre = scalp)
-input double InpScalpRR        = 0.0;      // 0 = PAS de TP (sortie au flip du biais EMA8/21 — regle CTA : la queue droite reste libre) ; >0 : TP = RR x SL
-input int    InpScalpRSIfloor = 45;        // long: RSI>=floor ; short: RSI<=100-floor (momentum, evite les rebonds morts). 0=off
-//--- PARAMETRES CANDLE (utilises seulement si InpStrategy=STRAT_CANDLE)
+//--- PARAMETRES CANDLE
 input bool   InpCdlEngulfing  = true;      // pattern englobante (bull/bear engulfing)
 input bool   InpCdlPinbar     = true;      // pattern pin bar (marteau / etoile filante)
 input double InpCdlBodyATRmin = 0.25;      // corps minimal du signal en xATR (anti-doji/bruit)
@@ -218,43 +182,20 @@ double SmaLastRates(const MqlRates &r[], const int period)
 }
 //+------------------------------------------------------------------+
 //| Photographie des indicateurs sur la DERNIERE bougie FERMEE.      |
-//| Les canaux EXCLUENT la bougie de signal (cassure = close au-dela |
-//| du canal des N barres PRECEDENTES — definition Turtle).          |
 //+------------------------------------------------------------------+
 struct Indi
 {
    double close;                  // cloture de la bougie de signal
-   double hiE, loE, mid;          // canal d'entree (InpEntryPeriod) + mediane
-   double hiX, loX;               // canal de sortie (InpExitPeriod)
    double ema;                    // EMA tendance (0 si off)
    double atr, rsi, adx;
-   // --- scalp : EMA rapide/lente sur la bougie de signal ET la precedente ---
-   double emaF, emaS;             // EMA rapide / lente a la bougie de signal
-   double emaFprev;               // EMA rapide a la bougie precedente
-   double closePrev;              // cloture de la bougie precedente
 };
-//--- EMA a un index donne (recalcul depuis le debut de la fenetre)
-double EmaAt(const double &src[], const int n, const int idx)
-{
-   if(n<=0 || idx<0 || idx>=ArraySize(src)) return 0.0;
-   double a=2.0/(n+1.0), e=src[0];
-   for(int i=1;i<=idx;i++) e=a*src[i]+(1.0-a)*e;
-   return e;
-}
 bool ComputeIndi(const MqlRates &r[], Indi &v)
 {
    int n=ArraySize(r);
-   int need=MathMax(MathMax(InpEntryPeriod,InpExitPeriod)+2,
-                    MathMax(InpEMAPeriod+10,60));
+   int need=MathMax(InpEMAPeriod+10,60);
    if(n<need) return false;
    int i=n-1;                      // derniere bougie fermee
    v.close=r[i].close;
-
-   v.hiE=-DBL_MAX; v.loE=DBL_MAX;
-   for(int k=i-InpEntryPeriod;k<i;k++){ v.hiE=MathMax(v.hiE,r[k].high); v.loE=MathMin(v.loE,r[k].low); }
-   v.mid=(v.hiE+v.loE)/2.0;
-   v.hiX=-DBL_MAX; v.loX=DBL_MAX;
-   for(int k=i-InpExitPeriod;k<i;k++){ v.hiX=MathMax(v.hiX,r[k].high); v.loX=MathMin(v.loX,r[k].low); }
 
    double close[],tr[],gain[],loss[];
    ArrayResize(close,n); ArrayResize(tr,n); ArrayResize(gain,n); ArrayResize(loss,n);
@@ -289,12 +230,6 @@ bool ComputeIndi(const MqlRates &r[], Indi &v)
    v.adx=adx[i];
 
    v.ema=(InpEMAPeriod>0)? EmaLast(close,InpEMAPeriod) : 0.0;
-
-   // --- scalp : EMA rapide/lente a i et i-1 (pullback = croisement close/emaF) ---
-   v.emaF     = EmaAt(close,InpScalpEMAfast,i);
-   v.emaS     = EmaAt(close,InpScalpEMAslow,i);
-   v.emaFprev = EmaAt(close,InpScalpEMAfast,i-1);
-   v.closePrev= close[i-1];
 
    if(v.atr<=0) return false;
    return true;
@@ -368,47 +303,6 @@ bool FiltersAllow(const string sym, const bool longSig, const MqlRates &rD[], co
    }
    reason="";
    return true;
-}
-//+------------------------------------------------------------------+
-//| Distance du SL initial (en prix) selon le mode choisi            |
-//+------------------------------------------------------------------+
-double SlDistance(const bool longSig, const Indi &v)
-{
-   double d=0.0;
-   switch(InpSLMode){
-      case SL_MEDIAN:   d=longSig? (v.close-v.mid) : (v.mid-v.close); break;
-      case SL_OPPOSITE: d=longSig? (v.close-v.loE) : (v.hiE-v.close); break;
-      case SL_ATR:      d=InpSLATRMult*v.atr; break;
-   }
-   // garde-fou : jamais moins de 0.5 x ATR (une cassure qui colle a la
-   // mediane donnerait un SL minuscule -> lot enorme -> risque reel >> cible)
-   return MathMax(d,0.5*v.atr);
-}
-//+------------------------------------------------------------------+
-//| SCALP : pullback sur EMA rapide dans le sens du biais court terme|
-//| Long  : emaF>emaS (biais haussier) ET la bougie PRECEDENTE a     |
-//|         cloture SOUS l'emaF (repli) ET la bougie de signal        |
-//|         re-cloture AU-DESSUS de l'emaF (reprise) ET RSI>=floor    |
-//| Short : symetrique. Retourne +1 / -1 / 0.                        |
-//| La tendance de fond (EMA200/D1) et l'ADX sont ajoutes ensuite    |
-//| par FiltersAllow (couche commune).                               |
-//+------------------------------------------------------------------+
-int ScalpSignal(const Indi &v, string &reason)
-{
-   reason="";
-   if(v.emaF<=0 || v.emaS<=0 || v.emaFprev<=0) return 0;
-   bool upBias = (v.emaF>v.emaS);
-   bool dnBias = (v.emaF<v.emaS);
-
-   bool longSetup  = upBias && (v.closePrev<v.emaFprev) && (v.close>v.emaF);
-   bool shortSetup = dnBias && (v.closePrev>v.emaFprev) && (v.close<v.emaF);
-   if(!longSetup && !shortSetup) return 0;
-
-   if(InpScalpRSIfloor>0){
-      if(longSetup  && v.rsi<InpScalpRSIfloor)          { reason="scalp_rsi_mou";  return 0; }
-      if(shortSetup && v.rsi>(100.0-InpScalpRSIfloor))  { reason="scalp_rsi_mou";  return 0; }
-   }
-   return longSetup ? 1 : -1;
 }
 //+------------------------------------------------------------------+
 //| CANDLE : patterns de bougies sur la derniere bougie fermee.      |
@@ -718,10 +612,8 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
    { LogRow(row+"0;"+(InpDryRun?"1":"0")+";ccy_corr"); return true; }
 
    // SL/TP ancres sur le prix de SORTIE (bid=long, ask=short)
-   // RR selon le moteur : Donchian=InpRR (0=pas de TP, sortie canal) ;
-   // Scalp=InpScalpRR ; Candle=InpCdlRR (TP requis pour la recuperation martingale)
-   double rr=(InpStrategy==STRAT_SCALP)?InpScalpRR:
-             (InpStrategy==STRAT_CANDLE)?InpCdlRR:InpRR;
+   // CANDLE : TP = InpCdlRR x SL (>=1 requis pour la recuperation martingale)
+   double rr=InpCdlRR;
    int digits=(int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
    double base=longSig?tick.bid:tick.ask;
    double sl=NormalizeDouble(longSig?base-slDist:base+slDist,digits);
@@ -841,8 +733,8 @@ int OnInit()
       }
    }
 
-   // journal PAR INSTANCE (suffixe magic) : deux strategies Donchian/Scalp qui
-   // partagent le meme fichier -> la 2e echoue en err 5004
+   // journal PAR INSTANCE (suffixe magic) : deux EA qui partageraient le meme
+   // fichier -> la 2e echoue en err 5004
    g_fileLog=FileOpen("MIKAEL_DONCHIAN_journal_"+IntegerToString(InpMagic)+".csv",
                       FILE_READ|FILE_WRITE|FILE_SHARE_READ|FILE_TXT|FILE_ANSI);
    if(g_fileLog==INVALID_HANDLE)
@@ -851,25 +743,15 @@ int OnInit()
       LogRow("time;symbol;dir;adx;signal;price;lots;dry;note");
    EventSetTimer(30);
    string symList=""; for(int i=0;i<g_nsym;i++) symList+=(i>0?",":"")+SYMBOLS[i];
-   string stratStr;
-   if(InpStrategy==STRAT_SCALP)
-      stratStr="SCALP (pullback EMA"+IntegerToString(InpScalpEMAfast)+"/"+IntegerToString(InpScalpEMAslow)+
-               ", SL="+DoubleToString(InpScalpSLATR,1)+"xATR, RR="+DoubleToString(InpScalpRR,2)+
-               ", RSIfloor="+IntegerToString(InpScalpRSIfloor)+")";
-   else if(InpStrategy==STRAT_CANDLE)
-      stratStr="CANDLE (engulf="+(InpCdlEngulfing?"ON":"OFF")+" pin="+(InpCdlPinbar?"ON":"OFF")+
+   string stratStr="CANDLE (engulf="+(InpCdlEngulfing?"ON":"OFF")+" pin="+(InpCdlPinbar?"ON":"OFF")+
                ", RR="+DoubleToString(InpCdlRR,2)+
                ", MART="+(InpMartEnable?"x"+DoubleToString(InpMartMult,1)+"^"+IntegerToString(InpMartMaxSteps)+
                " cap "+DoubleToString(InpMartMaxRiskPct*100,1)+"%":"OFF")+
                ", BE@"+DoubleToString(InpBETriggerATR,1)+"ATR trail@"+DoubleToString(InpTrailStartATR,1)+
                "/"+DoubleToString(InpTrailATR,1)+"ATR)";
-   else
-      stratStr="DONCHIAN (canal "+IntegerToString(InpEntryPeriod)+"/"+IntegerToString(InpExitPeriod)+
-               ", SL_mode="+EnumToString(InpSLMode)+", S&R="+(InpStopAndReverse?"ON":"OFF")+
-               ", RR="+DoubleToString(InpRR,2)+(InpRR<=0?" [sortie canal]":"")+")";
    string riskStr=(InpRiskCashFixed>0)? DoubleToString(InpRiskCashFixed,2)+"$/trade (FIXE)"
                                       : DoubleToString(InpRiskPerTrade*100,2)+"% equity";
-   Print("MIKAEL_DONCHIAN v2.00 init OK | sent_filter=",
+   Print("MIKAEL_DONCHIAN v2.10 (CANDLE only) init OK | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
          " | ",stratStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),
@@ -883,65 +765,6 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    if(g_fileLog!=INVALID_HANDLE) FileClose(g_fileLog);
-}
-//+------------------------------------------------------------------+
-//| Sortie de canal : ferme la position si la cloture franchit le    |
-//| canal oppose InpExitPeriod. Retourne +1/-1 = direction du REVERSE|
-//| souhaite (0 = pas de reverse). Tourne MEME en halt (gestion).    |
-//+------------------------------------------------------------------+
-int ManageChannelExit(const string sym, const Indi &v)
-{
-   if(!SymbolBusy(sym)) return 0;
-   for(int i=PositionsTotal()-1;i>=0;i--){
-      if(PositionGetSymbol(i)!=sym) continue;
-      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
-      bool isLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
-      bool exitSig=(isLong && v.close<v.loX) || (!isLong && v.close>v.hiX);
-      if(!exitSig) return 0;
-      ulong ticket=PositionGetInteger(POSITION_TICKET);
-      if(InpDryRun){
-         Print("[DRY][EXIT-CANAL] ",sym," ",(isLong?"long":"short")," close=",v.close,
-               " a franchi le canal ",InpExitPeriod);
-         return InpStopAndReverse ? (isLong?-1:1) : 0;
-      }
-      if(g_trade.PositionClose(ticket)){
-         Print("[EXIT-CANAL] ",sym," ",(isLong?"long":"short")," fermee (canal ",InpExitPeriod,
-               " franchi a ",v.close,")");
-         LogRow(TimeToString(TimeCurrent())+";"+sym+";"+(isLong?"Buy":"Sell")+
-                ";0;0;"+DoubleToString(v.close,(int)SymbolInfoInteger(sym,SYMBOL_DIGITS))+
-                ";0;0;EXIT_CANAL");
-         return InpStopAndReverse ? (isLong?-1:1) : 0;
-      }
-      Print("[EXIT-CANAL] echec fermeture ",sym," ret=",g_trade.ResultRetcode());
-      return 0;
-   }
-   return 0;
-}
-//+------------------------------------------------------------------+
-//| SCALP (v1.14) : sortie quand le BIAIS meurt — long ferme si       |
-//| EMA rapide repasse sous la lente (et inversement). C'est la       |
-//| sortie « signal » institutionnelle ; le TP fixe devient optionnel.|
-//+------------------------------------------------------------------+
-void ManageScalpBiasExit(const string sym, const Indi &v)
-{
-   for(int i=PositionsTotal()-1;i>=0;i--){
-      if(PositionGetSymbol(i)!=sym) continue;
-      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
-      bool isLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
-      bool exitSig=(isLong && v.emaF<v.emaS) || (!isLong && v.emaF>v.emaS);
-      if(!exitSig) return;
-      ulong ticket=PositionGetInteger(POSITION_TICKET);
-      if(InpDryRun) return;
-      if(g_trade.PositionClose(ticket)){
-         Print("[EXIT-BIAIS] ",sym," ",(isLong?"long":"short"),
-               " fermee — biais EMA",InpScalpEMAfast,"/",InpScalpEMAslow," inverse");
-         LogRow(TimeToString(TimeCurrent())+";"+sym+";"+(isLong?"Buy":"Sell")+
-                ";0;0;"+DoubleToString(v.close,(int)SymbolInfoInteger(sym,SYMBOL_DIGITS))+
-                ";0;0;EXIT_BIAIS");
-      }else
-         Print("[EXIT-BIAIS] echec fermeture ",sym," ret=",g_trade.ResultRetcode());
-      return;
-   }
 }
 //+------------------------------------------------------------------+
 void OnTimer()
@@ -1019,62 +842,19 @@ void OnTimer()
 
       bool friday=(now.day_of_week==5 && now.hour>=InpNoFridayAfter);
 
-      // --- 3) gestion des sorties par le SIGNAL ---
-      // DONCHIAN : sortie de canal + stop&reverse. SCALP : sortie au flip du
-      // biais EMA (v1.14) — le SL catastrophe et le time-stop restent en garde.
-      if(InpStrategy==STRAT_SCALP) ManageScalpBiasExit(sym,v);
-      if(InpStrategy==STRAT_DONCHIAN){
-         int rev=ManageChannelExit(sym,v);
-         if(rev!=0 && !halt && !friday){
-            bool longR=(rev>0);
-            string whyR="";
-            if(!FiltersAllow(sym,longR,rD,v,whyR)){
-               LogRow(TimeToString(TimeCurrent())+";"+sym+";"+(longR?"Buy":"Sell")+
-                      ";"+DoubleToString(v.adx,1)+";0;0;0;"+(InpDryRun?"1":"0")+";reverse_"+whyR);
-               Print("[REVERSE] ",sym," ",(longR?"Buy":"Sell")," refuse: ",whyR);
-            }else{
-               double slR=SlDistance(longR,v);
-               if(!TryEnter(sym,longR,slR,v.adx,canTrade,v.close)){
-                  g_pendActive[s]=true; g_pendLong[s]=longR; g_pendSlDist[s]=slR;
-                  g_pendRefPx[s]=v.close;
-                  g_pendExpiry[s]=TimeCurrent()+90*60;
-                  Print("[WAIT] ",sym," reverse en attente (spread)");
-               }
-            }
-            continue; // pas de double signal sur la meme bougie
-         }
-      }
-
-      // --- 4) entree (commun aux deux moteurs) ---
+      // --- 3) entree CANDLE ---
+      // (pas de sortie par signal : SL/TP fixes + breakeven/trailing + time-stop)
       if(halt || friday) continue;
       if(SymbolBusy(sym)) continue;
 
       bool longSig=false; double slDist=0.0; string why="";
-      bool haveSignal=false;
 
-      if(InpStrategy==STRAT_DONCHIAN){
-         bool breakUp=(v.close>v.hiE), breakDn=(v.close<v.loE);
-         if(!breakUp && !breakDn) continue;
-         longSig=breakUp; haveSignal=true;
-         slDist=SlDistance(longSig,v);
-      }else if(InpStrategy==STRAT_CANDLE){
-         string pat="";
-         int sig=CandleSignal(r,v,slDist,pat);
-         if(sig==0) continue;
-         longSig=(sig>0); haveSignal=true;
-         Print("[CANDLE] ",sym," pattern ",pat," ",(longSig?"Buy":"Sell"),
-               " sl_dist=",DoubleToString(slDist/SymbolInfoDouble(sym,SYMBOL_POINT),0),"pt");
-      }else{ // STRAT_SCALP
-         int sig=ScalpSignal(v,why);
-         if(sig==0){
-            if(why!="") LogRow(TimeToString(TimeCurrent())+";"+sym+";?;"+
-                               DoubleToString(v.adx,1)+";0;0;0;"+(InpDryRun?"1":"0")+";"+why);
-            continue;
-         }
-         longSig=(sig>0); haveSignal=true;
-         slDist=MathMax(InpScalpSLATR*v.atr,0.5*v.atr); // stop serre, plancher 0.5 ATR
-      }
-      if(!haveSignal) continue;
+      string pat="";
+      int sig=CandleSignal(r,v,slDist,pat);
+      if(sig==0) continue;
+      longSig=(sig>0);
+      Print("[CANDLE] ",sym," pattern ",pat," ",(longSig?"Buy":"Sell"),
+            " sl_dist=",DoubleToString(slDist/SymbolInfoDouble(sym,SYMBOL_POINT),0),"pt");
 
       // filtres de tendance/force communs (EMA200/D1/ADX/RSI-cap)
       if(!FiltersAllow(sym,longSig,rD,v,why)){
