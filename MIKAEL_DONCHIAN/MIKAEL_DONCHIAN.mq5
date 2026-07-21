@@ -1,5 +1,23 @@
 //+------------------------------------------------------------------+
 //| MIKAEL_DONCHIAN.mq5 — moteur UNIQUE : CANDLE, armature FTMO      |
+//| v2.13 : ZERO-LOCK breakeven (InpBEZeroTrigATR) — des que le trade|
+//|  est positif au-dela du bruit (defaut 0.10xATR), le SL se cale a |
+//|  l'entree (+buffer cout) : un trade parti negatif puis repasse en|
+//|  vert ne peut plus redevenir perdant, le trailing existant prend |
+//|  ensuite le relais. ⚠️ agressif (peut scratcher des gagnants) -> |
+//|  a valider via le log MFE/MAE. 0 = off (seul le BE 1.0xATR agit).|
+//| v2.12 : (1) martingale — garde anti-clustering : si la DERNIERE  |
+//|  perte de la paire est un vrai SL/stop-out touche ([sl]/[so]),   |
+//|  on NE double PAS (InpMartSkipHardSL) — on ne martingale que sur |
+//|  des pertes "molles" (BE-scratch, time-stop), jamais dans un     |
+//|  mauvais regime directionnel. (2) LOGGER MFE/MAE : journal        |
+//|  separe (mfe_<magic>.csv) enregistrant, par trade clos,          |
+//|  l'excursion favorable/adverse max (en xATR) + duree + motif —   |
+//|  DONNEE de recherche pour calibrer un futur exit no-progress     |
+//|  (au lieu de deviner les seuils). InpLogMfeMae, off = silencieux.|
+//| v2.11 : ajout du BASKET PROFIT-LOCK (verrou du flottant TOTAL   |
+//|  du magic : resserre les SL ou ferme tout au-dela d'un seuil $, |
+//|  contre les paires correlees qui se retournent ensemble).       |
 //| v2.10 : les moteurs Donchian (Turtle) et Scalp (pullback EMA)   |
 //|  ont ete RETIRES. Il ne reste que le moteur CANDLE (patterns de |
 //|  bougies) + martingale plafonnee + breakeven/trailing ATR. Le   |
@@ -48,7 +66,7 @@
 //|  a un autre EA : le day-ticket d'IA/MACRO vise magic+1).         |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.10"
+#property version   "2.13"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -76,11 +94,17 @@ input double InpMartMult      = 2.0;       // multiplicateur par perte consecuti
 input int    InpMartMaxSteps  = 2;         // pas max : risque plafonne a base x Mult^MaxSteps (2 -> x4 max)
 input double InpMartMaxRiskPct= 0.015;     // cap ABSOLU du risque d'un trade en % equity (garde FTMO)
 input int    InpMartLookbackD = 14;        // profondeur d'historique (jours) pour compter la serie de pertes
+input bool   InpMartSkipHardSL= true;      // si la DERNIERE perte de la paire est un vrai SL/stop-out ([sl]/[so]) -> pas de martingale (anti-clustering en mauvais regime)
 //--- BREAKEVEN + TRAILING STOP (gestion ATR, tous moteurs ; 0 = off)
+input double InpBEZeroTrigATR = 0.10;      // ZERO-LOCK : profit >= x*ATR -> SL a l'entree (+buffer) TOUT DE SUITE (un trade repasse en vert ne redevient plus perdant). 0 = off. ⚠️ agressif : peut scratcher des gagnants, mesurer via le log MFE/MAE
 input double InpBETriggerATR  = 1.0;       // profit >= x*ATR -> SL remonte a l'entree (+buffer) : le trade ne peut plus perdre
 input double InpBEBufferATR   = 0.05;      // buffer du breakeven (xATR) — couvre spread+commission
 input double InpTrailStartATR = 1.5;       // profit >= x*ATR -> trailing actif
 input double InpTrailATR      = 1.2;       // distance du trailing stop (xATR), ne fait que se RESSERRER
+//--- BASKET PROFIT-LOCK (verrouille le FLOTTANT TOTAL du magic ; 0 = off)
+input double InpBasketLockCash = 0.0;      // flottant total (magic) >= x$ -> verrouille le panier ; 0 = OFF
+input double InpBasketLockKeep = 0.50;     // fraction du gain de CHAQUE position gagnante a bloquer via SL (mode resserrer)
+input bool   InpBasketClose    = false;    // true = ferme TOUT le panier au seuil ; false = resserre les SL (laisse courir)
 //--- ARMATURE FTMO (identique MIKAEL_IA)
 input double InpRiskCashFixed  = 0.0;      // 0 = sizing INSTITUTIONNEL (fraction fixe du capital via InpRiskPerTrade). >0 = risque fixe en $ (mode nano-test)
 input double InpRiskPerTrade   = 0.005;    // risque par trade en % de l'equity (0.5%) — utilise seulement si InpRiskCashFixed=0
@@ -100,6 +124,7 @@ input double InpTargetPct      = 0.10;     // objectif de profit : stoppe les en
 input bool   InpDryRun         = false;    // false = ordres reels (forward-test DEMO). ⚠️ verifier que le compte connecte est bien un DEMO
 input string InpSymbols        = "EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,EURJPY,GBPJPY,AUDJPY"; // les 8 majeures du plan forward
 input long   InpMagic          = 20260713;
+input bool   InpLogMfeMae       = true;    // journal de recherche MFE/MAE par trade clos (fichier separe) : calibration d'un futur exit no-progress
 
 #define LOOKBACK 600   // barres TF signal chargees (>= EMA200 + marge de warm-up)
 
@@ -122,6 +147,16 @@ datetime g_pendExpiry[];
 double   g_pendRefPx[];
 datetime g_coolUntil[];
 double   g_lastAtr[];      // ATR14 TF signal par paire (rafraichi a chaque bougie) — trailing/BE
+// --- suivi MFE/MAE par position OUVERTE (recherche : calibration no-progress) ---
+// echantillonne a chaque OnTimer (30s). Etat NON persiste : au redemarrage de
+// l'EA, une position deja ouverte reprend son excursion a partir du prix courant
+// (biais mineur, purement pour la recherche).
+int      g_fileMfe   = INVALID_HANDLE;
+ulong    g_mfeTicket[];    // ticket position suivie
+double   g_mfeMax[];       // excursion FAVORABLE max, en prix (>=0)
+double   g_mfeMin[];       // excursion ADVERSE max (MAE), en prix (<=0)
+double   g_mfeAtr[];       // ATR TF signal a la 1re detection (normalisation xATR)
+datetime g_mfeOpen[];      // heure d'ouverture de la position (duree)
 
 int SymIndex(const string s)
 {
@@ -374,7 +409,22 @@ double MartRiskMultiplier(const string sym)
          double pl=HistoryDealGetDouble(dl,DEAL_PROFIT)
                   +HistoryDealGetDouble(dl,DEAL_SWAP)
                   +HistoryDealGetDouble(dl,DEAL_COMMISSION);
-         if(pl<-lossThr) streak++;      // vraie perte : on monte d'un pas
+         if(pl<-lossThr){
+            // Niveau 1 (anti-clustering) : la perte la PLUS RECENTE de la paire
+            // (streak==0) est-elle un vrai SL/stop-out touche ? Si oui, c'est un
+            // signal de mauvais regime directionnel -> on NE double PAS. On ne
+            // martingale que sur des pertes "molles" (BE-scratch, time-stop,
+            // fermeture EA), pas dans la direction qui vient de nous coller un SL.
+            if(InpMartSkipHardSL && streak==0){
+               string cmt=HistoryDealGetString(dl,DEAL_COMMENT);
+               StringToLower(cmt);
+               if(StringFind(cmt,"[sl")>=0 || StringFind(cmt,"[so")>=0){
+                  Print("[MART] ",sym," derniere perte = SL/stop-out touche -> pas de martingale (regime defavorable)");
+                  return 1.0;
+               }
+            }
+            streak++;                   // vraie perte "molle" : on monte d'un pas
+         }
          else break;                    // gain ou scratch : serie terminee
       }
    }
@@ -395,7 +445,7 @@ double MartRiskMultiplier(const string sym)
 //+------------------------------------------------------------------+
 void ManageBreakevenTrailing()
 {
-   if(InpBETriggerATR<=0 && InpTrailATR<=0) return;
+   if(InpBEZeroTrigATR<=0 && InpBETriggerATR<=0 && InpTrailATR<=0) return;
    for(int i=PositionsTotal()-1;i>=0;i--){
       string sym=PositionGetSymbol(i);
       if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
@@ -412,6 +462,13 @@ void ManageBreakevenTrailing()
       double pt  =SymbolInfoDouble(sym,SYMBOL_POINT);
 
       double newSl=sl;
+      // ZERO-LOCK : des que le trade est positif AU-DELA DU BRUIT, SL a l'entree
+      // (+buffer cout) -> le cas "parti negatif puis repasse en vert" ne peut plus
+      // redevenir perdant. Se declenche AVANT le BE 1.0 ATR (meme prix cible, plus tot).
+      if(InpBEZeroTrigATR>0 && prof>=InpBEZeroTrigATR*atr){
+         double be=isLong? open+InpBEBufferATR*atr : open-InpBEBufferATR*atr;
+         if(newSl<=0 || (isLong? be>newSl : be<newSl)) newSl=be;
+      }
       if(InpBETriggerATR>0 && prof>=InpBETriggerATR*atr){
          double be=isLong? open+InpBEBufferATR*atr : open-InpBEBufferATR*atr;
          if(sl<=0 || (isLong? be>newSl : be<newSl)) newSl=be;
@@ -432,6 +489,74 @@ void ManageBreakevenTrailing()
       if(g_trade.PositionModify(ticket,newSl,tp))
          Print("[TRAIL] ",sym," SL -> ",DoubleToString(newSl,dg),
                (prof>=InpTrailStartATR*atr?" (trailing)":" (breakeven)"));
+   }
+}
+//+------------------------------------------------------------------+
+//| BASKET PROFIT-LOCK : quand le FLOTTANT TOTAL des positions du    |
+//| magic depasse InpBasketLockCash, on protege le panier —          |
+//|  - InpBasketClose=true : fermeture immediate de TOUT le panier    |
+//|  - sinon (resserrer)   : chaque position GAGNANTE voit son SL     |
+//|    remonte pour bloquer InpBasketLockKeep de son gain courant.    |
+//| Traite le probleme des paires correlees qui se retournent        |
+//| ensemble (un +150 flottant ne peut plus redevenir -200). Ne fait |
+//| QUE resserrer. Stateless : aucun etat persiste, OK aux restarts. |
+//+------------------------------------------------------------------+
+void ManageBasketLock()
+{
+   if(InpBasketLockCash<=0) return;
+
+   // 1) flottant total du magic (profit courant + swap)
+   double basket=0.0; int n=0;
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      if(PositionGetSymbol(i)=="") continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      basket+=PositionGetDouble(POSITION_PROFIT)+PositionGetDouble(POSITION_SWAP);
+      n++;
+   }
+   if(n==0 || basket<InpBasketLockCash) return;
+
+   // 2a) mode fermeture : on solde TOUT le panier au seuil
+   if(InpBasketClose){
+      for(int i=PositionsTotal()-1;i>=0;i--){
+         string sym=PositionGetSymbol(i);
+         if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+         ulong tk=PositionGetInteger(POSITION_TICKET);
+         if(g_trade.PositionClose(tk))
+            Print("[BASKET] fermeture ",sym," (panier=",DoubleToString(basket,2),
+                  "$ >= ",DoubleToString(InpBasketLockCash,2),"$)");
+      }
+      return;
+   }
+
+   // 2b) mode resserrer : chaque position GAGNANTE bloque une fraction de son gain
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string sym=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      bool   isLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+      double open =PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur  =PositionGetDouble(POSITION_PRICE_CURRENT);
+      double sl   =PositionGetDouble(POSITION_SL);
+      double tp   =PositionGetDouble(POSITION_TP);
+      double prof =isLong? (cur-open) : (open-cur);
+      if(prof<=0) continue;                  // on ne touche pas aux positions perdantes
+      int    dg   =(int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
+      double pt   =SymbolInfoDouble(sym,SYMBOL_POINT);
+
+      // SL qui bloque InpBasketLockKeep du gain courant (converti en prix)
+      double lock =isLong? open+InpBasketLockKeep*prof : open-InpBasketLockKeep*prof;
+      lock=NormalizeDouble(lock,dg);
+      if(lock<=0) continue;
+      // resserrement uniquement (jamais desserrer un SL existant)
+      if(sl>0 && (isLong? lock<=sl+pt : lock>=sl-pt)) continue;
+      // distance minimale broker
+      double minDist=SymbolInfoInteger(sym,SYMBOL_TRADE_STOPS_LEVEL)*pt;
+      if(MathAbs(cur-lock)<minDist) continue;
+
+      ulong tk=PositionGetInteger(POSITION_TICKET);
+      if(g_trade.PositionModify(tk,lock,tp))
+         Print("[BASKET] ",sym," SL -> ",DoubleToString(lock,dg),
+               " (verrou ",DoubleToString(InpBasketLockKeep*100,0),"% ; panier=",
+               DoubleToString(basket,2),"$)");
    }
 }
 //+------------------------------------------------------------------+
@@ -577,6 +702,104 @@ void LogRow(const string line)
    FileSeek(g_fileLog,0,SEEK_END);
    FileWriteString(g_fileLog,line+"\n");
    FileFlush(g_fileLog);
+}
+//+------------------------------------------------------------------+
+//| LOGGER MFE/MAE (recherche). Fichier separe du journal signaux.   |
+//| Une ligne PAR TRADE CLOS : close_time;symbol;pl;mfe_atr;mae_atr; |
+//|  dur_min;reason. mfe_atr>=0 (meilleur point atteint en xATR),    |
+//| mae_atr<=0 (pire point en xATR). Sert a repondre, sur DONNEES :  |
+//| "les gagnants montrent-ils une MFE precoce que les perdants n'ont|
+//| jamais ?" -> seuil no-progress calibre, pas devine.              |
+//+------------------------------------------------------------------+
+void LogMfe(const string line)
+{
+   if(g_fileMfe==INVALID_HANDLE) return;
+   FileSeek(g_fileMfe,0,SEEK_END);
+   FileWriteString(g_fileMfe,line+"\n");
+   FileFlush(g_fileMfe);
+}
+//--- ecrit la ligne MFE/MAE d'une position fermee (lecture historique)
+void LogMfeMae(const ulong posid,const double mfe,const double mae,
+               const double atr,const datetime opened)
+{
+   double   pl=0.0; string cmt=""; string sym=""; datetime closed=0;
+   if(HistorySelectByPosition(posid)){
+      int dt=HistoryDealsTotal();
+      for(int d=0;d<dt;d++){
+         ulong dl=HistoryDealGetTicket(d);
+         if(HistoryDealGetInteger(dl,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+         pl+=HistoryDealGetDouble(dl,DEAL_PROFIT)
+            +HistoryDealGetDouble(dl,DEAL_SWAP)
+            +HistoryDealGetDouble(dl,DEAL_COMMISSION);
+         cmt   =HistoryDealGetString(dl,DEAL_COMMENT);
+         sym   =HistoryDealGetString(dl,DEAL_SYMBOL);
+         closed=(datetime)HistoryDealGetInteger(dl,DEAL_TIME);
+      }
+   }
+   double mfeAtr=(atr>0)? mfe/atr : 0.0;   // >=0
+   double maeAtr=(atr>0)? mae/atr : 0.0;   // <=0
+   long   durMin=(closed>opened)? (long)((closed-opened)/60) : 0;
+   string lc=cmt; StringToLower(lc);
+   string reason="ea_close";               // fermeture sans commentaire = PositionClose (time-stop, basket...)
+   if(StringFind(lc,"[sl")>=0)      reason="sl";
+   else if(StringFind(lc,"[tp")>=0) reason="tp";
+   else if(StringFind(lc,"[so")>=0) reason="so";
+   else if(StringLen(cmt)>0)        reason="close";
+   LogMfe(TimeToString(closed)+";"+sym+";"+DoubleToString(pl,2)+";"+
+          DoubleToString(mfeAtr,2)+";"+DoubleToString(maeAtr,2)+";"+
+          IntegerToString(durMin)+";"+reason);
+}
+//--- echantillonne l'excursion des positions ouvertes + logue les fermetures.
+//    Appele en TETE d'OnTimer (avant les fermetures de gestion) pour capter
+//    l'excursion la plus recente avant qu'un time-stop/BE ne referme.
+void TrackMfeMae()
+{
+   // 1) MAJ des positions OUVERTES du magic (init a la 1re detection)
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string sym=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      ulong  tk   =PositionGetInteger(POSITION_TICKET);
+      bool   isLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+      double open =PositionGetDouble(POSITION_PRICE_OPEN);
+      double cur  =PositionGetDouble(POSITION_PRICE_CURRENT);
+      double prof =isLong? (cur-open) : (open-cur);
+
+      int k=-1;
+      for(int j=0;j<ArraySize(g_mfeTicket);j++) if(g_mfeTicket[j]==tk){ k=j; break; }
+      if(k<0){
+         int n=ArraySize(g_mfeTicket);
+         ArrayResize(g_mfeTicket,n+1); ArrayResize(g_mfeMax,n+1);
+         ArrayResize(g_mfeMin,n+1);    ArrayResize(g_mfeAtr,n+1);
+         ArrayResize(g_mfeOpen,n+1);
+         int si=SymIndex(sym);
+         g_mfeTicket[n]=tk;
+         g_mfeMax[n]=MathMax(0.0,prof);
+         g_mfeMin[n]=MathMin(0.0,prof);
+         g_mfeAtr[n]=(si>=0 && g_lastAtr[si]>0)? g_lastAtr[si] : 0.0;
+         g_mfeOpen[n]=(datetime)PositionGetInteger(POSITION_TIME);
+      } else {
+         if(prof>g_mfeMax[k]) g_mfeMax[k]=prof;
+         if(prof<g_mfeMin[k]) g_mfeMin[k]=prof;
+      }
+   }
+
+   // 2) positions tracees mais desormais FERMEES -> log + purge (decalage, tableau <= MaxConcurrent)
+   int n=ArraySize(g_mfeTicket);
+   for(int j=0;j<n;){
+      if(PositionSelectByTicket(g_mfeTicket[j])){ j++; continue; }   // encore ouverte
+      LogMfeMae(g_mfeTicket[j],g_mfeMax[j],g_mfeMin[j],g_mfeAtr[j],g_mfeOpen[j]);
+      for(int m=j;m<n-1;m++){
+         g_mfeTicket[m]=g_mfeTicket[m+1]; g_mfeMax[m]=g_mfeMax[m+1];
+         g_mfeMin[m]=g_mfeMin[m+1];       g_mfeAtr[m]=g_mfeAtr[m+1];
+         g_mfeOpen[m]=g_mfeOpen[m+1];
+      }
+      n--;
+   }
+   if(n!=ArraySize(g_mfeTicket)){
+      ArrayResize(g_mfeTicket,n); ArrayResize(g_mfeMax,n);
+      ArrayResize(g_mfeMin,n);    ArrayResize(g_mfeAtr,n);
+      ArrayResize(g_mfeOpen,n);
+   }
 }
 //+------------------------------------------------------------------+
 //| Tente l'entree. true = signal CONSOMME (execute ou rejete),      |
@@ -741,19 +964,34 @@ int OnInit()
       Print("!! journal CSV indisponible (err ",GetLastError(),") — l'EA continue sans log fichier");
    else if(FileSize(g_fileLog)==0)
       LogRow("time;symbol;dir;adx;signal;price;lots;dry;note");
+
+   // journal de recherche MFE/MAE (fichier separe : colonnes differentes)
+   if(InpLogMfeMae){
+      g_fileMfe=FileOpen("MIKAEL_DONCHIAN_mfe_"+IntegerToString(InpMagic)+".csv",
+                         FILE_READ|FILE_WRITE|FILE_SHARE_READ|FILE_TXT|FILE_ANSI);
+      if(g_fileMfe==INVALID_HANDLE)
+         Print("!! journal MFE/MAE indisponible (err ",GetLastError(),") — suivi desactive");
+      else if(FileSize(g_fileMfe)==0)
+         LogMfe("close_time;symbol;pl;mfe_atr;mae_atr;dur_min;reason");
+   }
    EventSetTimer(30);
    string symList=""; for(int i=0;i<g_nsym;i++) symList+=(i>0?",":"")+SYMBOLS[i];
    string stratStr="CANDLE (engulf="+(InpCdlEngulfing?"ON":"OFF")+" pin="+(InpCdlPinbar?"ON":"OFF")+
                ", RR="+DoubleToString(InpCdlRR,2)+
                ", MART="+(InpMartEnable?"x"+DoubleToString(InpMartMult,1)+"^"+IntegerToString(InpMartMaxSteps)+
-               " cap "+DoubleToString(InpMartMaxRiskPct*100,1)+"%":"OFF")+
-               ", BE@"+DoubleToString(InpBETriggerATR,1)+"ATR trail@"+DoubleToString(InpTrailStartATR,1)+
+               " cap "+DoubleToString(InpMartMaxRiskPct*100,1)+"%"+(InpMartSkipHardSL?" skipSL":""):"OFF")+
+               ", MFElog="+(InpLogMfeMae?"ON":"OFF")+
+               ", ZL@"+DoubleToString(InpBEZeroTrigATR,2)+"ATR BE@"+DoubleToString(InpBETriggerATR,1)+"ATR trail@"+DoubleToString(InpTrailStartATR,1)+
                "/"+DoubleToString(InpTrailATR,1)+"ATR)";
+   string basketStr=(InpBasketLockCash>0)
+      ? "basket_lock=ON (seuil "+DoubleToString(InpBasketLockCash,0)+"$, "
+        +(InpBasketClose?"CLOSE-ALL":"resserre keep "+DoubleToString(InpBasketLockKeep*100,0)+"%")+")"
+      : "basket_lock=OFF";
    string riskStr=(InpRiskCashFixed>0)? DoubleToString(InpRiskCashFixed,2)+"$/trade (FIXE)"
                                       : DoubleToString(InpRiskPerTrade*100,2)+"% equity";
-   Print("MIKAEL_DONCHIAN v2.10 (CANDLE only) init OK | sent_filter=",
+   Print("MIKAEL_DONCHIAN v2.13 (CANDLE only) init OK | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
-         " | ",stratStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
+         " | ",stratStr," | ",basketStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),
          " RSIcap=",DoubleToString(InpRSICap,0),
          " | risk=",riskStr," | daily=",
@@ -765,12 +1003,15 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    if(g_fileLog!=INVALID_HANDLE) FileClose(g_fileLog);
+   if(g_fileMfe!=INVALID_HANDLE) FileClose(g_fileMfe);
 }
 //+------------------------------------------------------------------+
 void OnTimer()
 {
+   if(InpLogMfeMae) TrackMfeMae();   // AVANT les fermetures : capte l'excursion la plus recente
    EnforceTimeStop();
    ManageBreakevenTrailing();   // BE + trailing a chaque cycle (gestion, tourne meme en halt)
+   ManageBasketLock();          // verrou du flottant total du panier (gestion, tourne meme en halt)
 
    // --- ancre journaliere + kill switches (copie MIKAEL_IA) ---
    MqlDateTime now; TimeToStruct(TimeCurrent(),now);
