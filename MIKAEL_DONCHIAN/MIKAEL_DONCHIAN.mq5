@@ -1,5 +1,24 @@
 //+------------------------------------------------------------------+
-//| MIKAEL_DONCHIAN.mq5 — moteur UNIQUE : CANDLE, armature FTMO      |
+//| MIKAEL_DONCHIAN.mq5 — moteurs MA-TREND / CANDLE, armature FTMO   |
+//| v2.17 : MOTEUR MA-TREND (suivi de tendance D1, InpEngine).       |
+//|  L'hypothese CANDLE est falsifiee (backtests M5->H12 2025+2026 + |
+//|  forward H1/M15 : esperance ~0 au mieux, DD -6.5%). Le chassis   |
+//|  (sizing, gardes v2.16, armature FTMO) est conserve tel quel.    |
+//|  MA-TREND :                                                      |
+//|   ENTREE 1 (pullback) : tendance = EMA9>EMA21 sur le TF signal   |
+//|            (defaut D1) ; le prix TOUCHE l'EMA20 (low<=EMA20) et  |
+//|            recloture au-dessus -> Buy (symetrique Sell) ;        |
+//|   ENTREE 2 (croisement) : EMA9 croise EMA21 -> entree dans le    |
+//|            sens du croisement ;                                  |
+//|   TP     : objectif en % DU PRIX (InpTPPct, defaut 6%, plage     |
+//|            realiste 5-8% par mouvement de tendance) — plus de    |
+//|            RR x SL pour ce moteur ;                              |
+//|   SORTIE : croisement inverse EMA9/21 = tendance finie ->        |
+//|            fermeture (InpExitOnCross) ; BE/zero-lock/trailing    |
+//|            ATR du chassis inchanges ;                            |
+//|   SL     : extreme de la bougie de repli + 0.1 ATR, plancher     |
+//|            InpMASLATR x ATR (defaut 2.0).                        |
+//|  InpEngine=ENGINE_CANDLE restaure l'ancien moteur (comparaison). |
 //| v2.16 : GARDES DE SECURITE LIVE (post-mortem forward 16-23 juil  |
 //|  2026 : marge epuisee le 21/07, daily stop -3.58% le 17/07 sur   |
 //|  l'instance M15, churn 8x NZDUSD en 2 jours) :                   |
@@ -117,13 +136,25 @@
 //|  a un autre EA : le day-ticket d'IA/MACRO vise magic+1).         |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.16"
+#property version   "2.17"
 #property strict
 
 #include <Trade\Trade.mqh>
 
-//--- INPUTS strategie (moteur unique : CANDLE)
-input ENUM_TIMEFRAMES InpSignalTF   = PERIOD_H1; // timeframe des signaux (bougie fermee)
+//--- INPUTS strategie
+enum ENUM_ENGINE { ENGINE_MA=0,      // MA-TREND : pullback EMA20 + croisement EMA9/21 (v2.17)
+                   ENGINE_CANDLE=1 };// CANDLE historique (falsifie — comparaison seulement)
+input ENUM_ENGINE    InpEngine      = ENGINE_MA; // moteur de signal
+input ENUM_TIMEFRAMES InpSignalTF   = PERIOD_D1; // timeframe des signaux (bougie fermee) — D1 pour MA-TREND
+//--- MOTEUR MA-TREND (v2.17)
+input bool   InpMAPullback   = true;       // entree pullback : prix touche l'EMA20 dans le sens de la tendance
+input bool   InpMACross      = true;       // entree croisement EMA9/21
+input int    InpMAFast       = 9;          // EMA rapide (tendance + croisement)
+input int    InpMASlow       = 21;         // EMA lente (tendance + croisement)
+input int    InpMAPull       = 20;         // EMA de pullback (zone de repli)
+input double InpMASLATR      = 2.0;        // plancher du SL en xATR (le SL = extreme du repli, jamais moins que ca)
+input double InpTPPct        = 6.0;        // objectif de gain en % DU PRIX (5-8 realiste sur un mouvement D1 ; 0 = pas de TP, sortie au cross/trailing)
+input bool   InpExitOnCross  = true;       // fermer la position au croisement EMA9/21 inverse (tendance finie)
 //--- FILTRES anti-fausse-cassure
 input int    InpEMAPeriod     = 200;       // EMA tendance sur TF de signal (0=off) — SEUL filtre de tendance par defaut
 input int    InpTrendMAD1     = 0;         // SMA D1 tendance de fond (0=off) — desactive : double filtre trop strict (etouffait les cassures)
@@ -265,6 +296,14 @@ double EmaLast(const double &src[], const int n)
    for(int i=1;i<sz;i++) e=a*src[i]+(1.0-a)*e;
    return e;
 }
+//--- EMA a l'index 'idx' (0..sz-1), warm-up depuis src[0]. -1 si indispo.
+double EmaAt(const double &src[], const int n, const int idx)
+{
+   int sz=ArraySize(src); if(n<=0 || idx<0 || idx>=sz) return -1.0;
+   double a=2.0/(n+1.0), e=src[0];
+   for(int k=1;k<=idx;k++) e=a*src[k]+(1.0-a)*e;
+   return e;
+}
 double SmaLastRates(const MqlRates &r[], const int period)
 {
    int n=ArraySize(r);
@@ -281,6 +320,9 @@ struct Indi
    double close;                  // cloture de la bougie de signal
    double ema;                    // EMA tendance (0 si off)
    double atr, rsi, adx;
+   // --- MA-TREND (v2.17), sur la DERNIERE bougie fermee [i] et la precedente [i-1] ---
+   double emaFast,  emaSlow,  emaPull;   // EMA9/EMA21/EMA20 a [i]
+   double emaFast0, emaSlow0;            // EMA9/EMA21 a [i-1] (detection de croisement)
 };
 bool ComputeIndi(const MqlRates &r[], Indi &v)
 {
@@ -323,6 +365,11 @@ bool ComputeIndi(const MqlRates &r[], Indi &v)
    v.adx=adx[i];
 
    v.ema=(InpEMAPeriod>0)? EmaLast(close,InpEMAPeriod) : 0.0;
+
+   // --- EMA MA-TREND (v2.17) : EMA9/21/20 a [i] et EMA9/21 a [i-1] ---
+   v.emaFast =EmaAt(close,InpMAFast,i);   v.emaSlow =EmaAt(close,InpMASlow,i);
+   v.emaPull =EmaAt(close,InpMAPull,i);
+   v.emaFast0=EmaAt(close,InpMAFast,i-1); v.emaSlow0=EmaAt(close,InpMASlow,i-1);
 
    if(v.atr<=0) return false;
    return true;
@@ -463,6 +510,49 @@ int CandleSignal(const MqlRates &r[], const Indi &v, double &slDist, string &pat
    return sig;
 }
 //+------------------------------------------------------------------+
+//| MA-TREND (v2.17) : suivi de tendance sur la derniere bougie      |
+//| FERMEE du TF signal (defaut D1).                                 |
+//|  Tendance : EMA9 > EMA21 (haussiere) / EMA9 < EMA21 (baissiere). |
+//|  ENTREE 1 pullback : dans le sens de la tendance, la bougie a    |
+//|   TOUCHE l'EMA20 (low<=EMA20 en up, high>=EMA20 en down) et a    |
+//|   RECLOTURE du bon cote (close>EMA20 en up) -> repli achete.     |
+//|  ENTREE 2 croisement : EMA9 croise EMA21 sur la derniere bougie  |
+//|   (fast0<=slow0 puis fast>slow -> Buy ; symetrique Sell).        |
+//|  SL = extreme de la bougie de repli +/- 0.1 ATR, plancher        |
+//|   InpMASLATR x ATR. Le TP en % du prix est pose dans TryEnter.   |
+//|  Retourne +1/-1/0 ; les filtres communs (FiltersAllow) suivent.  |
+//+------------------------------------------------------------------+
+int MaTrendSignal(const MqlRates &r[], const Indi &v, double &slDist, string &pat)
+{
+   int n=ArraySize(r); if(n<3) return 0;
+   int i=n-1;
+   double atr=v.atr; pat=""; slDist=0.0;
+   if(atr<=0) return 0;
+   if(v.emaFast<=0 || v.emaSlow<=0 || v.emaPull<=0) return 0;    // warm-up insuffisant
+
+   double h1=r[i].high, l1=r[i].low, c1=r[i].close;
+   bool up  =(v.emaFast>v.emaSlow);      // tendance haussiere
+   bool down=(v.emaFast<v.emaSlow);      // tendance baissiere
+   int sig=0;
+
+   // ENTREE 2 : croisement EMA9/21 sur la bougie qui vient de fermer (prioritaire)
+   if(InpMACross && v.emaFast0>0 && v.emaSlow0>0){
+      if(v.emaFast0<=v.emaSlow0 && v.emaFast>v.emaSlow){ sig=+1; pat="ema_cross_up"; }
+      else if(v.emaFast0>=v.emaSlow0 && v.emaFast<v.emaSlow){ sig=-1; pat="ema_cross_dn"; }
+   }
+   // ENTREE 1 : pullback sur l'EMA20 dans le sens de la tendance etablie
+   if(sig==0 && InpMAPullback){
+      if(up   && l1<=v.emaPull && c1>v.emaPull){ sig=+1; pat="pullback_ema20"; }
+      else if(down && h1>=v.emaPull && c1<v.emaPull){ sig=-1; pat="pullback_ema20"; }
+   }
+   if(sig==0) return 0;
+
+   // SL sous l'extreme de la bougie (le repli), plancher anti-lot-enorme
+   double d=(sig>0)? (c1-l1) : (h1-c1);
+   slDist=MathMax(d+0.10*atr, InpMASLATR*atr);
+   return sig;
+}
+//+------------------------------------------------------------------+
 //| MARTINGALE PLAFONNEE : multiplicateur = Mult^(pertes consecutives|
 //| PAR PAIRE, magic strict), plafonne en pas ET en % du capital.    |
 //| Serie relue depuis l'historique des deals (robuste aux restarts, |
@@ -533,6 +623,38 @@ double MartRiskMultiplier(const string sym)
    double capMult=(eq*InpMartMaxRiskPct)/baseRisk;
    if(mult>capMult) mult=capMult;
    return MathMax(mult,1.0);
+}
+//+------------------------------------------------------------------+
+//| MA-TREND (v2.17) : sortie au CROISEMENT EMA9/21 inverse.         |
+//| Une position longue est fermee des que la tendance passe         |
+//| baissiere (EMA9<EMA21) sur la derniere bougie fermee du TF       |
+//| signal, et vice-versa : la these de tendance n'est plus valide.  |
+//| Recalcule par symbole a chaque cycle (D1 : peu de symboles, ok). |
+//| Ne tient JAMAIS compte du P/L (pas d'equity-curve trading) —     |
+//| c'est la structure de marche qui decide, pas le flottant.        |
+//+------------------------------------------------------------------+
+void ManageMaCrossExit()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string sym=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      MqlRates r[]; ArraySetAsSeries(r,false);
+      int need=MathMax(InpMASlow+10,60);
+      if(CopyRates(sym,InpSignalTF,1,LOOKBACK,r)<need) continue;   // pas assez d'historique -> on ne touche pas
+      int m=ArraySize(r); double close[]; ArrayResize(close,m);
+      for(int k=0;k<m;k++) close[k]=r[k].close;
+      double ef=EmaAt(close,InpMAFast,m-1), es=EmaAt(close,InpMASlow,m-1);
+      if(ef<=0 || es<=0) continue;
+      bool isLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+      bool flip=(isLong && ef<es) || (!isLong && ef>es);
+      if(!flip) continue;
+      ulong tk=PositionGetInteger(POSITION_TICKET);
+      if(g_trade.PositionClose(tk))
+         Print("[MA-EXIT] ",sym," croisement EMA",InpMAFast,"/",InpMASlow,
+               " inverse -> fermeture (tendance finie)");
+      else
+         Print("[MA-EXIT] ",sym," echec fermeture ret=",g_trade.ResultRetcode());
+   }
 }
 //+------------------------------------------------------------------+
 //| BREAKEVEN + TRAILING (tous moteurs, toutes les 30 s, meme en     |
@@ -1052,11 +1174,17 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
 
    // SL/TP ancres sur le prix de SORTIE (bid=long, ask=short)
    // CANDLE : TP = InpCdlRR x SL (>=1 requis pour la recuperation martingale)
-   double rr=InpCdlRR;
    int digits=(int)SymbolInfoInteger(sym,SYMBOL_DIGITS);
    double base=longSig?tick.bid:tick.ask;
    double sl=NormalizeDouble(longSig?base-slDist:base+slDist,digits);
-   double tp=(rr>0)? NormalizeDouble(longSig?base+rr*slDist:base-rr*slDist,digits) : 0.0;
+   // TP : MA-TREND vise un % du PRIX (objectif de mouvement) ; CANDLE garde RR x SL
+   double tp;
+   if(InpEngine==ENGINE_MA)
+      tp=(InpTPPct>0)? NormalizeDouble(longSig?base*(1.0+InpTPPct/100.0):base*(1.0-InpTPPct/100.0),digits) : 0.0;
+   else{
+      double rr=InpCdlRR;
+      tp=(rr>0)? NormalizeDouble(longSig?base+rr*slDist:base-rr*slDist,digits) : 0.0;
+   }
    if(!StopsValid(sym,price,sl,tp)){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";stops_level"); return true; }
 
    // sizing exact — risque en $ FIXE (InpRiskCashFixed>0) sinon % de l'equity,
@@ -1117,7 +1245,10 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
          price=longSig?tick.ask:tick.bid;
          base=longSig?tick.bid:tick.ask;
          sl=NormalizeDouble(longSig?base-slDist:base+slDist,digits);
-         tp=(rr>0)? NormalizeDouble(longSig?base+rr*slDist:base-rr*slDist,digits) : 0.0;
+         if(InpEngine==ENGINE_MA)
+            tp=(InpTPPct>0)? NormalizeDouble(longSig?base*(1.0+InpTPPct/100.0):base*(1.0-InpTPPct/100.0),digits) : 0.0;
+         else
+            tp=(InpCdlRR>0)? NormalizeDouble(longSig?base+InpCdlRR*slDist:base-InpCdlRR*slDist,digits) : 0.0;
          ok=longSig? g_trade.Buy(lots,sym,price,sl,tp,"MIKAEL_DONCHIAN")
                    : g_trade.Sell(lots,sym,price,sl,tp,"MIKAEL_DONCHIAN");
       }
@@ -1252,8 +1383,13 @@ int OnInit()
    }
    EventSetTimer(30);
    string symList=""; for(int i=0;i<g_nsym;i++) symList+=(i>0?",":"")+SYMBOLS[i];
-   string stratStr="CANDLE (engulf="+(InpCdlEngulfing?"ON":"OFF")+" pin="+(InpCdlPinbar?"ON":"OFF")+
-               ", RR="+DoubleToString(InpCdlRR,2)+
+   string engineStr=(InpEngine==ENGINE_MA)
+      ? "MA-TREND (pullback="+(InpMAPullback?"ON":"OFF")+" cross="+(InpMACross?"ON":"OFF")
+        +" EMA"+IntegerToString(InpMAFast)+"/"+IntegerToString(InpMASlow)+" pull=EMA"+IntegerToString(InpMAPull)
+        +", TP="+DoubleToString(InpTPPct,1)+"% exitCross="+(InpExitOnCross?"ON":"OFF")
+        +", SLfloor="+DoubleToString(InpMASLATR,1)+"ATR"
+      : "CANDLE (engulf="+(InpCdlEngulfing?"ON":"OFF")+" pin="+(InpCdlPinbar?"ON":"OFF")+", RR="+DoubleToString(InpCdlRR,2);
+   string stratStr=engineStr+
                ", MART="+(InpMartEnable?"x"+DoubleToString(InpMartMult,1)+"^"+IntegerToString(InpMartMaxSteps)+
                " cap "+DoubleToString(InpMartMaxRiskPct*100,1)+"%"+(InpMartSkipHardSL?" skipSL":""):"OFF")+
                ", MFElog="+(InpLogMfeMae?"ON":"OFF")+
@@ -1269,7 +1405,7 @@ int OnInit()
       +(InpMaxMarginPct>0? "marge<="+DoubleToString(InpMaxMarginPct*100,0)+"% ":"marge=OFF ")
       +(InpMaxCcyRiskMult>0? "ccy_risk<="+DoubleToString(InpMaxCcyRiskMult,1)+"x ":"ccy_risk=OFF ")
       +"churn_guard retry_revalid";
-   Print("MIKAEL_DONCHIAN v2.16 (CANDLE only) init OK | ",guardStr," | sent_filter=",
+   Print("MIKAEL_DONCHIAN v2.17 (",(InpEngine==ENGINE_MA?"MA-TREND":"CANDLE"),") init OK | ",guardStr," | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
          " | ",stratStr," | ",basketStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),
@@ -1290,6 +1426,7 @@ void OnTimer()
 {
    if(InpLogMfeMae) TrackMfeMae();   // AVANT les fermetures : capte l'excursion la plus recente
    EnforceTimeStop();
+   if(InpEngine==ENGINE_MA && InpExitOnCross) ManageMaCrossExit(); // tendance finie -> sortie
    ManageBreakevenTrailing();   // BE + trailing a chaque cycle (gestion, tourne meme en halt)
    ManageBasketLock();          // verrou du flottant total du panier (gestion, tourne meme en halt)
 
@@ -1385,18 +1522,18 @@ void OnTimer()
 
       bool friday=(now.day_of_week==5 && now.hour>=InpNoFridayAfter);
 
-      // --- 3) entree CANDLE ---
-      // (pas de sortie par signal : SL/TP fixes + breakeven/trailing + time-stop)
+      // --- 3) entree (moteur MA-TREND ou CANDLE) ---
       if(halt || friday) continue;
       if(SymbolBusy(sym)) continue;
 
       bool longSig=false; double slDist=0.0; string why="";
 
       string pat="";
-      int sig=CandleSignal(r,v,slDist,pat);
+      int sig=(InpEngine==ENGINE_MA)? MaTrendSignal(r,v,slDist,pat)
+                                    : CandleSignal(r,v,slDist,pat);
       if(sig==0) continue;
       longSig=(sig>0);
-      Print("[CANDLE] ",sym," pattern ",pat," ",(longSig?"Buy":"Sell"),
+      Print("[",(InpEngine==ENGINE_MA?"MA":"CANDLE"),"] ",sym," ",pat," ",(longSig?"Buy":"Sell"),
             " sl_dist=",DoubleToString(slDist/SymbolInfoDouble(sym,SYMBOL_POINT),0),"pt");
 
       // filtres de tendance/force communs (EMA200/D1/ADX/RSI-cap)
