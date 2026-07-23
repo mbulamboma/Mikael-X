@@ -1,5 +1,15 @@
 //+------------------------------------------------------------------+
 //| MIKAEL_DONCHIAN.mq5 — moteur UNIQUE : CANDLE, armature FTMO      |
+//| v2.15 : PRIORITE PAR SCORE (2 passes dans le cycle). Avant, les  |
+//|  signaux d'une meme bougie etaient executes dans l'ordre de      |
+//|  InpSymbols (premier liste = premier servi quand il reste peu de |
+//|  slots MaxConcurrent). Desormais : passe 1 = collecte de TOUS les|
+//|  signaux valides du cycle ; passe 2 = execution par SCORE        |
+//|  decroissant. Score = ADX (force de la tendance) + bonus +10 si  |
+//|  le sentiment macro est ALIGNE au sens du trade (FX seulement,   |
+//|  le veto contraire existant reste inchange). Log [RANK] quand    |
+//|  plusieurs signaux concourent. Les retries de spread (pendings)  |
+//|  gardent leur traitement en tete de cycle (signaux plus anciens).|
 //| v2.14 : SUPPORT INDICES/CFD (symboles non-FX dans InpSymbols).   |
 //|  Trois gardes supposaient des paires FX a 6 lettres :            |
 //|   1) spread : pips FX -> pour les non-FX, garde RELATIVE a l'ATR |
@@ -80,7 +90,7 @@
 //|  a un autre EA : le day-ticket d'IA/MACRO vise magic+1).         |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.14"
+#property version   "2.15"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -320,6 +330,26 @@ bool GetPairSentiment(const string sym, double &sent)
    }
    sent=sBase-sQuote;
    return true;
+}
+//+------------------------------------------------------------------+
+//| SCORE d'un signal (priorite d'execution quand plusieurs signaux  |
+//| concourent pour les memes slots MaxConcurrent, v2.15).           |
+//|  base = ADX (force de tendance, deja calcule et filtre >= MinADX)|
+//|  +10  = sentiment macro ALIGNE au sens du trade (FX seulement ;  |
+//|         le veto sentiment CONTRAIRE de FiltersAllow reste la     |
+//|         barriere, ici on ne fait que recompenser l'alignement).  |
+//+------------------------------------------------------------------+
+double SignalScore(const string sym, const bool longSig, const double adx)
+{
+   double score=adx;
+   if(InpSentThreshold>0 && IsFxPair(sym)){
+      double sent;
+      if(GetPairSentiment(sym,sent)){
+         if(( longSig && sent> InpSentThreshold) ||
+            (!longSig && sent<-InpSentThreshold)) score+=10.0;
+      }
+   }
+   return score;
 }
 //+------------------------------------------------------------------+
 //| Filtres de tendance/force : autorisent-ils la direction demandee |
@@ -1045,7 +1075,7 @@ int OnInit()
       : "basket_lock=OFF";
    string riskStr=(InpRiskCashFixed>0)? DoubleToString(InpRiskCashFixed,2)+"$/trade (FIXE)"
                                       : DoubleToString(InpRiskPerTrade*100,2)+"% equity";
-   Print("MIKAEL_DONCHIAN v2.14 (CANDLE only) init OK | sent_filter=",
+   Print("MIKAEL_DONCHIAN v2.15 (CANDLE only) init OK | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
          " | ",stratStr," | ",basketStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),
@@ -1103,6 +1133,10 @@ void OnTimer()
                 && (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)
                 && (bool)MQLInfoInteger(MQL_TRADE_ALLOWED)
                 && (bool)AccountInfoInteger(ACCOUNT_TRADE_ALLOWED);
+
+   // candidats de CE cycle (passe 1 : collecte ; passe 2 : execution par score)
+   string cSym[]; bool cLong[]; double cSl[]; double cAdx[]; double cRef[]; double cScore[]; int cIdx[];
+   int nc=0;
 
    for(int s=0;s<g_nsym;s++){
       string sym=SYMBOLS[s];
@@ -1162,11 +1196,47 @@ void OnTimer()
          continue;
       }
 
-      if(!TryEnter(sym,longSig,slDist,v.adx,canTrade,v.close)){
-         g_pendActive[s]=true; g_pendLong[s]=longSig; g_pendSlDist[s]=slDist;
-         g_pendRefPx[s]=v.close;
-         g_pendExpiry[s]=TimeCurrent()+90*60;
-         Print("[WAIT] ",sym," spread trop large — signal en attente (retry 30s, max 90 min)");
+      // passe 1 : COLLECTE (v2.15) — l'execution est differee en fin de cycle
+      // et triee par score, sinon l'ordre de InpSymbols ferait la priorite
+      ArrayResize(cSym,nc+1);  ArrayResize(cLong,nc+1); ArrayResize(cSl,nc+1);
+      ArrayResize(cAdx,nc+1);  ArrayResize(cRef,nc+1);  ArrayResize(cScore,nc+1);
+      ArrayResize(cIdx,nc+1);
+      cSym[nc]=sym; cLong[nc]=longSig; cSl[nc]=slDist; cAdx[nc]=v.adx;
+      cRef[nc]=v.close; cScore[nc]=SignalScore(sym,longSig,v.adx); cIdx[nc]=s;
+      nc++;
+   }
+
+   // --- 4) passe 2 : execution par SCORE decroissant (v2.15) ---
+   //     Les slots (MaxConcurrent/MaxPerCcy/famille indices) vont aux signaux
+   //     les plus forts de la bougie, pas aux premiers de la liste.
+   if(nc>0){
+      for(int a=0;a<nc-1;a++){                       // tri selection (nc petit)
+         int best=a;
+         for(int b=a+1;b<nc;b++) if(cScore[b]>cScore[best]) best=b;
+         if(best!=a){
+            string ts=cSym[a];   cSym[a]=cSym[best];     cSym[best]=ts;
+            bool   tb=cLong[a];  cLong[a]=cLong[best];   cLong[best]=tb;
+            double td;
+            td=cSl[a];    cSl[a]=cSl[best];       cSl[best]=td;
+            td=cAdx[a];   cAdx[a]=cAdx[best];     cAdx[best]=td;
+            td=cRef[a];   cRef[a]=cRef[best];     cRef[best]=td;
+            td=cScore[a]; cScore[a]=cScore[best]; cScore[best]=td;
+            int ti=cIdx[a]; cIdx[a]=cIdx[best];   cIdx[best]=ti;
+         }
+      }
+      if(nc>1){
+         string ord="";
+         for(int a=0;a<nc;a++) ord+=(a>0?" > ":"")+cSym[a]+"("+DoubleToString(cScore[a],1)+")";
+         Print("[RANK] ",nc," signaux concurrents: ",ord);
+      }
+      for(int a=0;a<nc;a++){
+         if(!TryEnter(cSym[a],cLong[a],cSl[a],cAdx[a],canTrade,cRef[a])){
+            int p=cIdx[a];
+            g_pendActive[p]=true; g_pendLong[p]=cLong[a]; g_pendSlDist[p]=cSl[a];
+            g_pendRefPx[p]=cRef[a];
+            g_pendExpiry[p]=TimeCurrent()+90*60;
+            Print("[WAIT] ",cSym[a]," spread trop large — signal en attente (retry 30s, max 90 min)");
+         }
       }
    }
 }
