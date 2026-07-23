@@ -1,5 +1,32 @@
 //+------------------------------------------------------------------+
 //| MIKAEL_DONCHIAN.mq5 — moteur UNIQUE : CANDLE, armature FTMO      |
+//| v2.16 : GARDES DE SECURITE LIVE (post-mortem forward 16-23 juil  |
+//|  2026 : marge epuisee le 21/07, daily stop -3.58% le 17/07 sur   |
+//|  l'instance M15, churn 8x NZDUSD en 2 jours) :                   |
+//|   A1) garde de MARGE prospective (InpMaxMarginPct) : rejet si    |
+//|       marge utilisee + marge du trade > x% equity — le sizing par|
+//|       risque ne voit pas le notionnel (16.72 lots AUDJPY) ;      |
+//|   A2) RE-VALIDATION complete au retry spread : EMA/ADX/sentiment |
+//|       re-verifies a l'execution (avant : 28% des fills live      |
+//|       partaient avec adx=0, filtres de la bougie d'origine) ;    |
+//|   A3) ANTI-CHURN : apres une sortie, pas de re-entree dans la    |
+//|       MEME direction tant qu'une bougie du TF signal commencee   |
+//|       APRES la sortie n'a pas cloture (SL plein : 1 bougie de    |
+//|       plus) — casse le cycle scratch zero-lock -> re-entree ;    |
+//|   A4) exposition par devise comptee en RISQUE $ directionnel     |
+//|       (InpMaxCcyRiskMult x risque de base, martingale incluse),  |
+//|       en plus du compte de positions (17/07 : 4 positions long   |
+//|       USD ~45 lots = un seul pari leverage) ;                    |
+//|   B1) martingale : serie ENTIERE verifiee pour les SL durs (avant|
+//|       : seule la perte la plus recente — SL->SL->molle doublait);|
+//|   B2) martingale interdite si une position correlee (devise      |
+//|       commune / famille indices) est deja ouverte ;              |
+//|   B3) martingale interdite si TF signal < H1 (backtest M5 : 121  |
+//|       evenements MART pour 21 trades, kill switch en 5 jours) ;  |
+//|   C1) zero-lock par defaut 0.10 -> 0.50 ATR (1455 passages BE vs |
+//|       79 TP en backtest : 0.10 scratchait tout) ;                |
+//|   C3) init refusee si balance compte diverge >20% de             |
+//|       InpInitialBalance (kill switch -90% instantane en testeur).|
 //| v2.15 : PRIORITE PAR SCORE (2 passes dans le cycle). Avant, les  |
 //|  signaux d'une meme bougie etaient executes dans l'ordre de      |
 //|  InpSymbols (premier liste = premier servi quand il reste peu de |
@@ -90,7 +117,7 @@
 //|  a un autre EA : le day-ticket d'IA/MACRO vise magic+1).         |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.15"
+#property version   "2.16"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -120,7 +147,7 @@ input double InpMartMaxRiskPct= 0.015;     // cap ABSOLU du risque d'un trade en
 input int    InpMartLookbackD = 14;        // profondeur d'historique (jours) pour compter la serie de pertes
 input bool   InpMartSkipHardSL= true;      // si la DERNIERE perte de la paire est un vrai SL/stop-out ([sl]/[so]) -> pas de martingale (anti-clustering en mauvais regime)
 //--- BREAKEVEN + TRAILING STOP (gestion ATR, tous moteurs ; 0 = off)
-input double InpBEZeroTrigATR = 0.10;      // ZERO-LOCK : profit >= x*ATR -> SL a l'entree (+buffer) TOUT DE SUITE (un trade repasse en vert ne redevient plus perdant). 0 = off. ⚠️ agressif : peut scratcher des gagnants, mesurer via le log MFE/MAE
+input double InpBEZeroTrigATR = 0.50;      // ZERO-LOCK : profit >= x*ATR -> SL a l'entree (+buffer). 0 = off. v2.16 : defaut 0.10 -> 0.50 (0.10 = bruit pur : 1455 scratches BE vs 79 TP en backtest, churn massif en forward). A re-calibrer via l'analyse MFE/MAE
 input double InpBETriggerATR  = 1.0;       // profit >= x*ATR -> SL remonte a l'entree (+buffer) : le trade ne peut plus perdre
 input double InpBEBufferATR   = 0.05;      // buffer du breakeven (xATR) — couvre spread+commission
 input double InpTrailStartATR = 1.5;       // profit >= x*ATR -> trailing actif
@@ -137,6 +164,8 @@ input double InpDailyStopPct   = 0.035;    // budget de perte journalier (FTMO 5
 input double InpMaxDDPct       = 0.07;     // halt total (FTMO 10% - marge)
 input int    InpMaxConcurrent  = 3;        // positions simultanees max
 input int    InpMaxPerCcy      = 2;        // positions max par devise
+input double InpMaxCcyRiskMult = 2.0;      // v2.16 : risque $ max par devise DIRECTIONNEL, en multiples du risque de base (martingale incluse ; 0=off). Complements InpMaxPerCcy : 2 positions dont une martingalee x2 = 3 unites de risque -> bloque
+input double InpMaxMarginPct   = 0.35;     // v2.16 : marge totale max (utilisee + trade candidat) en fraction de l'equity (0=off) — garde PROSPECTIVE du notionnel, que le sizing par risque ne voit pas
 input int    InpNoFridayAfter  = 22;       // pas d'entree vendredi apres (h srv) — regle FTMO gap-trading
 input double InpMaxSpreadPips  = 1.0;      // spread max en pips — paires FX uniquement (EURUSD ~0.2 chez FTMO)
 input double InpMaxSpreadATR   = 0.05;     // spread max des symboles NON-FX (indices/CFD) en fraction d'ATR (0.05 = 5%)
@@ -172,6 +201,10 @@ datetime g_pendExpiry[];
 double   g_pendRefPx[];
 datetime g_coolUntil[];
 double   g_lastAtr[];      // ATR14 TF signal par paire (rafraichi a chaque bougie) — trailing/BE
+// --- ANTI-CHURN v2.16 (A3) : derniere sortie par paire ---
+datetime g_exitTime[];     // heure du dernier deal OUT de la paire (0 = aucun)
+bool     g_exitLong[];     // direction de la position FERMEE
+bool     g_exitHard[];     // true = SL/stop-out touche EN PERTE (bloque 1 bougie de plus)
 // --- suivi MFE/MAE par position OUVERTE (recherche : calibration no-progress) ---
 // echantillonne a chaque OnTimer (30s). Etat NON persiste : au redemarrage de
 // l'EA, une position deja ouverte reprend son excursion a partir du prix courant
@@ -441,6 +474,16 @@ int CandleSignal(const MqlRates &r[], const Indi &v, double &slDist, string &pat
 double MartRiskMultiplier(const string sym)
 {
    if(!InpMartEnable || InpMartMaxSteps<=0 || InpMartMult<=1.0) return 1.0;
+   // v2.16 (B3) : jamais de martingale sous H1 — backtest M5 : 121 evenements
+   // MART pour 21 trades, kill switch -7% en 5 jours (emballement structurel)
+   if(PeriodSeconds(InpSignalTF)<PeriodSeconds(PERIOD_H1)) return 1.0;
+   // v2.16 (B2) : jamais de martingale si une position correlee (devise
+   // commune / famille indices) est deja ouverte — doubler un risque deja
+   // correle = crash du 30/05 (GBPUSD x2 + EURUSD -> -7% en 45 min)
+   if(HasCorrelatedOpen(sym)){
+      Print("[MART] ",sym," position correlee ouverte -> pas de martingale");
+      return 1.0;
+   }
    double eq=AccountInfoDouble(ACCOUNT_EQUITY);
    double baseRisk=(InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade;
    if(baseRisk<=0) return 1.0;
@@ -457,16 +500,17 @@ double MartRiskMultiplier(const string sym)
                   +HistoryDealGetDouble(dl,DEAL_SWAP)
                   +HistoryDealGetDouble(dl,DEAL_COMMISSION);
          if(pl<-lossThr){
-            // Niveau 1 (anti-clustering) : la perte la PLUS RECENTE de la paire
-            // (streak==0) est-elle un vrai SL/stop-out touche ? Si oui, c'est un
-            // signal de mauvais regime directionnel -> on NE double PAS. On ne
-            // martingale que sur des pertes "molles" (BE-scratch, time-stop,
-            // fermeture EA), pas dans la direction qui vient de nous coller un SL.
-            if(InpMartSkipHardSL && streak==0){
+            // Anti-clustering v2.16 (B1) : si N'IMPORTE QUELLE perte de la serie
+            // est un vrai SL/stop-out touche -> pas de martingale du tout. C'est
+            // un signal de mauvais regime directionnel : on ne martingale que
+            // sur des series de pertes "molles" (BE-scratch, time-stop,
+            // fermeture EA). Avant : seule la perte la plus recente (streak==0)
+            // etait verifiee — une serie SL->SL->molle doublait quand meme.
+            if(InpMartSkipHardSL){
                string cmt=HistoryDealGetString(dl,DEAL_COMMENT);
                StringToLower(cmt);
                if(StringFind(cmt,"[sl")>=0 || StringFind(cmt,"[so")>=0){
-                  Print("[MART] ",sym," derniere perte = SL/stop-out touche -> pas de martingale (regime defavorable)");
+                  Print("[MART] ",sym," SL/stop-out dans la serie de pertes -> pas de martingale (regime defavorable)");
                   return 1.0;
                }
             }
@@ -641,6 +685,81 @@ int CcyCount(const string ccy)
       if(StringSubstr(sym,0,3)==ccy || StringSubstr(sym,3,3)==ccy) c++;
    }
    return c;
+}
+//+------------------------------------------------------------------+
+//| v2.16 (A4) : risque $ pire-cas des positions ouvertes du magic   |
+//| exposees a la devise ccy dans le SENS donne (longCcy=true : la   |
+//| position gagne si ccy monte). Un long EURUSD est long EUR et     |
+//| short USD. Le risque est relu depuis le SL REEL de chaque        |
+//| position -> une position martingalee pese son vrai poids (le     |
+//| compte de positions InpMaxPerCcy ne voyait pas ca : 17/07 live,  |
+//| 4 positions long USD ~45 lots = un seul pari).                   |
+//+------------------------------------------------------------------+
+double CcyDirRiskCash(const string ccy, const bool longCcy)
+{
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   double baseUnit=(InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade;
+   double total=0.0;
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string sym=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsFxPair(sym)) continue;
+      bool posLong=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY);
+      bool match=false, ccyLong=false;
+      if(StringSubstr(sym,0,3)==ccy){ match=true; ccyLong=posLong;  }  // devise de base
+      else if(StringSubstr(sym,3,3)==ccy){ match=true; ccyLong=!posLong; } // devise cotee
+      if(!match || ccyLong!=longCcy) continue;
+      double sl =PositionGetDouble(POSITION_SL);
+      double cur=PositionGetDouble(POSITION_PRICE_CURRENT);
+      double vol=PositionGetDouble(POSITION_VOLUME);
+      // SL absent (ne devrait pas arriver) : compte 1 unite de risque de base
+      double risk=(sl>0)? LossPerLotAtSL(sym,posLong,cur,sl)*vol : baseUnit;
+      // SL deja au-dela du prix (BE verrouille) : plus de risque residuel
+      if(sl>0 && ((posLong && cur<=sl) || (!posLong && cur>=sl))) risk=0.0;
+      total+=risk;
+   }
+   return total;
+}
+//+------------------------------------------------------------------+
+//| v2.16 (B2) : une position ouverte du magic partage-t-elle une    |
+//| devise (FX) ou la famille (non-FX) avec sym ? -> martingale      |
+//| interdite : doubler le risque quand une position correlee est    |
+//| deja exposee = le crash backtest du 30/05 (GBPUSD mart x2 +      |
+//| EURUSD meme direction -> -7% -> kill switch en 45 min).          |
+//+------------------------------------------------------------------+
+bool HasCorrelatedOpen(const string sym)
+{
+   bool fx=IsFxPair(sym);
+   string b=fx?StringSubstr(sym,0,3):"", q=fx?StringSubstr(sym,3,3):"";
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string ps=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(ps==sym) continue;
+      if(fx){
+         if(!IsFxPair(ps)) continue;
+         if(StringSubstr(ps,0,3)==b || StringSubstr(ps,3,3)==b ||
+            StringSubstr(ps,0,3)==q || StringSubstr(ps,3,3)==q) return true;
+      }else{
+         if(!IsFxPair(ps)) return true;   // indices = une seule famille correlee
+      }
+   }
+   return false;
+}
+//+------------------------------------------------------------------+
+//| v2.16 (A3) ANTI-CHURN : re-entree dans la MEME direction permise |
+//| seulement quand une bougie du TF signal COMMENCEE APRES la       |
+//| sortie a cloture (sortie SL plein en perte : une bougie de plus).|
+//| Casse le cycle scratch zero-lock -> pattern encore valide ->     |
+//| re-entree immediate (forward M15 : 8 entrees NZDUSD en 2 jours,  |
+//| ~9 lots chacune, frottement spread massif).                      |
+//+------------------------------------------------------------------+
+bool ChurnBlocked(const string sym, const bool longSig)
+{
+   int s=SymIndex(sym); if(s<0) return false;
+   if(g_exitTime[s]<=0 || g_exitLong[s]!=longSig) return false;
+   int back=g_exitHard[s]? 2 : 1;
+   datetime bs=iTime(sym,InpSignalTF,back);
+   return (bs==0 || bs<=g_exitTime[s]);   // la bougie n'a pas commence apres la sortie -> bloque
 }
 int MagicPositions()
 {
@@ -909,6 +1028,9 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
    { LogRow(row+"0;"+(InpDryRun?"1":"0")+";cooldown"); return true; }
    if(MagicPositions()>=InpMaxConcurrent){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";max_conc"); return true; }
    if(SymbolBusy(sym)){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";sym_busy"); return true; }
+   // v2.16 (A3) : anti-churn — pas de re-entree meme direction avant qu'une
+   // bougie du TF signal posterieure a la sortie n'ait cloture
+   if(ChurnBlocked(sym,longSig)){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";churn_guard"); return true; }
    if(fx){
       if(CcyCount(StringSubstr(sym,0,3))>=InpMaxPerCcy ||
          CcyCount(StringSubstr(sym,3,3))>=InpMaxPerCcy)
@@ -937,8 +1059,32 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
    double riskCash=((InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade)*mart;
    if(mart>1.0) Print("[MART] ",sym," serie de pertes -> risque x",DoubleToString(mart,2),
                       " (",DoubleToString(riskCash,2),"$)");
+
+   // v2.16 (A4) : risque DIRECTIONNEL par devise, martingale incluse — le
+   // compte de positions (ccy_corr) ne pese pas les lots ; ici on borne le
+   // risque $ cumule par devise et par sens a InpMaxCcyRiskMult x unite de base
+   if(fx && InpMaxCcyRiskMult>0){
+      double unit=(InpRiskCashFixed>0)? InpRiskCashFixed : eq*InpRiskPerTrade;
+      double lim=InpMaxCcyRiskMult*unit;
+      string bC=StringSubstr(sym,0,3), qC=StringSubstr(sym,3,3);
+      if(CcyDirRiskCash(bC,longSig)+riskCash>lim ||
+         CcyDirRiskCash(qC,!longSig)+riskCash>lim)
+      { LogRow(row+"0;"+(InpDryRun?"1":"0")+";ccy_risk"); return true; }
+   }
+
    double lots=CalcLots(sym,longSig,price,sl,riskCash,why);
    if(lots<=0){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";"+why); return true; }
+
+   // v2.16 (A1) : garde de MARGE prospective — borne le notionnel que le
+   // sizing par risque ne voit pas (21/07 live : 16.72 lots AUDJPY sur SL
+   // serre -> marge epuisee, decouverte au moment de l'ordre suivant)
+   if(InpMaxMarginPct>0){
+      double needM=0.0;
+      if(OrderCalcMargin(longSig?ORDER_TYPE_BUY:ORDER_TYPE_SELL,sym,lots,price,needM)){
+         if(AccountInfoDouble(ACCOUNT_MARGIN)+needM > InpMaxMarginPct*eq)
+         { LogRow(row+"0;"+(InpDryRun?"1":"0")+";marge_budget"); return true; }
+      }
+   }
 
    // budget de perte journalier PROSPECTIF (regle FTMO)
    double dayPl=(g_dayAnchor>0)?(eq-g_dayAnchor)/g_dayAnchor:0;
@@ -978,6 +1124,20 @@ int OnInit()
 {
    if(ParseSymbols(InpSymbols)<=0)
    { Print("Aucune paire valide dans InpSymbols='",InpSymbols,"' — init annulee."); return INIT_FAILED; }
+
+   // v2.16 (C3) : coherence compte/config — un depot testeur different de
+   // InpInitialBalance declenchait un kill switch immediat (-90% percu,
+   // 2 runs de backtest gaspilles) ; en live ce serait un halt injustifie.
+   if(InpInitialBalance>0){
+      double bal=AccountInfoDouble(ACCOUNT_BALANCE);
+      if(MathAbs(bal-InpInitialBalance)/InpInitialBalance>0.20){
+         Print("!! INIT REFUSEE : balance du compte (",DoubleToString(bal,2),
+               ") diverge de plus de 20% de InpInitialBalance (",
+               DoubleToString(InpInitialBalance,2),
+               ") — aligner l'input sur la taille reelle du compte (ou le depot du testeur).");
+         return INIT_FAILED;
+      }
+   }
    ArrayResize(g_lastBar,g_nsym);
    ArrayResize(g_pendActive,g_nsym);
    ArrayResize(g_pendLong,g_nsym);
@@ -987,6 +1147,10 @@ int OnInit()
    ArrayResize(g_coolUntil,g_nsym);
    ArrayResize(g_lastAtr,g_nsym);
    ArrayInitialize(g_lastAtr,0.0);
+   ArrayResize(g_exitTime,g_nsym);
+   ArrayResize(g_exitLong,g_nsym);
+   ArrayResize(g_exitHard,g_nsym);
+   for(int i=0;i<g_nsym;i++){ g_exitTime[i]=0; g_exitLong[i]=false; g_exitHard[i]=false; }
 
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(20);
@@ -1020,6 +1184,25 @@ int OnInit()
       g_dayOfYear=ftmoDay;
       GlobalVariableSet(g_gvDayA,g_dayAnchor);
       GlobalVariableSet(g_gvDayD,g_dayOfYear);
+   }
+
+   // v2.16 (A3) : anti-churn retroactif — derniere sortie par paire relue
+   // depuis l'historique (sorties survenues pendant que l'EA etait eteint)
+   if(HistorySelect(TimeCurrent()-5*86400,TimeCurrent())){
+      for(int h=HistoryDealsTotal()-1;h>=0;h--){
+         ulong dl=HistoryDealGetTicket(h);
+         if(HistoryDealGetInteger(dl,DEAL_MAGIC)!=InpMagic) continue;
+         if(HistoryDealGetInteger(dl,DEAL_ENTRY)!=DEAL_ENTRY_OUT) continue;
+         int xi=SymIndex(HistoryDealGetString(dl,DEAL_SYMBOL)); if(xi<0) continue;
+         if(g_exitTime[xi]>0) continue;      // parcours du plus recent au plus ancien
+         double xpl=HistoryDealGetDouble(dl,DEAL_PROFIT)
+                   +HistoryDealGetDouble(dl,DEAL_SWAP)
+                   +HistoryDealGetDouble(dl,DEAL_COMMISSION);
+         string xc=HistoryDealGetString(dl,DEAL_COMMENT); StringToLower(xc);
+         g_exitTime[xi]=(datetime)HistoryDealGetInteger(dl,DEAL_TIME);
+         g_exitLong[xi]=(HistoryDealGetInteger(dl,DEAL_TYPE)==DEAL_TYPE_SELL);
+         g_exitHard[xi]=(xpl<0 && (StringFind(xc,"[sl")>=0 || StringFind(xc,"[so")>=0));
+      }
    }
 
    // cooldown retroactif (pertes fermees pendant que l'EA etait eteint)
@@ -1075,7 +1258,11 @@ int OnInit()
       : "basket_lock=OFF";
    string riskStr=(InpRiskCashFixed>0)? DoubleToString(InpRiskCashFixed,2)+"$/trade (FIXE)"
                                       : DoubleToString(InpRiskPerTrade*100,2)+"% equity";
-   Print("MIKAEL_DONCHIAN v2.15 (CANDLE only) init OK | sent_filter=",
+   string guardStr="gardes v2.16: "
+      +(InpMaxMarginPct>0? "marge<="+DoubleToString(InpMaxMarginPct*100,0)+"% ":"marge=OFF ")
+      +(InpMaxCcyRiskMult>0? "ccy_risk<="+DoubleToString(InpMaxCcyRiskMult,1)+"x ":"ccy_risk=OFF ")
+      +"churn_guard retry_revalid";
+   Print("MIKAEL_DONCHIAN v2.16 (CANDLE only) init OK | ",guardStr," | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
          " | ",stratStr," | ",basketStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),
@@ -1149,8 +1336,26 @@ void OnTimer()
                    ";0;1;0;0;"+(InpDryRun?"1":"0")+";pend_timeout");
          }
          else if(!halt && !(now.day_of_week==5 && now.hour>=InpNoFridayAfter)){
-            if(TryEnter(sym,g_pendLong[s],g_pendSlDist[s],0,canTrade,g_pendRefPx[s]))
-               g_pendActive[s]=false;
+            // v2.16 (A2) : RE-VALIDATION complete au retry — un signal differe
+            // par le spread ne s'execute plus avec les filtres de la bougie
+            // d'origine (forward : 28% des fills partaient avec adx=0, sans
+            // aucune re-verification EMA/ADX/sentiment jusqu'a 90 min plus tard)
+            MqlRates rp[];  ArraySetAsSeries(rp,false);
+            MqlRates rpD[]; ArraySetAsSeries(rpD,false);
+            Indi vp; string whyp="";
+            if(CopyRates(sym,InpSignalTF,1,LOOKBACK,rp)>=MathMax(InpEMAPeriod+10,60) &&
+               CopyRates(sym,PERIOD_D1,1,MathMax(InpTrendMAD1+20,60),rpD)>=MathMin(InpTrendMAD1,55) &&
+               ComputeIndi(rp,vp)){
+               if(!FiltersAllow(sym,g_pendLong[s],rpD,vp,whyp)){
+                  g_pendActive[s]=false;
+                  LogRow(TimeToString(TimeCurrent())+";"+sym+";"+(g_pendLong[s]?"Buy":"Sell")+
+                         ";"+DoubleToString(vp.adx,1)+";0;0;0;"+(InpDryRun?"1":"0")+";retry_"+whyp);
+                  Print("[RETRY] ",sym," signal differe invalide par les filtres: ",whyp);
+               }
+               else if(TryEnter(sym,g_pendLong[s],g_pendSlDist[s],vp.adx,canTrade,g_pendRefPx[s]))
+                  g_pendActive[s]=false;
+            }
+            // CopyRates transitoirement indisponible -> retry au prochain cycle (30s)
          }
       }
 
@@ -1241,13 +1446,13 @@ void OnTimer()
    }
 }
 //+------------------------------------------------------------------+
-//| Cooldown apres perte (actif seulement si InpCooldownHours>0)     |
+//| Sorties de position : memorisation anti-churn (v2.16, toujours   |
+//| active) + cooldown apres perte (optionnel, InpCooldownHours>0)   |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
                         const MqlTradeResult &result)
 {
-   if(InpCooldownHours<=0) return;
    if(trans.type!=TRADE_TRANSACTION_DEAL_ADD) return;
    if(!HistoryDealSelect(trans.deal)) return;
    if(HistoryDealGetInteger(trans.deal,DEAL_MAGIC)!=InpMagic) return;
@@ -1255,9 +1460,18 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    double pl=HistoryDealGetDouble(trans.deal,DEAL_PROFIT)
             +HistoryDealGetDouble(trans.deal,DEAL_SWAP)
             +HistoryDealGetDouble(trans.deal,DEAL_COMMISSION);
-   if(pl>=0) return;
    string sym=HistoryDealGetString(trans.deal,DEAL_SYMBOL);
    int idx=SymIndex(sym); if(idx<0) return;
+
+   // --- v2.16 (A3) : memorise la sortie pour l'anti-churn ---
+   // deal OUT de type SELL = fermeture d'un LONG (et inversement)
+   string cmt=HistoryDealGetString(trans.deal,DEAL_COMMENT); StringToLower(cmt);
+   g_exitTime[idx]=(datetime)HistoryDealGetInteger(trans.deal,DEAL_TIME);
+   g_exitLong[idx]=(HistoryDealGetInteger(trans.deal,DEAL_TYPE)==DEAL_TYPE_SELL);
+   g_exitHard[idx]=(pl<0 && (StringFind(cmt,"[sl")>=0 || StringFind(cmt,"[so")>=0));
+
+   // --- cooldown apres perte (inchange, optionnel) ---
+   if(InpCooldownHours<=0 || pl>=0) return;
    g_coolUntil[idx]=TimeCurrent()+(datetime)InpCooldownHours*3600;
    GlobalVariableSet(g_gvCool+sym,(double)(long)g_coolUntil[idx]);
    g_pendActive[idx]=false;
