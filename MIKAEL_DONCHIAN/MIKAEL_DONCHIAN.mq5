@@ -471,6 +471,18 @@ int CandleSignal(const MqlRates &r[], const Indi &v, double &slDist, string &pat
 //| doubler a tort). Le budget journalier prospectif (TryEnter) et le|
 //| kill switch FTMO restent au-dessus de tout.                      |
 //+------------------------------------------------------------------+
+//--- v2.16 fix : detection SL/stop-out par DEAL_REASON (fiable testeur ET
+//    live) ; le commentaire "[sl ...]" n'est PAS rempli par le testeur ->
+//    la martingale doublait apres un vrai SL (observe backtest 23/07).
+//    Le commentaire reste en repli pour les historiques importes.
+bool DealIsHardStop(const ulong dl)
+{
+   long r=HistoryDealGetInteger(dl,DEAL_REASON);
+   if(r==DEAL_REASON_SL || r==DEAL_REASON_SO) return true;
+   string cmt=HistoryDealGetString(dl,DEAL_COMMENT);
+   StringToLower(cmt);
+   return (StringFind(cmt,"[sl")>=0 || StringFind(cmt,"[so")>=0);
+}
 double MartRiskMultiplier(const string sym)
 {
    if(!InpMartEnable || InpMartMaxSteps<=0 || InpMartMult<=1.0) return 1.0;
@@ -506,13 +518,9 @@ double MartRiskMultiplier(const string sym)
             // sur des series de pertes "molles" (BE-scratch, time-stop,
             // fermeture EA). Avant : seule la perte la plus recente (streak==0)
             // etait verifiee — une serie SL->SL->molle doublait quand meme.
-            if(InpMartSkipHardSL){
-               string cmt=HistoryDealGetString(dl,DEAL_COMMENT);
-               StringToLower(cmt);
-               if(StringFind(cmt,"[sl")>=0 || StringFind(cmt,"[so")>=0){
-                  Print("[MART] ",sym," SL/stop-out dans la serie de pertes -> pas de martingale (regime defavorable)");
-                  return 1.0;
-               }
+            if(InpMartSkipHardSL && DealIsHardStop(dl)){
+               Print("[MART] ",sym," SL/stop-out dans la serie de pertes -> pas de martingale (regime defavorable)");
+               return 1.0;
             }
             streak++;                   // vraie perte "molle" : on monte d'un pas
          }
@@ -1198,10 +1206,9 @@ int OnInit()
          double xpl=HistoryDealGetDouble(dl,DEAL_PROFIT)
                    +HistoryDealGetDouble(dl,DEAL_SWAP)
                    +HistoryDealGetDouble(dl,DEAL_COMMISSION);
-         string xc=HistoryDealGetString(dl,DEAL_COMMENT); StringToLower(xc);
          g_exitTime[xi]=(datetime)HistoryDealGetInteger(dl,DEAL_TIME);
          g_exitLong[xi]=(HistoryDealGetInteger(dl,DEAL_TYPE)==DEAL_TYPE_SELL);
-         g_exitHard[xi]=(xpl<0 && (StringFind(xc,"[sl")>=0 || StringFind(xc,"[so")>=0));
+         g_exitHard[xi]=(xpl<0 && DealIsHardStop(dl));
       }
    }
 
@@ -1465,10 +1472,9 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
 
    // --- v2.16 (A3) : memorise la sortie pour l'anti-churn ---
    // deal OUT de type SELL = fermeture d'un LONG (et inversement)
-   string cmt=HistoryDealGetString(trans.deal,DEAL_COMMENT); StringToLower(cmt);
    g_exitTime[idx]=(datetime)HistoryDealGetInteger(trans.deal,DEAL_TIME);
    g_exitLong[idx]=(HistoryDealGetInteger(trans.deal,DEAL_TYPE)==DEAL_TYPE_SELL);
-   g_exitHard[idx]=(pl<0 && (StringFind(cmt,"[sl")>=0 || StringFind(cmt,"[so")>=0));
+   g_exitHard[idx]=(pl<0 && DealIsHardStop(trans.deal));
 
    // --- cooldown apres perte (inchange, optionnel) ---
    if(InpCooldownHours<=0 || pl>=0) return;
