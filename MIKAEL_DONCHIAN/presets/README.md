@@ -17,7 +17,7 @@ forward devient illisible.)
 | `TEST_TRAIL10.set` | Variante tester | `InpTrailStartATR` 1.5 → **1.0** (trailing dès le BE ; motivé par le round-trip EURJPY +1.11 ATR → perte) |
 | `TEST_H4.set` | Variante tester | `InpSignalTF` H1 → **H4** (16388) (moins de bruit/scratches ; SL plus larges, moins de trades) |
 | `INDICES_DEMO.set` | 2ᵉ instance indices (v2.14+) | `InpSymbols=US500,US100,US30,GER40`, magic **20260730**, martingale **OFF**, risque **0.25 %**, `InpMaxPerCcy=1` (1 seul indice à la fois : famille corrélée) |
-| `FX_PLUS_INDICES.set` | **Instance unique mixte** (choix utilisateur 23/07) | = baseline + `InpSymbols` étendu aux 4 indices, **magic 20260713 inchangé**. ⚠️ Les indices héritent du risque 0.5 % et de la **martingale** ; le sample forward mélange désormais FX et indices (analyser le CSV MFE en filtrant par symbole). |
+| `FX_PLUS_INDICES.set` | **Instance unique mixte** (choix utilisateur 23/07) | **28 paires FX** (toutes les combinaisons des 8 devises du flux sentiment : EUR/USD/GBP/JPY/AUD/NZD/CAD/CHF) **+ 4 indices**, magic 20260713 inchangé. ⚠️ Indices : risque 0.5 % + martingale hérités. Crosses à spread large (GBPNZD, EURNZD, GBPCHF…) : souvent bloqués par le garde 1 pip — c'est le garde qui travaille, pas un bug (logs `[WAIT]`/`pend_timeout` plus nombreux). Sample mixte → analyser le CSV MFE avec `fx` / `idx`. |
 
 ## Remettre le live sur la baseline (VPS)
 

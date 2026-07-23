@@ -1,6 +1,6 @@
 ; ===================================================================
-; MIKAEL_DONCHIAN v2.14 — INSTANCE UNIQUE MIXTE : les 8 paires FX + 4 indices
-; dans la MEME instance (magic 20260713 inchange = continuite du forward).
+; MIKAEL_DONCHIAN v2.14 — INSTANCE UNIQUE MIXTE : 28 paires FX (toutes les combi
+; des 8 devises du flux sentiment EUR USD GBP JPY AUD NZD CAD CHF) + 4 indices.
 ; Choix utilisateur 23/07 : indices dans le live, PAS d instance separee.
 ; Les indices heritent donc du risque 0.5% ET de la martingale (skip-hardSL
 ; actif). Verifier les noms exacts des symboles dans le Market Watch FTMO.
@@ -49,6 +49,6 @@ InpMinLotRiskMult=2.0
 InpInitialBalance=100000
 InpTargetPct=0.10
 InpDryRun=false
-InpSymbols=EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,EURJPY,GBPJPY,AUDJPY,US500,US100,US30,GER40
+InpSymbols=EURUSD,EURGBP,EURJPY,EURCHF,EURAUD,EURCAD,EURNZD,GBPUSD,GBPJPY,GBPCHF,GBPAUD,GBPCAD,GBPNZD,AUDUSD,AUDJPY,AUDCHF,AUDCAD,AUDNZD,NZDUSD,NZDJPY,NZDCHF,NZDCAD,USDJPY,USDCHF,USDCAD,CADJPY,CADCHF,CHFJPY,US500,US100,US30,GER40
 InpMagic=20260713
 InpLogMfeMae=true
