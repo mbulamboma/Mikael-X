@@ -1,9 +1,11 @@
 ; ===================================================================
-; MIKAEL_DONCHIAN v2.13 — VARIANTE TESTER : signaux H4 (16388) au lieu de H1
-; Motivation : moins de bruit/scratches zero-lock. NE PAS charger en live avant
-; validation Strategy Tester vs BASELINE_v213_H1 (SL plus larges, moins de trades).
+; MIKAEL_DONCHIAN v2.14 — 2e INSTANCE INDICES (DEMO/TESTER D ABORD, jamais sur
+; l instance FX baseline). Magic 20260730 (non adjacent aux magics existants),
+; martingale OFF + risque 0.25% + 1 seul indice a la fois (famille correlee) :
+; defauts PRUDENTS pour un marche non valide. VERIFIER les noms de symboles
+; exacts dans le Market Watch FTMO et ajuster InpSymbols si besoin.
 ; ===================================================================
-InpSignalTF=16388
+InpSignalTF=16385
 InpEMAPeriod=200
 InpTrendMAD1=0
 InpMinADX=15.0
@@ -16,7 +18,7 @@ InpCdlBodyATRmin=0.25
 InpCdlSLBufATR=0.10
 InpCdlSLATRFloor=0.80
 InpCdlRR=1.5
-InpMartEnable=true
+InpMartEnable=false
 InpMartMult=2.0
 InpMartMaxSteps=2
 InpMartMaxRiskPct=0.015
@@ -31,12 +33,12 @@ InpBasketLockCash=0.0
 InpBasketLockKeep=0.50
 InpBasketClose=false
 InpRiskCashFixed=0.0
-InpRiskPerTrade=0.005
+InpRiskPerTrade=0.0025
 InpMaxHoldHours=0
 InpDailyStopPct=0.035
 InpMaxDDPct=0.07
 InpMaxConcurrent=3
-InpMaxPerCcy=2
+InpMaxPerCcy=1
 InpNoFridayAfter=22
 InpMaxSpreadPips=1.0
 InpMaxSpreadATR=0.05
@@ -47,6 +49,6 @@ InpMinLotRiskMult=2.0
 InpInitialBalance=100000
 InpTargetPct=0.10
 InpDryRun=false
-InpSymbols=EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,EURJPY,GBPJPY,AUDJPY
-InpMagic=20260713
+InpSymbols=US500,US100,US30,GER40
+InpMagic=20260730
 InpLogMfeMae=true

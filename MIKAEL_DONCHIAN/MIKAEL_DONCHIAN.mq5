@@ -1,5 +1,19 @@
 //+------------------------------------------------------------------+
 //| MIKAEL_DONCHIAN.mq5 — moteur UNIQUE : CANDLE, armature FTMO      |
+//| v2.14 : SUPPORT INDICES/CFD (symboles non-FX dans InpSymbols).   |
+//|  Trois gardes supposaient des paires FX a 6 lettres :            |
+//|   1) spread : pips FX -> pour les non-FX, garde RELATIVE a l'ATR |
+//|      (InpMaxSpreadATR, defaut 5% de l'ATR) ;                     |
+//|   2) correlation devises (CcyCount sur substrings) -> les non-FX |
+//|      sont traites comme UNE famille correlee unique (US500/US100/ |
+//|      GER40 bougent ensemble), plafonnee par InpMaxPerCcy ;       |
+//|   3) sentiment : substrings sans sens sur un indice -> skip      |
+//|      explicite (pas de donnee macro par indice, fail-open).      |
+//|  Le reste (ATR, sizing tick value, BE/zero-lock/trailing, mart)  |
+//|  est deja generique. DEPLOIEMENT RECOMMANDE : 2e instance dediee |
+//|  (autre graphe + autre magic + InpSymbols indices), JAMAIS dans  |
+//|  l'instance FX baseline. ⚠️ gaps de session/week-end non geres : |
+//|  un SL peut etre saute avec slippage (voir EURJPY 21/07 en pire).|
 //| v2.13 : ZERO-LOCK breakeven (InpBEZeroTrigATR) — des que le trade|
 //|  est positif au-dela du bruit (defaut 0.10xATR), le SL se cale a |
 //|  l'entree (+buffer cout) : un trade parti negatif puis repasse en|
@@ -66,7 +80,7 @@
 //|  a un autre EA : le day-ticket d'IA/MACRO vise magic+1).         |
 //+------------------------------------------------------------------+
 #property copyright "Mbula"
-#property version   "2.13"
+#property version   "2.14"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -114,7 +128,8 @@ input double InpMaxDDPct       = 0.07;     // halt total (FTMO 10% - marge)
 input int    InpMaxConcurrent  = 3;        // positions simultanees max
 input int    InpMaxPerCcy      = 2;        // positions max par devise
 input int    InpNoFridayAfter  = 22;       // pas d'entree vendredi apres (h srv) — regle FTMO gap-trading
-input double InpMaxSpreadPips  = 1.0;      // spread max en pips (EURUSD ~0.2 chez FTMO)
+input double InpMaxSpreadPips  = 1.0;      // spread max en pips — paires FX uniquement (EURUSD ~0.2 chez FTMO)
+input double InpMaxSpreadATR   = 0.05;     // spread max des symboles NON-FX (indices/CFD) en fraction d'ATR (0.05 = 5%)
 input int    InpCooldownHours  = 0;        // pause par paire apres une perte (0=off, laisse le S&R travailler)
 input int    InpDayResetOffsetH= -1;       // -1 = AUTO (minuit CE(S)T) ; >=0 = decalage manuel serveur->FTMO
 input double InpMaxDriftSL     = 0.25;     // abandon d'un signal differe si derive prix > x*SL
@@ -313,7 +328,9 @@ bool GetPairSentiment(const string sym, double &sent)
 bool FiltersAllow(const string sym, const bool longSig, const MqlRates &rD[], const Indi &v, string &reason)
 {
    // --- veto sentiment : jamais CONTRE le flux macro/news (fail-open) ---
-   if(InpSentThreshold>0){
+   //     FX uniquement : pas de donnee macro par indice/CFD, et les substrings
+   //     d'un "US500" ne correspondent a aucune devise du CSV (skip explicite)
+   if(InpSentThreshold>0 && IsFxPair(sym)){
       double sent;
       if(GetPairSentiment(sym,sent)){
          if( longSig && sent<-InpSentThreshold){ reason="sent_contre("+DoubleToString(sent,2)+")"; return false; }
@@ -562,6 +579,29 @@ void ManageBasketLock()
 //+------------------------------------------------------------------+
 //| Portefeuille                                                     |
 //+------------------------------------------------------------------+
+//--- vrai croisement FX (6 lettres, deux devises connues) ? Les gardes
+//    devises/pips/sentiment ne s'appliquent qu'a eux ; le reste (US500,
+//    GER40, XAUUSD est FX-like mais base XAU inconnue -> non-FX) passe
+//    par les chemins non-FX (spread ATR, famille correlee unique).
+bool IsFxPair(const string sym)
+{
+   if(StringLen(sym)<6) return false;
+   const string majors="USD,EUR,GBP,JPY,AUD,NZD,CAD,CHF,SEK,NOK,DKK,SGD,MXN,ZAR,PLN,CZK,HUF";
+   return (StringFind(majors,StringSubstr(sym,0,3))>=0 &&
+           StringFind(majors,StringSubstr(sym,3,3))>=0);
+}
+//--- positions ouvertes du magic sur des symboles NON-FX : traites comme
+//    UNE seule famille correlee (les indices actions bougent ensemble)
+int NonFxCount()
+{
+   int c=0;
+   for(int i=PositionsTotal()-1;i>=0;i--){
+      string sym=PositionGetSymbol(i);
+      if(PositionGetInteger(POSITION_MAGIC)!=InpMagic) continue;
+      if(!IsFxPair(sym)) c++;
+   }
+   return c;
+}
 int CcyCount(const string ccy)
 {
    int c=0;
@@ -821,18 +861,34 @@ bool TryEnter(const string sym, const bool longSig, const double slDist,
    { LogRow(row+"0;"+(InpDryRun?"1":"0")+";price_drift"); return true; }
 
    // spread trop large -> retry
-   double sprPips=(tick.ask-tick.bid)/pip;
-   if(sprPips>InpMaxSpreadPips) return false;
+   //  FX : garde en pips (InpMaxSpreadPips) ; NON-FX (indices/CFD) : garde
+   //  relative a l'ATR (la notion de pip n'a pas de sens sur US500 & co)
+   int idx=SymIndex(sym);
+   bool fx=IsFxPair(sym);
+   if(fx){
+      double sprPips=(tick.ask-tick.bid)/pip;
+      if(sprPips>InpMaxSpreadPips) return false;
+   }else{
+      double atr=(idx>=0)? g_lastAtr[idx] : 0.0;
+      if(atr<=0) return false;                                  // ATR pas encore cache -> retry
+      if((tick.ask-tick.bid)>InpMaxSpreadATR*atr) return false;
+   }
 
    // contraintes portefeuille
-   int idx=SymIndex(sym);
    if(idx>=0 && TimeCurrent()<g_coolUntil[idx])
    { LogRow(row+"0;"+(InpDryRun?"1":"0")+";cooldown"); return true; }
    if(MagicPositions()>=InpMaxConcurrent){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";max_conc"); return true; }
    if(SymbolBusy(sym)){ LogRow(row+"0;"+(InpDryRun?"1":"0")+";sym_busy"); return true; }
-   if(CcyCount(StringSubstr(sym,0,3))>=InpMaxPerCcy ||
-      CcyCount(StringSubstr(sym,3,3))>=InpMaxPerCcy)
-   { LogRow(row+"0;"+(InpDryRun?"1":"0")+";ccy_corr"); return true; }
+   if(fx){
+      if(CcyCount(StringSubstr(sym,0,3))>=InpMaxPerCcy ||
+         CcyCount(StringSubstr(sym,3,3))>=InpMaxPerCcy)
+      { LogRow(row+"0;"+(InpDryRun?"1":"0")+";ccy_corr"); return true; }
+   }else{
+      // indices/CFD = UNE famille correlee : jamais plus de InpMaxPerCcy
+      // positions non-FX simultanees (US500+US100+GER40 = le meme pari)
+      if(NonFxCount()>=InpMaxPerCcy)
+      { LogRow(row+"0;"+(InpDryRun?"1":"0")+";idx_corr"); return true; }
+   }
 
    // SL/TP ancres sur le prix de SORTIE (bid=long, ask=short)
    // CANDLE : TP = InpCdlRR x SL (>=1 requis pour la recuperation martingale)
@@ -989,7 +1045,7 @@ int OnInit()
       : "basket_lock=OFF";
    string riskStr=(InpRiskCashFixed>0)? DoubleToString(InpRiskCashFixed,2)+"$/trade (FIXE)"
                                       : DoubleToString(InpRiskPerTrade*100,2)+"% equity";
-   Print("MIKAEL_DONCHIAN v2.13 (CANDLE only) init OK | sent_filter=",
+   Print("MIKAEL_DONCHIAN v2.14 (CANDLE only) init OK | sent_filter=",
          (InpSentThreshold>0?"ON (seuil "+DoubleToString(InpSentThreshold,2)+", fail-open)":"OFF"),
          " | ",stratStr," | ",basketStr," | paires=",symList," (",g_nsym,") | TF=",EnumToString(InpSignalTF),
          " | filtres: EMA",InpEMAPeriod," D1_SMA",InpTrendMAD1," ADX>=",DoubleToString(InpMinADX,0),

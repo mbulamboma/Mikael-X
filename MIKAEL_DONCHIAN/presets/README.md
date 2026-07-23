@@ -16,6 +16,7 @@ forward devient illisible.)
 | `BASELINE_v213_H1.set` | **Config live gelée** (= défauts du code, commit 70f6339) | — |
 | `TEST_TRAIL10.set` | Variante tester | `InpTrailStartATR` 1.5 → **1.0** (trailing dès le BE ; motivé par le round-trip EURJPY +1.11 ATR → perte) |
 | `TEST_H4.set` | Variante tester | `InpSignalTF` H1 → **H4** (16388) (moins de bruit/scratches ; SL plus larges, moins de trades) |
+| `INDICES_DEMO.set` | **2ᵉ instance** indices (v2.14+) | `InpSymbols=US500,US100,US30,GER40`, magic **20260730**, martingale **OFF**, risque **0.25 %**, `InpMaxPerCcy=1` (1 seul indice à la fois : famille corrélée) |
 
 ## Remettre le live sur la baseline (VPS)
 
@@ -47,6 +48,22 @@ forward devient illisible.)
   tester sont plus « propres » que la réalité.
 - Multi-devises + timer 30 s : exige « real ticks » et un historique complet
   des 8 paires (premier run long : téléchargement).
+
+## Instance INDICES (v2.14) — règles
+
+- **Jamais dans l'instance FX baseline.** Ouvrir un 2ᵉ graphe (n'importe quel
+  symbole), attacher l'EA, **Load** → `INDICES_DEMO.set`. Magic 20260730
+  (jamais adjacent aux magics existants — règle day-ticket).
+- **Vérifier les noms de symboles** dans le Market Watch FTMO (US500 / US100 /
+  US30 / GER40 — adapter `InpSymbols` si le broker suffixe autrement).
+- v2.14 route automatiquement les non-FX : spread contrôlé en **fraction
+  d'ATR** (`InpMaxSpreadATR`, 5 %), corrélation = **une seule famille** (tous
+  les indices comptent ensemble, cap `InpMaxPerCcy`), sentiment **skippé**.
+- Défauts volontairement prudents : martingale OFF, risque 0.25 %, 1 indice à
+  la fois. Marché **non validé** → backtest puis démo avant tout compte réel.
+- ⚠️ Risque structurel assumé : **gaps de session/week-end** — un SL peut être
+  sauté avec slippage bien pire que l'EURJPY du 21/07. L'EA ne ferme pas avant
+  les clôtures de session.
 
 ## Analyse du log MFE (checkpoint ~30 trades)
 

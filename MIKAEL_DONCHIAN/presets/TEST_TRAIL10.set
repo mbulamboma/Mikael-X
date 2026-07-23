@@ -39,6 +39,7 @@ InpMaxConcurrent=3
 InpMaxPerCcy=2
 InpNoFridayAfter=22
 InpMaxSpreadPips=1.0
+InpMaxSpreadATR=0.05
 InpCooldownHours=0
 InpDayResetOffsetH=-1
 InpMaxDriftSL=0.25
