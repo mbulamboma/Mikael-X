@@ -16,7 +16,8 @@ forward devient illisible.)
 | `BASELINE_v213_H1.set` | **Config live gelée** (= défauts du code, commit 70f6339) | — |
 | `TEST_TRAIL10.set` | Variante tester | `InpTrailStartATR` 1.5 → **1.0** (trailing dès le BE ; motivé par le round-trip EURJPY +1.11 ATR → perte) |
 | `TEST_H4.set` | Variante tester | `InpSignalTF` H1 → **H4** (16388) (moins de bruit/scratches ; SL plus larges, moins de trades) |
-| `INDICES_DEMO.set` | **2ᵉ instance** indices (v2.14+) | `InpSymbols=US500,US100,US30,GER40`, magic **20260730**, martingale **OFF**, risque **0.25 %**, `InpMaxPerCcy=1` (1 seul indice à la fois : famille corrélée) |
+| `INDICES_DEMO.set` | 2ᵉ instance indices (v2.14+) | `InpSymbols=US500,US100,US30,GER40`, magic **20260730**, martingale **OFF**, risque **0.25 %**, `InpMaxPerCcy=1` (1 seul indice à la fois : famille corrélée) |
+| `FX_PLUS_INDICES.set` | **Instance unique mixte** (choix utilisateur 23/07) | = baseline + `InpSymbols` étendu aux 4 indices, **magic 20260713 inchangé**. ⚠️ Les indices héritent du risque 0.5 % et de la **martingale** ; le sample forward mélange désormais FX et indices (analyser le CSV MFE en filtrant par symbole). |
 
 ## Remettre le live sur la baseline (VPS)
 

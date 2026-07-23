@@ -3,7 +3,11 @@
 analyse_mfe.py — analyse du journal MFE/MAE de MIKAEL_DONCHIAN (v2.12+).
 
 Usage :
-    python analyse_mfe.py MIKAEL_DONCHIAN_mfe_20260713.csv
+    python analyse_mfe.py MIKAEL_DONCHIAN_mfe_20260713.csv        # tout
+    python analyse_mfe.py MIKAEL_DONCHIAN_mfe_20260713.csv fx     # paires FX seules
+    python analyse_mfe.py MIKAEL_DONCHIAN_mfe_20260713.csv idx    # indices/CFD seuls
+    (instance mixte : TOUJOURS calibrer les seuils par famille, pas melanges —
+     l'ATR d'un indice et d'une paire FX ne vivent pas dans le meme regime)
 
 Entree : CSV ecrit par l'EA, colonnes :
     close_time;symbol;pl;mfe_atr;mae_atr;dur_min;reason
@@ -44,7 +48,16 @@ def fmt_q(d):
     return "  ".join(f"p{int(q*100):02d}={v:+.2f}" for q, v in d.items())
 
 
-def main(path):
+MAJORS = {"USD", "EUR", "GBP", "JPY", "AUD", "NZD", "CAD", "CHF",
+          "SEK", "NOK", "DKK", "SGD", "MXN", "ZAR", "PLN", "CZK", "HUF"}
+
+
+def is_fx(sym):
+    # miroir de IsFxPair() de l'EA : 6 lettres, deux devises connues
+    return len(sym) >= 6 and sym[:3] in MAJORS and sym[3:6] in MAJORS
+
+
+def main(path, family=None):
     rows = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f, delimiter=";"):
@@ -58,10 +71,20 @@ def main(path):
             except (KeyError, ValueError):
                 continue  # ligne partielle/corrompue : ignoree
 
+    if family == "fx":
+        rows = [r for r in rows if is_fx(r["sym"])]
+    elif family == "idx":
+        rows = [r for r in rows if not is_fx(r["sym"])]
+
     n = len(rows)
     if n == 0:
         print("Aucune ligne exploitable."); return
-    print(f"=== ANALYSE MFE/MAE : {n} trades clos ===")
+    fam = {"fx": " (FX seulement)", "idx": " (indices/CFD seulement)"}.get(family, "")
+    print(f"=== ANALYSE MFE/MAE : {n} trades clos{fam} ===")
+    nfx = sum(1 for r in rows if is_fx(r["sym"]))
+    if family is None and 0 < nfx < n:
+        print(f"!! echantillon MIXTE ({nfx} FX / {n - nfx} non-FX) : relancer avec"
+              f" 'fx' puis 'idx' pour calibrer les seuils par famille.")
     if n < 30:
         print(f"!! n={n} < 30 : INDICATIF seulement, ne pas decider la-dessus.\n")
 
@@ -111,6 +134,6 @@ def main(path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3) or (len(sys.argv) == 3 and sys.argv[2] not in ("fx", "idx")):
         print(__doc__); sys.exit(1)
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
