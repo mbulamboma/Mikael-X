@@ -1,0 +1,51 @@
+; ===================================================================
+; MIKAEL_DONCHIAN v2.13 — VARIANTE TESTER : trail-start 1.5 -> 1.0 (trailing des le BE)
+; Motivation : cas EURJPY 21/07 (+1.11 ATR round-trip -> perte). NE PAS charger en live
+; avant validation Strategy Tester vs BASELINE_v213_H1.
+; ===================================================================
+InpSignalTF=16385
+InpEMAPeriod=200
+InpTrendMAD1=0
+InpMinADX=15.0
+InpRSICap=100.0
+InpSentThreshold=0.15
+InpSentMaxAgeH=12
+InpCdlEngulfing=true
+InpCdlPinbar=true
+InpCdlBodyATRmin=0.25
+InpCdlSLBufATR=0.10
+InpCdlSLATRFloor=0.80
+InpCdlRR=1.5
+InpMartEnable=true
+InpMartMult=2.0
+InpMartMaxSteps=2
+InpMartMaxRiskPct=0.015
+InpMartLookbackD=14
+InpMartSkipHardSL=true
+InpBEZeroTrigATR=0.10
+InpBETriggerATR=1.0
+InpBEBufferATR=0.05
+InpTrailStartATR=1.0
+InpTrailATR=1.2
+InpBasketLockCash=0.0
+InpBasketLockKeep=0.50
+InpBasketClose=false
+InpRiskCashFixed=0.0
+InpRiskPerTrade=0.005
+InpMaxHoldHours=0
+InpDailyStopPct=0.035
+InpMaxDDPct=0.07
+InpMaxConcurrent=3
+InpMaxPerCcy=2
+InpNoFridayAfter=22
+InpMaxSpreadPips=1.0
+InpCooldownHours=0
+InpDayResetOffsetH=-1
+InpMaxDriftSL=0.25
+InpMinLotRiskMult=2.0
+InpInitialBalance=100000
+InpTargetPct=0.10
+InpDryRun=false
+InpSymbols=EURUSD,GBPUSD,USDJPY,AUDUSD,NZDUSD,EURJPY,GBPJPY,AUDJPY
+InpMagic=20260713
+InpLogMfeMae=true
