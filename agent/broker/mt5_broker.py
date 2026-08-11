@@ -200,20 +200,45 @@ class MT5Broker:
             return None
 
     # ---------------------------------------------------------------- positions
-    def positions(self) -> list[dict]:
+    def positions(self, own_only: bool | None = None) -> list[dict]:
+        """Positions ouvertes. `own_only=True` -> uniquement celles de CET agent (magic).
+
+        Les positions d'un autre EA ou ouvertes a la main pesent sur l'equity (donc sur
+        les limites FTMO) : on les VOIT (own_only=False) pour mesurer le risque, mais on
+        n'agit jamais dessus (cf. run.Orchestrator)."""
+        if not (_HAS_MT5 and self.connected):
+            return []
+        if own_only is None:
+            own_only = bool(getattr(self.acfg.execution, "own_positions_only", True))
+        magic = int(getattr(self.acfg.execution, "magic", 770077))
+        out = []
+        for p in mt5.positions_get() or []:
+            mine = getattr(p, "magic", 0) == magic
+            if own_only and not mine:
+                continue
+            out.append({
+                "ticket": p.ticket, "symbol": p.symbol,
+                "direction": "buy" if p.type == 0 else "sell",
+                "volume": p.volume, "entry": p.price_open,
+                "sl": p.sl, "tp": p.tp, "floating": p.profit,
+                "magic": getattr(p, "magic", 0), "a_nous": mine,
+                "open_time": datetime.fromtimestamp(p.time, tz=timezone.utc),
+            })
+        return out
+
+    def server_now(self) -> datetime:
+        """HORLOGE DU SERVEUR broker — c'est elle qui definit la journee FTMO
+        (reset a minuit heure serveur, EET/EEST, pas UTC).
+
+        MT5 horodate les ticks en heure serveur : on lit donc le mur-horloge du
+        serveur (l'objet est etiquete UTC mais porte l'heure serveur ; il ne sert
+        qu'a calculer la frontiere de journee). Repli sur l'heure locale UTC."""
         if _HAS_MT5 and self.connected:
-            pos = mt5.positions_get() or []
-            out = []
-            for p in pos:
-                out.append({
-                    "ticket": p.ticket, "symbol": p.symbol,
-                    "direction": "buy" if p.type == 0 else "sell",
-                    "volume": p.volume, "entry": p.price_open,
-                    "sl": p.sl, "tp": p.tp, "floating": p.profit,
-                    "open_time": datetime.fromtimestamp(p.time, tz=timezone.utc),
-                })
-            return out
-        return []
+            for sym in (self.acfg.symbols or ("EURUSD",)):
+                t = mt5.symbol_info_tick(sym)
+                if t is not None and getattr(t, "time", 0):
+                    return datetime.fromtimestamp(t.time, tz=timezone.utc)
+        return datetime.now(timezone.utc)
 
     # ---------------------------------------------------------------- execution
     def _filling(self, symbol: str):
@@ -225,6 +250,30 @@ class MT5Broker:
         if mask & 1:
             return mt5.ORDER_FILLING_FOK
         return mt5.ORDER_FILLING_RETURN
+
+    def _position_ticket(self, result, symbol: str) -> int:
+        """Ticket de la POSITION creee (pas celui de l'ordre).
+
+        Sur la plupart des comptes hedging les deux coincident, mais pas toujours :
+        on resout via le DEAL (`position_id`), sinon on retombe sur la position la
+        plus recente du symbole, et en dernier recours sur `order`. Un mauvais ticket
+        casserait silencieusement le trailing, le MFE/MAE et l'attribution du R."""
+        deal = getattr(result, "deal", 0)
+        if deal:
+            try:
+                deals = mt5.history_deals_get(ticket=deal)
+                if deals and getattr(deals[0], "position_id", 0):
+                    return int(deals[0].position_id)
+            except Exception:                       # pragma: no cover - depend du terminal
+                pass
+        try:
+            pos = mt5.positions_get(symbol=symbol) or []
+            mine = [p for p in pos if self._is_ours(p)]
+            if mine:
+                return int(max(mine, key=lambda p: p.time).ticket)
+        except Exception:                           # pragma: no cover
+            pass
+        return int(getattr(result, "order", 0))
 
     def place_order(self, symbol: str, direction: str, lot: float,
                     sl: float, tp: float, comment: str = "AI-FTMO") -> dict:
@@ -263,7 +312,7 @@ class MT5Broker:
             if r is not None and r.retcode == mt5.TRADE_RETCODE_DONE:
                 filled = getattr(r, "price", price) or price
                 slip = (filled - first_price) if direction == "buy" else (first_price - filled)
-                return {"ok": True, "ticket": getattr(r, "order", 0), "price": filled,
+                return {"ok": True, "ticket": self._position_ticket(r, symbol), "price": filled,
                         "requested_price": first_price,
                         "slippage_pips": round(slip * p2p, 2) if p2p else 0.0,
                         "spread_pips": spec.get("spread_pips", 0.0),
@@ -285,6 +334,12 @@ class MT5Broker:
         pos = mt5.positions_get(ticket=ticket)
         return pos[0] if pos else None
 
+    def _is_ours(self, p) -> bool:
+        """Garde-fou : ne JAMAIS toucher a une position d'un autre EA / ouverte a la main."""
+        if not getattr(self.acfg.execution, "own_positions_only", True):
+            return True
+        return getattr(p, "magic", 0) == int(getattr(self.acfg.execution, "magic", 770077))
+
     def close_position(self, ticket: int, fraction: float = 1.0,
                        comment: str = "AI-close") -> dict:
         """Ferme (totalement ou partiellement) une position par un DEAL oppose.
@@ -292,6 +347,10 @@ class MT5Broker:
         p = self._find_position(ticket)
         if p is None:
             return {"ok": False, "message": f"position {ticket} introuvable"}
+        if not self._is_ours(p):
+            log.warning("Cloture refusee : la position %s (magic %s) n'appartient pas a "
+                        "l'agent.", ticket, getattr(p, "magic", 0))
+            return {"ok": False, "message": "position d'un autre EA — non touchee"}
         si = mt5.symbol_info(p.symbol)
         step = si.volume_step or 0.01
         vol = p.volume * max(0.0, min(1.0, fraction))
@@ -322,6 +381,10 @@ class MT5Broker:
         p = self._find_position(ticket)
         if p is None:
             return {"ok": False, "message": f"position {ticket} introuvable"}
+        if not self._is_ours(p):
+            log.warning("Modification refusee : la position %s (magic %s) n'appartient pas "
+                        "a l'agent.", ticket, getattr(p, "magic", 0))
+            return {"ok": False, "message": "position d'un autre EA — non touchee"}
         req = {
             "action": mt5.TRADE_ACTION_SLTP, "symbol": p.symbol, "position": ticket,
             "sl": float(sl) if sl is not None else p.sl,

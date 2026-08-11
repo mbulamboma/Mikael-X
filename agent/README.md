@@ -88,6 +88,42 @@ désarmer et gérer son stop à la main (`plan_modify`).
 | **myfxbook** (sentiment retail) | API officielle (la page publique renvoie 403) | `MYFXBOOK_EMAIL` + `MYFXBOOK_PASSWORD` — **vos** identifiants, envoyés uniquement à myfxbook |
 | Calendrier éco + GDELT | déjà en place | `MT5_FILES`, `NEWS_GDELT` |
 
+## Filet de sécurité déterministe (indépendant du LLM)
+
+Correctifs issus d'une revue de risque sévère. **Aucune de ces protections ne dépend
+de l'IA** : elles tournent à chaque cycle **et** dans un watchdog entre deux cycles.
+
+| Garde-fou | Comportement |
+|---|---|
+| **Urgence perte-jour** | perte du jour ≥ 75 % du stop agent (ou perte totale ≥ seuil doux) → **toutes nos positions sont fermées**, LLM vivant ou non |
+| **Watchdog** | `AGENT_WATCH_SECONDS` (60 s) : perte-jour, SL d'urgence, break-even, trailing — sans appeler le modèle |
+| **Positions étrangères** | l'agent n'agit **que** sur ses ordres (`magic`) ; celles d'un autre EA sont comptées dans le risque et l'equity, jamais fermées — une alerte est loguée |
+| **Journée FTMO** | ancrée sur l'**horloge serveur** (EET/EEST), plus sur UTC : la perte journalière est mesurée sur la même journée que FTMO |
+| **Corrélation** | plafond de risque **par devise** (`AGENT_MAX_RISK_PER_CURRENCY_PCT`, 2 %) : EURUSD + GBPUSD + XAUUSD longs ne peuvent plus faire 3 % sur le seul pari dollar |
+| **Calendrier absent** | log **ERREUR** à chaque cycle (le black-out ne protégeait plus rien en silence) + `NEWS_FAIL_CLOSED=1` pour interdire toute entrée |
+| **Heure d'été** | conversion EET→UTC calculée (UTC+2 / UTC+3) au lieu d'un -2 h fixe : la fenêtre de black-out tombe au bon moment |
+| **Ticket de position** | résolu via le *deal* (`position_id`) : plus de trailing/MFE/attribution rattachés à un ticket fantôme |
+| **Stop d'urgence** | arrondi aux **digits réels** du symbole (l'or à 2 décimales était rejeté par le broker) |
+| **Gap week-end** | `AGENT_WEEKEND_FLATTEN=1` ferme tout au cutoff du vendredi (défaut 0 : blocage des entrées seulement) |
+| **Objectif vs jours minimum** | l'arrêt « objectif atteint » ne bloque plus les ouvertures tant que le minimum de jours de trading n'est pas atteint (sinon l'étape devenait invalidable) |
+
+## Modèle : Claude, DeepSeek… avec ou sans outils
+
+Deux modes, choisis automatiquement (`BEDROCK_TOOL_MODE=auto`) :
+
+- **Tool calling** (Claude, Nova, Mistral Large…) : le modèle appelle lui-même
+  `get_chart`, `compute_indicator`, `web_search`, `plan_open`…
+- **Mode JSON** (DeepSeek et tout modèle sans *tool use*) : on lui livre un **dossier
+  complet** du cycle (compte, positions, marchés, chart, stratégies, post-mortem, news)
+  et il répond par un **plan d'actions JSON**, qui repasse par **exactement les mêmes
+  validations** (`plan_open/close/modify/trail`) puis par le moteur de risque FTMO.
+
+La bascule est automatique si le tool calling échoue. En mode JSON, l'agent ne peut pas
+demander une analyse supplémentaire : il décide avec le dossier, ou s'abstient.
+
+**Authentification** : `BEDROCK_API_KEY` (clé API Bedrock, exportée pour boto3 en
+`AWS_BEARER_TOKEN_BEDROCK`) ou la chaîne de credentials AWS classique.
+
 ## État persistant : SQLite, pas des fichiers
 
 Tout l'état vit dans **`state/agent.db`** ([store.py](agent/store.py)) — journal,

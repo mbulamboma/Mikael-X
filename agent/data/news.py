@@ -46,6 +46,28 @@ GDELT_Q = {
 }
 
 
+def _last_sunday(year: int, month: int) -> datetime:
+    """Dernier dimanche du mois (bascule d'heure europeenne, a 01:00 UTC)."""
+    d = datetime(year, month, 31, 1, tzinfo=timezone.utc)
+    while d.month != month:
+        d -= timedelta(days=1)
+    while d.weekday() != 6:                    # 6 = dimanche
+        d -= timedelta(days=1)
+    return d
+
+
+def _eet_offset(t) -> int:
+    """Decalage du serveur MT5 (EET/EEST) par rapport a UTC : +3 en heure d'ete
+    (dernier dimanche de mars -> dernier dimanche d'octobre), +2 sinon."""
+    try:
+        ts = pd.Timestamp(t).to_pydatetime()
+    except Exception:
+        return 2
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return 3 if _last_sunday(ts.year, 3) <= ts < _last_sunday(ts.year, 10) else 2
+
+
 def symbol_ccys(sym: str) -> list[str]:
     """Devises pertinentes pour un symbole. EURUSD -> [EUR, USD] ; XAUUSD -> [XAU, USD]."""
     s = sym.upper()
@@ -75,6 +97,9 @@ class NewsFeed:
         self.cfg = cfg
         self.store = store or default_store()
         self.files = _resolve_mt5_files(cfg) if cfg.enabled else None
+        # False des qu'un cycle constate l'absence de calendrier -> le black-out ne
+        # protege plus rien (l'orchestrateur peut alors interdire les entrees).
+        self.calendar_ok = True
 
     # ------------------------------------------------------------- cache
     def snapshot(self, symbols: list[str]) -> dict:
@@ -196,10 +221,17 @@ class NewsFeed:
         upcoming: list[dict] = []
         if self.files is None:
             return recent, upcoming
-        path = self.files / "calendar_history.csv"
-        if not path.exists():
-            log.info("calendar_history.csv absent (re-exporter ExportCalendar.mq5)")
+        path = self.files / "calendar_history.csv" if self.files else None
+        if path is None or not path.exists():
+            # SILENCE = DANGER : sans calendrier, le black-out news est INACTIF et
+            # l'agent croirait etre protege. On le crie fort a chaque cycle.
+            log.error("CALENDRIER ECONOMIQUE ABSENT (%s) — AUCUN BLACK-OUT NEWS ACTIF. "
+                      "Re-exporter ExportCalendar.mq5 vers MQL5\\Files, ou mettre "
+                      "NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.",
+                      path or "dossier MQL5\\Files introuvable")
+            self.calendar_ok = False
             return recent, upcoming
+        self.calendar_ok = True
         try:
             df = pd.read_csv(path, sep=";", encoding="cp1252", engine="python",
                              on_bad_lines="skip")
@@ -216,7 +248,9 @@ class NewsFeed:
         df[c_imp] = pd.to_numeric(df[c_imp], errors="coerce")
         df["_t"] = pd.to_datetime(df[c_time], format="%Y.%m.%d %H:%M", errors="coerce")
         df = df.dropna(subset=["_t", c_imp])
-        df["_utc"] = df["_t"] - pd.Timedelta(hours=2)          # EET approx -> UTC
+        # Heure serveur MT5 = EET l'hiver (UTC+2), EEST l'ete (UTC+3). Un decalage d'une
+        # heure ferait rater une fenetre de black-out : on applique le VRAI decalage.
+        df["_utc"] = df["_t"] - df["_t"].map(lambda t: pd.Timedelta(hours=_eet_offset(t)))
         now_naive = now.replace(tzinfo=None)
         lo = now_naive - timedelta(hours=self.cfg.recent_hours)
         hi = now_naive + timedelta(hours=self.cfg.upcoming_hours)

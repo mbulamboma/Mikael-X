@@ -83,6 +83,64 @@ def pop_actions() -> list[dict]:
     return list(_CTX["actions"])
 
 
+# ============================================================ MODE SANS OUTILS
+# Pour les modeles Bedrock qui ne savent pas appeler d'outils (DeepSeek...) : on leur
+# livre le dossier deja constitue, et on valide leur plan JSON par les MEMES fonctions.
+def context_digest(max_chart: int = 2) -> str:
+    """Dossier compact du cycle : compte, positions, marches, charts, strategies,
+    post-mortem, news. Volontairement borne pour ne pas exploser le contexte."""
+    snaps = _CTX["snapshots"] or {}
+    charts = _CTX["charts"] or {}
+    news = _CTX["news"] or {}
+    blocs = [
+        "== COMPTE / FTMO ==\n" + json.dumps(_CTX["account"], ensure_ascii=False, default=str),
+        "== POSITIONS OUVERTES ==\n" + json.dumps(_CTX["positions"], ensure_ascii=False, default=str),
+        "== MARCHES (scan) ==\n" + json.dumps(snaps, ensure_ascii=False, default=str),
+    ]
+    for sym in list(charts)[:max_chart]:
+        blocs.append(f"== CHART {sym} ==\n"
+                     + json.dumps(charts[sym], ensure_ascii=False, default=str))
+    blocs.append("== STRATEGIES ==\n" + (_CTX["strategies"] or "(aucune)"))
+    blocs.append("== BILAN / DEFAUTS RECURRENTS ==\n" + (_CTX.get("postmortem") or "(aucun)"))
+    blocs.append("== LECONS ==\n" + (_CTX["lessons"] or "(aucune)"))
+    if news.get("enabled"):
+        blocs.append("== NEWS ==\n" + json.dumps(
+            {"blackout": news.get("blackout", {}), "fred": news.get("fred", {}),
+             "par_symbole": news.get("per_symbol", {})}, ensure_ascii=False, default=str))
+    return "\n\n".join(blocs)
+
+
+def apply_plan(plan: dict) -> list[dict]:
+    """Transforme un plan JSON en actions VALIDEES : chaque entree repasse par
+    plan_open / plan_close / plan_modify / plan_trail (memes controles de coherence).
+    Une action mal formee est ignoree, jamais executee telle quelle."""
+    _CTX["actions"] = []
+    for a in (plan or {}).get("actions", []) or []:
+        if not isinstance(a, dict):
+            continue
+        kind = str(a.get("type", "")).strip().lower()
+        try:
+            if kind == "open":
+                _plan_open(str(a.get("strategy", "")), str(a.get("symbol", "")),
+                           str(a.get("direction", "")), _f(a.get("entry")), _f(a.get("sl")),
+                           _f(a.get("tp")), _f(a.get("confidence"), 0.6),
+                           str(a.get("rationale", "")))
+            elif kind == "close":
+                _plan_close(int(_f(a.get("ticket"))), _f(a.get("fraction"), 1.0),
+                            str(a.get("reason", "")))
+            elif kind == "modify":
+                _plan_modify(int(_f(a.get("ticket"))), _f(a.get("sl")), _f(a.get("tp")),
+                             str(a.get("reason", "")))
+            elif kind == "trail":
+                _plan_trail(int(_f(a.get("ticket"))), _f(a.get("atr_mult"), 2.0),
+                            _f(a.get("pips")), _f(a.get("activate_r"), 1.0),
+                            str(a.get("timeframe", "")), bool(a.get("enabled", True)),
+                            str(a.get("reason", "")))
+        except (TypeError, ValueError):
+            continue                      # action illisible -> ignoree
+    return pop_actions()
+
+
 def _f(x: Any, default: float = 0.0) -> float:
     try:
         return float(x)
@@ -343,15 +401,11 @@ def get_fred_series(series_id: str, limit: int = 12) -> str:
 
 
 # ============================================================ AGIR
-@tool
-def plan_open(strategy: str, symbol: str, direction: str, entry: float, sl: float,
-              tp: float, confidence: float = 0.6, rationale: str = "") -> str:
-    """OUVRIR une nouvelle position. strategy = nom exact du catalogue
-    (trend_follow, donchian_breakout, mean_reversion, momentum). direction = "buy"/"sell".
-    symbol = N'IMPORTE QUEL symbole negociable du broker (cf. list_symbols), pas seulement
-    la watchlist — c'est TOI qui choisis quoi trader. entry/sl/tp en PRIX, a des niveaux
-    techniques reels. NE calcule PAS le lot (le moteur de risque FTMO dimensionne).
-    Coherence exigee : buy -> sl<entry<tp ; sell -> tp<entry<sl."""
+# Chaque action existe en deux versions : `_plan_x` (fonction Python, la VRAIE
+# validation) et `plan_x` (outil expose au LLM). Le mode JSON (DeepSeek) appelle les
+# `_plan_x` directement -> memes controles quel que soit le modele.
+def _plan_open(strategy: str, symbol: str, direction: str, entry: float, sl: float,
+               tp: float, confidence: float = 0.6, rationale: str = "") -> str:
     direction = str(direction).strip().lower()
     symbol = str(symbol).strip().upper()
     ok = symbol and direction in {"buy", "sell"} and _f(entry) > 0 and _f(sl) > 0 and _f(tp) > 0
@@ -369,9 +423,18 @@ def plan_open(strategy: str, symbol: str, direction: str, entry: float, sl: floa
 
 
 @tool
-def plan_close(ticket: int, fraction: float = 1.0, reason: str = "") -> str:
-    """CLOTURER une position ouverte, totalement (fraction=1.0) ou partiellement
-    (ex 0.5 = la moitie, pour securiser une partie des gains). ticket = celui de la position."""
+def plan_open(strategy: str, symbol: str, direction: str, entry: float, sl: float,
+              tp: float, confidence: float = 0.6, rationale: str = "") -> str:
+    """OUVRIR une nouvelle position. strategy = nom exact du catalogue
+    (trend_follow, donchian_breakout, mean_reversion, momentum). direction = "buy"/"sell".
+    symbol = N'IMPORTE QUEL symbole negociable du broker (cf. list_symbols), pas seulement
+    la watchlist — c'est TOI qui choisis quoi trader. entry/sl/tp en PRIX, a des niveaux
+    techniques reels. NE calcule PAS le lot (le moteur de risque FTMO dimensionne).
+    Coherence exigee : buy -> sl<entry<tp ; sell -> tp<entry<sl."""
+    return _plan_open(strategy, symbol, direction, entry, sl, tp, confidence, rationale)
+
+
+def _plan_close(ticket: int, fraction: float = 1.0, reason: str = "") -> str:
     frac = max(0.05, min(1.0, _f(fraction, 1.0)))
     _CTX["actions"].append({"type": "close", "ticket": int(_f(ticket)), "fraction": frac,
                             "reason": str(reason)})
@@ -379,13 +442,40 @@ def plan_close(ticket: int, fraction: float = 1.0, reason: str = "") -> str:
 
 
 @tool
+def plan_close(ticket: int, fraction: float = 1.0, reason: str = "") -> str:
+    """CLOTURER une position ouverte, totalement (fraction=1.0) ou partiellement
+    (ex 0.5 = la moitie, pour securiser une partie des gains). ticket = celui de la position."""
+    return _plan_close(ticket, fraction, reason)
+
+
+def _plan_modify(ticket: int, sl: float = 0.0, tp: float = 0.0, reason: str = "") -> str:
+    _CTX["actions"].append({"type": "modify", "ticket": int(_f(ticket)),
+                            "sl": _f(sl) or None, "tp": _f(tp) or None, "reason": str(reason)})
+    return f"Modification planifiee: ticket {int(_f(ticket))}."
+
+
+@tool
 def plan_modify(ticket: int, sl: float = 0.0, tp: float = 0.0, reason: str = "") -> str:
     """MODIFIER le stop et/ou la cible d'une position (break-even, deplacement ponctuel de
     stop, ajustement de cible). Mettre sl et/ou tp au nouveau PRIX (0 = ne pas changer ce
     champ). Le garde-fou n'accepte pas d'AUGMENTER le risque au-dela du budget FTMO."""
-    _CTX["actions"].append({"type": "modify", "ticket": int(_f(ticket)),
-                            "sl": _f(sl) or None, "tp": _f(tp) or None, "reason": str(reason)})
-    return f"Modification planifiee: ticket {int(_f(ticket))}."
+    return _plan_modify(ticket, sl, tp, reason)
+
+
+def _plan_trail(ticket: int, atr_mult: float = 2.0, pips: float = 0.0,
+                activate_r: float = 1.0, timeframe: str = "", enabled: bool = True,
+                reason: str = "") -> str:
+    tk = int(_f(ticket))
+    am = _f(atr_mult); pp = _f(pips)
+    if enabled and am <= 0 and pp <= 0:
+        am = 2.0
+    _CTX["actions"].append({"type": "trail", "ticket": tk,
+                            "atr_mult": am if am > 0 else None, "pips": pp if pp > 0 else None,
+                            "activate_r": _f(activate_r, 1.0),
+                            "timeframe": str(timeframe).strip().upper() or None,
+                            "enabled": bool(enabled), "reason": str(reason)})
+    return (f"Trailing {'arme' if enabled else 'desarme'} sur ticket {tk}"
+            + (f" (dist {pp:.0f} pips)" if pp > 0 else f" ({am:.1f}xATR)" if enabled else "") + ".")
 
 
 @tool
@@ -404,17 +494,7 @@ def plan_trail(ticket: int, atr_mult: float = 2.0, pips: float = 0.0,
     C'est TON choix : trailing serre pour proteger, large pour laisser respirer la tendance ;
     tu peux aussi le desarmer et gerer le stop a la main avec plan_modify. Utile de calibrer
     la distance avec compute_indicator(atr) ou supertrend avant d'armer."""
-    tk = int(_f(ticket))
-    am = _f(atr_mult); pp = _f(pips)
-    if enabled and am <= 0 and pp <= 0:
-        am = 2.0
-    _CTX["actions"].append({"type": "trail", "ticket": tk,
-                            "atr_mult": am if am > 0 else None, "pips": pp if pp > 0 else None,
-                            "activate_r": _f(activate_r, 1.0),
-                            "timeframe": str(timeframe).strip().upper() or None,
-                            "enabled": bool(enabled), "reason": str(reason)})
-    return (f"Trailing {'arme' if enabled else 'desarme'} sur ticket {tk}"
-            + (f" (dist {pp:.0f} pips)" if pp > 0 else f" ({am:.1f}xATR)" if enabled else "") + ".")
+    return _plan_trail(ticket, atr_mult, pips, activate_r, timeframe, enabled, reason)
 
 
 ALL_TOOLS = [list_symbols, get_market, get_chart, compute_indicator, get_account,

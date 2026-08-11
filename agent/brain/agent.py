@@ -12,6 +12,8 @@ Deux appels LLM :
 """
 from __future__ import annotations
 import json
+import logging
+import re
 
 try:
     from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -29,6 +31,36 @@ except Exception as exc:  # pragma: no cover - optional dependency fallback
 from config import AgentConfig
 from brain import tools as T
 from strategy import playbooks
+
+log = logging.getLogger("agent")
+
+
+def _extract_json(texte: str) -> dict:
+    """Recupere l'objet JSON d'une reponse LLM (tolere le bavardage et les ```json)."""
+    if not texte:
+        return {}
+    t = texte.strip()
+    t = re.sub(r"^```(?:json)?|```$", "", t, flags=re.M).strip()
+    # DeepSeek-R1 prefixe son raisonnement : on ne garde que le dernier objet complet
+    debut = t.find("{")
+    if debut < 0:
+        return {}
+    profondeur, fin = 0, -1
+    for i, ch in enumerate(t[debut:], start=debut):
+        if ch == "{":
+            profondeur += 1
+        elif ch == "}":
+            profondeur -= 1
+            if profondeur == 0:
+                fin = i + 1
+                break
+    if fin < 0:
+        return {}
+    try:
+        data = json.loads(t[debut:fin])
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 SYSTEM = """Tu es un TRADER SWING AUTONOME, specialiste des challenges FTMO en DEUX
 ETAPES. Tu es actuellement en ETAPE {phase}. Compte : {account_size:.0f} USD.
@@ -156,6 +188,27 @@ Si le moteur de risque oppose un veto, accepte-le. Si rien a faire, n'emets aucu
 Tu peux emettre PLUSIEURS actions par cycle. Tu es juge sur la gestion du book et le respect
 des regles, pas sur l'activite."""
 
+JSON_MODE_SUFFIX = """MODE SANS OUTILS — IMPORTANT : tu ne peux pas appeler d'outils ce
+cycle. On te livre un DOSSIER complet (compte, positions, marches, chart, strategies,
+bilan/post-mortem, news). Tu ne peux donc PAS demander d'analyse supplementaire : decide
+avec ce dossier, et si l'information manque, abstiens-toi (c'est une decision valable).
+
+Reponds UNIQUEMENT par un objet JSON, sans texte autour, sans balise de code :
+{"analyse": "2-3 phrases : regime, biais macro, ce que tu fais et pourquoi",
+ "actions": [
+   {"type": "close",  "ticket": 123, "fraction": 1.0, "reason": "these cassee"},
+   {"type": "modify", "ticket": 123, "sl": 1.0950, "tp": 0, "reason": "break-even"},
+   {"type": "trail",  "ticket": 123, "atr_mult": 2.0, "activate_r": 1.0,
+    "timeframe": "D1", "enabled": true, "reason": "laisser courir"},
+   {"type": "open",   "strategy": "trend_follow", "symbol": "EURUSD", "direction": "buy",
+    "entry": 1.1000, "sl": 1.0900, "tp": 1.1250, "confidence": 0.7,
+    "rationale": "macro + technique + ce qui invaliderait"}
+ ]}
+Regles : "actions" vide = ne rien faire (parfaitement acceptable). Les prix sont des PRIX
+reels du dossier. Ne calcule JAMAIS le lot. Coherence : buy -> sl<entry<tp ; sell ->
+tp<entry<sl. Les ouvertures repassent par le moteur de risque FTMO qui peut opposer un veto."""
+
+
 REFLECT_SYSTEM = """Tu es le coach du trader. On te donne un trade cloture — avec la
 strategie, le regime, le R:R PLANIFIE, le R REELLEMENT encaisse, le MFE (meilleur point
 atteint) et le MAE (pire point), le slippage et le spread payes — puis le BILAN CHIFFRE
@@ -178,6 +231,11 @@ class TraderAgent:
         # pilote de secours deterministe (brain/autopilot.py). Voir aussi last_error.
         self.degraded = False
         self.last_error = ""
+        # tool calling ou mode JSON (modeles sans tool use : DeepSeek...)
+        b = cfg.bedrock
+        self.mode = ("json" if b.tool_mode == "json"
+                     else "tools" if b.tool_mode == "tools"
+                     else "tools" if b.supports_tools else "json")
         if not _LANGCHAIN_OK:
             self._llm_error = str(_LANGCHAIN_ERROR)
             self.degraded = True
@@ -210,6 +268,33 @@ class TraderAgent:
                    f" Reevaluer l'adaptation au regime avant le prochain trade."
         return f"{strat}: garder une approche selective et ne pas trader par impatience."
 
+    # ------------------------------------------------------------------ mode JSON
+    # Certains modeles Bedrock (DeepSeek notamment) exposent Converse mais PAS le tool
+    # calling. Dans ce cas on ne peut pas laisser le modele appeler get_chart/plan_open :
+    # on lui injecte un DOSSIER de contexte deja constitue et on lui demande un PLAN
+    # D'ACTIONS en JSON, qui repasse ensuite par les memes fonctions de validation
+    # (plan_open/plan_close/plan_modify/plan_trail) et par le moteur de risque FTMO.
+    def _json_prompt(self) -> str:
+        f = self.cfg.ftmo
+        return (SYSTEM.format(phase=f.phase, account_size=f.account_size,
+                              target=f.profit_target_pct, max_daily=f.max_daily_loss_pct,
+                              max_total=f.max_total_loss_pct,
+                              playbooks=playbooks.as_prompt_block())
+                + "\n\n" + JSON_MODE_SUFFIX)
+
+    def _decide_json(self, account: dict) -> list[dict]:
+        # messages BRUTS (pas de ChatPromptTemplate) : le dossier contient du JSON,
+        # dont les accolades seraient prises pour des variables de template.
+        resp = self.llm.invoke([
+            ("system", self._json_prompt()),
+            ("human", "DOSSIER DU CYCLE :\n" + T.context_digest()
+             + "\n\nRends UNIQUEMENT le JSON du plan d'actions.")])
+        texte = resp.content if isinstance(resp.content, str) else str(resp.content)
+        plan = _extract_json(texte)
+        if plan.get("analyse"):
+            log.info("Analyse: %s", str(plan["analyse"])[:400])
+        return T.apply_plan(plan)
+
     def _executor(self) -> AgentExecutor | None:
         if not self.llm or not _LANGCHAIN_OK:
             return None
@@ -232,36 +317,57 @@ class TraderAgent:
         """Fait tourner l'agent (gestion du book + recherche d'entrees) et renvoie la
         liste des actions de trading a executer (open / close / modify / trail).
 
-        En cas d'echec (LLM injoignable, credentials, quota, erreur d'execution), on
-        leve le drapeau `degraded` : l'orchestrateur prend alors la main avec le pilote
-        de secours deterministe et n'ouvre plus rien."""
+        Deux modes selon le modele : TOOL CALLING (Claude, Nova, Mistral Large...) ou
+        JSON (DeepSeek et autres modeles sans tool use) — bascule automatique en cas
+        d'echec des outils. En cas d'echec total (LLM injoignable, credentials, quota),
+        on leve `degraded` : l'orchestrateur prend la main avec le pilote deterministe
+        et n'ouvre plus rien."""
         if self.llm is None or not _LANGCHAIN_OK:
             self.degraded = True
             self.last_error = self.last_error or (self._llm_error or "LLM non initialise")
             return self._fallback_actions()
         try:
-            self._executor().invoke(
-                {"input": "Gere ton portefeuille : revois d'abord tes positions ouvertes "
-                          "(securiser/cloturer/ajuster), puis cherche des opportunites. "
-                          "Emets les actions necessaires."})
+            if self.mode == "json":
+                actions = self._decide_json(account)
+            else:
+                self._executor().invoke(
+                    {"input": "Gere ton portefeuille : revois d'abord tes positions ouvertes "
+                              "(securiser/cloturer/ajuster), puis cherche des opportunites. "
+                              "Emets les actions necessaires."})
+                actions = T.pop_actions()
         except Exception as exc:
-            self.degraded = True
-            self.last_error = f"appel LLM en echec: {exc}"
-            return self._fallback_actions()
+            if self.mode != "json" and self.cfg.bedrock.tool_mode != "tools":
+                # le modele ne sait pas appeler d'outils -> on bascule definitivement
+                log.warning("Tool calling indisponible pour %s (%s) — bascule en MODE JSON.",
+                            self.cfg.bedrock.model_id, exc)
+                self.mode = "json"
+                try:
+                    actions = self._decide_json(account)
+                except Exception as exc2:
+                    self.degraded = True
+                    self.last_error = f"appel LLM en echec (mode JSON): {exc2}"
+                    return self._fallback_actions()
+            else:
+                self.degraded = True
+                self.last_error = f"appel LLM en echec: {exc}"
+                return self._fallback_actions()
         self.degraded = False
         self.last_error = ""
-        return T.pop_actions()
+        return actions
 
     def reflect(self, trade: dict, postmortem: str = "") -> str:
         """Ecrit la lecon d'un trade cloture, en s'appuyant sur le bilan chiffre
         (brain/postmortem.py) pour eviter les lecons redondantes ou hors-sol."""
         if self.llm is None or not _LANGCHAIN_OK:
             return self._fallback_reflect(trade)
+        # messages BRUTS : le JSON du trade contient des accolades, que
+        # ChatPromptTemplate prendrait pour des variables (la lecon echouait toujours).
         msgs = [("system", REFLECT_SYSTEM),
                 ("human", "Trade cloture :\n" + json.dumps(trade, ensure_ascii=False, default=str)
                  + (f"\n\nBILAN CHIFFRE ACTUEL :\n{postmortem}" if postmortem else ""))]
         try:
-            resp = self.llm.invoke(ChatPromptTemplate.from_messages(msgs).format_messages())
+            resp = self.llm.invoke(msgs)
             return resp.content if isinstance(resp.content, str) else str(resp.content)
-        except Exception:
+        except Exception as exc:
+            log.warning("Reflexion LLM impossible (%s) — lecon generique.", exc)
             return self._fallback_reflect(trade)

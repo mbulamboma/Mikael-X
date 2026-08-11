@@ -127,8 +127,11 @@ def test_cycle_complet_bascule_en_secours_puis_arrete_le_script():
         def account(self):
             return {"equity": 101_000.0, "balance": 101_000.0, "currency": "USD"}
 
-        def positions(self):
-            return list(self.pos)
+        def positions(self, own_only=None):
+            return [dict(p, a_nous=True) for p in self.pos]
+
+        def server_now(self):
+            return datetime(2026, 8, 11, 12, 0, tzinfo=timezone.utc)   # mardi midi
 
         def ensure_symbol(self, s):
             return True

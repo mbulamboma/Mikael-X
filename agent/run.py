@@ -44,7 +44,8 @@ from data.market import snapshot, _atr
 from data import chart, indicators
 from data.news import NewsFeed
 from data.web import WebResearch
-from risk.ftmo import FTMOEngine, AccountState, TradeProposal, TradeCosts
+from risk.ftmo import (FTMOEngine, AccountState, TradeProposal, TradeCosts,
+                      currencies_of)
 from brain.memory import Memory
 from brain.autopilot import SafePilot
 from brain.postmortem import PostMortem
@@ -62,8 +63,11 @@ class SafeExit(Exception):
     a l'humain (inspection manuelle puis relance)."""
 
 
-def _today_key() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _today_key(now: datetime | None = None) -> str:
+    """Cle de journee. ATTENTION : la journee FTMO se reinitialise a MINUIT HEURE
+    SERVEUR (EET/EEST), pas a minuit UTC — d'ou l'horloge serveur passee en argument
+    par l'orchestrateur (broker.server_now())."""
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
 def _position_risk(pos: dict, spec: dict) -> float:
@@ -90,6 +94,7 @@ class Orchestrator:
         self._spec_cache: dict[str, dict] = {}
         self._bars_cache: dict[tuple[str, str], "object"] = {}
         self._last_regime = "unknown"          # regime dominant du cycle (trace post-mortem)
+        self._server_now: datetime | None = None   # horloge serveur (journee FTMO)
 
     # -------------------------------------------------------- acces marche a la demande
     def _spec(self, symbol: str) -> dict:
@@ -223,23 +228,33 @@ class Orchestrator:
             margin_required_per_lot=marge_1lot,
             max_spread_pips=e.max_spread_pips,
             max_spread_atr_ratio=e.max_spread_atr_ratio,
-            max_margin_pct_of_free=e.max_margin_pct_of_free)
+            max_margin_pct_of_free=e.max_margin_pct_of_free,
+            max_risk_per_currency_pct=e.max_risk_per_currency_pct)
 
     def _weekend_guard(self, now: datetime | None = None) -> str:
         """Pas de NOUVELLE entree juste avant la fermeture hebdomadaire (risque de gap)."""
         e = self.cfg.execution
         if not e.weekend_guard:
             return ""
-        now = now or datetime.now(timezone.utc)
+        now = now or self.server_now()
         if now.weekday() == 4 and now.hour >= e.friday_cutoff_utc:      # vendredi
-            return (f"garde week-end: apres {e.friday_cutoff_utc}h UTC le vendredi, "
-                    f"risque de gap a la reouverture (AGENT_WEEKEND_GUARD=0 pour lever)")
+            return (f"garde week-end: apres {e.friday_cutoff_utc}h (heure serveur) le "
+                    f"vendredi, risque de gap a la reouverture (AGENT_WEEKEND_GUARD=0)")
         return ""
+
+    def server_now(self) -> datetime:
+        """Horloge SERVEUR (journee FTMO). Mise en cache le temps d'un cycle."""
+        if self._server_now is None:
+            try:
+                self._server_now = self.broker.server_now()
+            except Exception:
+                self._server_now = datetime.now(timezone.utc)
+        return self._server_now
 
     # -------------------------------------------------------- session / FTMO state
     def _session(self, account: dict) -> dict:
         s = self.mem.load_session()
-        today = _today_key()
+        today = _today_key(self.server_now())          # journee = celle du serveur FTMO
         ph = self.cfg.ftmo.phase
         # (re)demarrage d'une ETAPE : re-ancre solde initial + fenetre 30j + jours de trading
         if s.get("phase") != ph:
@@ -285,17 +300,28 @@ class Orchestrator:
         }
 
     def _account_state(self, account: dict, positions: list, s: dict) -> AccountState:
+        """`positions` inclut les positions d'AUTRES EA : elles pesent sur l'equity donc
+        sur les limites FTMO, et sur le risque correle. On ne les pilote jamais."""
         risk_by_sym: dict[str, float] = {}
+        risk_by_ccy: dict[str, float] = {}
         for p in positions:
             spec = self._spec(p["symbol"])
-            if spec:
-                risk_by_sym[p["symbol"]] = risk_by_sym.get(p["symbol"], 0.0) + _position_risk(p, spec)
+            if not spec:
+                continue
+            r = _position_risk(p, spec)
+            risk_by_sym[p["symbol"]] = risk_by_sym.get(p["symbol"], 0.0) + r
+            for ccy in currencies_of(p["symbol"]):
+                risk_by_ccy[ccy] = risk_by_ccy.get(ccy, 0.0) + r
         last_loss = datetime.fromisoformat(s["last_loss_iso"]) if s.get("last_loss_iso") else None
         return AccountState(
             equity=account["equity"], balance=account["balance"],
-            day_start_balance=s["day_start_balance"], initial_balance=s["initial_balance"],
+            # tolerant : le watchdog peut tourner avant le premier cycle complet
+            day_start_balance=s.get("day_start_balance") or account["balance"],
+            initial_balance=s.get("initial_balance") or account["balance"],
             open_positions=len(positions), open_risk_by_symbol=risk_by_sym,
-            trades_today=s["trades_today"], last_loss_time=last_loss)
+            open_risk_by_currency=risk_by_ccy,
+            trading_days=len(set(s.get("trading_days", []))),
+            trades_today=int(s.get("trades_today", 0)), last_loss_time=last_loss)
 
     def _account_summary(self, acc: AccountState) -> dict:
         c = self.cfg.ftmo
@@ -351,7 +377,7 @@ class Orchestrator:
         trade = {"ticket": meta.get("ticket"), "symbol": meta.get("symbol"),
                  "strategy": strat, "direction": meta.get("direction"),
                  "entry": meta.get("entry"), "exit": exit_price,
-                 "R": R, "pnl": pnl, "result": result, "closed_at": _today_key(),
+                 "R": R, "pnl": pnl, "result": result, "closed_at": _today_key(self.server_now()),
                  # --- matiere du POST-MORTEM : plan vs realite ---
                  "rr_planifie": rr, "rr_net_planifie": meta.get("rr_net"),
                  "mfe_R": meta.get("mfe_R"), "mae_R": meta.get("mae_R"),
@@ -487,6 +513,103 @@ class Orchestrator:
         if changed:
             self.mem.save_meta(meta)
 
+    # -------------------------------------------------------- filet deterministe (sans IA)
+    def _protect(self, positions: list, etrangeres: list, summary: dict, meta: dict,
+                 s: dict, account: dict) -> bool:
+        """PROTECTIONS QUI NE DEPENDENT PAS DU LLM, appliquees a chaque cycle ET par le
+        watchdog entre deux cycles. Renvoie True si une URGENCE a ete traitee (l'IA n'a
+        alors pas son mot a dire ce tour-ci).
+
+        1. Perte du jour proche de la limite / perte totale -> on ferme TOUT (nos positions).
+        2. Position sans stop -> SL d'urgence ; +1R -> break-even ; trailing arme.
+        3. Vendredi apres le cutoff -> mise a plat si AGENT_WEEKEND_FLATTEN=1.
+
+        Rappel : les positions d'un autre EA comptent dans la perte (elles pesent sur
+        l'equity FTMO) mais ne sont JAMAIS fermees par l'agent — on alerte a la place.
+        """
+        if not positions and not etrangeres:
+            return False
+        pos_view = self._enrich_positions(positions, meta)
+        panique = self.pilot.panic_reason(summary)
+
+        if panique:
+            log.error("URGENCE FTMO — %s : fermeture immediate de %d position(s).",
+                      panique, len(positions))
+            self.mem.log_event("urgence_ftmo", {"raison": panique, "positions": len(positions),
+                                                "etrangeres": len(etrangeres), **summary})
+            for p in positions:
+                self._exec_close({"ticket": p["ticket"], "fraction": 1.0,
+                                  "reason": f"urgence: {panique}"[:24]}, meta)
+            if etrangeres:
+                log.error("ATTENTION : %d position(s) hors agent restent ouvertes et pesent "
+                          "sur la perte du jour — intervention MANUELLE requise.",
+                          len(etrangeres))
+            self.mem.add_lesson("*", "loss", f"Urgence FTMO declenchee: {panique}",
+                                tags=["risque", "urgence"])
+            return True
+
+        if self._flatten_weekend_due():
+            log.warning("MISE A PLAT WEEK-END : fermeture de %d position(s) avant la "
+                        "coupure hebdomadaire (risque de gap).", len(positions))
+            self.mem.log_event("weekend_flatten", {"positions": len(positions)})
+            for p in positions:
+                self._exec_close({"ticket": p["ticket"], "fraction": 1.0,
+                                  "reason": "week-end: gap"}, meta)
+            return bool(positions)
+
+        # protections position par position (stop d'urgence, break-even, trailing)
+        atr_by_sym = {}
+        for p in pos_view:
+            df = self._bars(p["symbol"], self.cfg.timeframe)
+            if df is not None and not df.empty:
+                try:
+                    atr_by_sym[p["symbol"]] = _atr(df, 14)
+                except Exception:
+                    pass
+        actions = self.pilot.protective_actions(pos_view, atr_by_sym, self._spec)
+        if actions:
+            log.info("Protections deterministes: %s",
+                     [f"{a['type']} #{a['ticket']}" for a in actions])
+            pos_by_tk = {p["ticket"]: p for p in positions}
+            for a in actions:
+                if a["type"] == "modify":
+                    self._exec_modify(a, pos_by_tk, meta)
+                elif a["type"] == "trail":
+                    self._exec_trail(a, meta)
+                elif a["type"] == "close":
+                    self._exec_close(a, meta)
+        return False
+
+    def _flatten_weekend_due(self) -> bool:
+        e = self.cfg.execution
+        if not e.weekend_flatten:
+            return False
+        now = self.server_now()
+        return now.weekday() == 4 and now.hour >= e.friday_cutoff_utc
+
+    def watchdog(self):
+        """Tour de garde SANS IA (toutes les AGENT_WATCH_SECONDS) : on ne decide rien,
+        on protege. C'est ce qui evite de decouvrir une perte a -5 % une heure trop tard."""
+        if not self.broker.connected:
+            return
+        self._server_now = None
+        self._spec_cache.clear()
+        self._bars_cache.clear()
+        account = self.broker.account()
+        if account["balance"] <= 0:
+            return
+        positions = self.broker.positions()
+        etrangeres = [p for p in self.broker.positions(own_only=False) if not p.get("a_nous")]
+        if not positions and not etrangeres:
+            return
+        s = self.mem.load_session()
+        if not s.get("initial_balance"):
+            return
+        meta = self.mem.load_meta()
+        acc = self._account_state(account, positions + etrangeres, s)
+        summary = self._account_summary(acc)
+        self._protect(positions, etrangeres, summary, meta, s, account)
+
     # -------------------------------------------------------- execution des actions
     def _execute_actions(self, actions: list, s: dict, meta: dict,
                          news: dict, can_open: bool, account: dict):
@@ -581,6 +704,11 @@ class Orchestrator:
             log.warning("Ouverture %s ignoree : symbole inconnu ou non negociable.", sym)
             self.mem.log_event("symbol_unknown", {"symbol": sym, "strategy": strat})
             return
+        if self.cfg.news.enabled and self.cfg.news.fail_closed and not self.news.calendar_ok:
+            log.error("Ouverture %s refusee : calendrier economique illisible et "
+                      "NEWS_FAIL_CLOSED=1 (aucune protection news).", sym)
+            self.mem.log_event("news_fail_closed", {"symbol": sym})
+            return
         bo = news.get("blackout", {}).get(sym) or self.news.blackout_for(sym)
         if bo.get("active"):
             log.info("BLACK-OUT news sur %s (%s dans %sh) — entree bloquee.",
@@ -624,7 +752,7 @@ class Orchestrator:
                                           "result": res})
         if res["ok"]:
             s["trades_today"] += 1
-            today = _today_key()                          # suivi du minimum 4 jours de trading
+            today = _today_key(self.server_now())         # min 4 jours de trading (heure serveur)
             if today not in s.setdefault("trading_days", []):
                 s["trading_days"].append(today)
             meta[str(res["ticket"])] = {
@@ -655,13 +783,18 @@ class Orchestrator:
         # nouveau cycle -> donnees fraiches (specs et bougies rechargees a la demande)
         self._spec_cache.clear()
         self._bars_cache.clear()
+        self._server_now = None          # horloge serveur relue a chaque cycle
         self.web.reset_budget()          # quota de recherches web rendu a l'agent
 
         s = self._session(account)
-        positions = self.broker.positions()
+        positions = self.broker.positions()          # les NOTRES (magic) : on n'agit que dessus
         meta = self.mem.load_meta()
         self._handle_closes(positions, meta, s)
         positions = self.broker.positions()
+        etrangeres = [p for p in self.broker.positions(own_only=False) if not p.get("a_nous")]
+        if etrangeres:
+            log.info("%d position(s) d'un autre EA / manuelles : comptees dans le risque, "
+                     "JAMAIS touchees.", len(etrangeres))
 
         # Pre-scan de la WATCHLIST (point de depart). L'agent reste libre d'aller
         # chercher n'importe quel autre symbole du broker via list_symbols/get_chart.
@@ -677,13 +810,19 @@ class Orchestrator:
             snaps[sym] = snapshot(sym, self._bars(sym, self.cfg.timeframe), spec)
             charts[sym] = chart.read(sym, frames, spec)
 
-        # trailing stops armes -> maintenus AUTOMATIQUEMENT a chaque cycle (avant tout le reste)
+        # PROTECTIONS DETERMINISTES D'ABORD — elles ne dependent JAMAIS du LLM :
+        # trailing, stop d'urgence, break-even, panique perte-jour, mise a plat week-end.
         self._apply_trailing(meta)
         positions = self.broker.positions()          # SL potentiellement resserres
 
-        acc = self._account_state(account, positions, s)
+        acc = self._account_state(account, positions + etrangeres, s)
         summary = self._account_summary(acc)
         summary.update(self._phase_info(s, summary["pnl_total_pct"]))
+        if self._protect(positions, etrangeres, summary, meta, s, account):
+            return                                   # urgence traitee : on ne sollicite pas l'IA
+        positions = self.broker.positions()
+        acc = self._account_state(account, positions + etrangeres, s)
+        summary.update(self._account_summary(acc))
         sb = Scoreboard(self.mem.closed_trades())
         news = self.news.snapshot(watch)
         pos_view = self._enrich_positions(positions, meta)
@@ -753,7 +892,7 @@ class Orchestrator:
                     atr_by_sym[p["symbol"]] = _atr(df, 14)
                 except Exception:
                     pass
-        actions = self.pilot.actions(pos_view, summary, atr_by_sym)
+        actions = self.pilot.actions(pos_view, summary, atr_by_sym, spec_of=self._spec)
         self.mem.log_event("safe_mode", {"raison": why, "positions": len(pos_view),
                                          "actions": actions, **summary})
         self._write_safe_marker(why, pos_view, summary)
@@ -834,6 +973,23 @@ class Orchestrator:
         print()
         st.close()
 
+    def _sleep_with_watchdog(self, seconds: int) -> bool:
+        """Attend le prochain cycle LLM en executant le watchdog toutes les
+        AGENT_WATCH_SECONDS. Renvoie False si le script doit s'arreter."""
+        pas = max(5, int(self.cfg.execution.watch_seconds or seconds))
+        restant = int(seconds)
+        while restant > 0:
+            dodo = min(pas, restant)
+            time.sleep(dodo)
+            restant -= dodo
+            try:
+                self.watchdog()
+            except SafeExit:
+                raise
+            except Exception as e:
+                log.warning("Watchdog: %s", e)
+        return True
+
     def run(self, loop: bool) -> int:
         ok = self.broker.connect()
         if not ok:
@@ -865,7 +1021,12 @@ class Orchestrator:
                     log.exception("Erreur de cycle: %s", e)
                 if not loop:
                     break
-                time.sleep(self.cfg.loop_seconds)
+                # Entre deux decisions du LLM, le WATCHDOG protege en continu :
+                # perte-jour, stop d'urgence, break-even, trailing. Sans IA, sans delai.
+                if not self._sleep_with_watchdog(self.cfg.loop_seconds):
+                    break
+        except SafeExit as e:                    # levee depuis le watchdog
+            log.warning("ARRET DU SCRIPT (watchdog) — %s", e)
         finally:
             self.broker.shutdown()
             self.mem.store.close()          # WAL flush : rien ne se perd a l'arret

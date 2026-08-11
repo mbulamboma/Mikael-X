@@ -9,11 +9,23 @@ ordre sans passer par `validate()`. C'est ici que vit tout le chassis FTMO :
   - concentration par symbole.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
 from config import FTMOConfig
+
+
+def currencies_of(symbol: str) -> list[str]:
+    """Devises/facteurs portes par un symbole (pour le risque correle)."""
+    s = symbol.upper()
+    if len(s) >= 6 and s[:6].isalpha():
+        return [s[:3], s[3:6]]
+    if any(k in s for k in ("US30", "NAS", "SPX", "US500", "NDX", "DJ", "USTEC")):
+        return ["USD", "EQUITY"]
+    if any(k in s for k in ("GER", "DAX", "EU50", "FRA")):
+        return ["EUR", "EQUITY"]
+    return [s[:3]]
 
 
 @dataclass
@@ -27,6 +39,9 @@ class AccountState:
     open_risk_by_symbol: dict[str, float]   # risque $ deja engage par symbole
     trades_today: int
     last_loss_time: Optional[datetime] = None
+    # risque $ agrege par DEVISE : EURUSD long + GBPUSD long = un seul pari contre l'USD.
+    open_risk_by_currency: dict[str, float] = field(default_factory=dict)
+    trading_days: int = 0                   # jours de trading valides (critere FTMO)
 
 
 @dataclass
@@ -64,6 +79,7 @@ class TradeCosts:
     max_spread_pips: float = 0.0
     max_spread_atr_ratio: float = 0.0
     max_margin_pct_of_free: float = 100.0
+    max_risk_per_currency_pct: float = 0.0     # 0 = pas de plafond de correlation
 
 
 @dataclass
@@ -99,7 +115,18 @@ class FTMOEngine:
         if total_loss_pct >= c.total_soft_stop_pct:
             block.append(f"STOP TOTAL agent atteint ({total_loss_pct:.2f}% >= {c.total_soft_stop_pct}%).")
         if profit_pct >= c.profit_target_pct:
-            block.append(f"OBJECTIF +{c.profit_target_pct}% ATTEINT ({profit_pct:.2f}%) — on preserve, plus de risque.")
+            # Exception : si le critere "minimum de jours de trades" n'est pas encore
+            # rempli, arreter d'ouvrir rendrait l'etape INVALIDABLE. On laisse alors
+            # passer (le reste des garde-fous s'applique toujours).
+            if acc.trading_days >= c.min_trading_days:
+                block.append(f"OBJECTIF +{c.profit_target_pct}% ATTEINT ({profit_pct:.2f}%) — "
+                             f"on preserve, plus de risque.")
+            else:
+                block_msg = (f"Objectif atteint mais seulement {acc.trading_days}/"
+                             f"{c.min_trading_days} jours de trading : ouvertures encore "
+                             f"autorisees pour valider le critere.")
+                # information, pas un blocage
+                acc.__dict__.setdefault("_notes", []).append(block_msg)
         if acc.open_positions >= c.max_open_positions:
             block.append(f"Max positions simultanees atteint ({acc.open_positions}/{c.max_open_positions}).")
         if acc.trades_today >= c.max_trades_per_day:
@@ -177,9 +204,24 @@ class FTMOEngine:
         already = acc.open_risk_by_symbol.get(p.symbol, 0.0)
         symbol_room = acc.initial_balance * c.max_risk_per_symbol_pct / 100 - already
 
-        budget = min(base_budget, daily_room, total_room, symbol_room)
+        # CORRELATION : trois paires "contre le dollar" = un seul pari. On plafonne le
+        # risque cumule par DEVISE, sinon 3 x 1 % peuvent devenir 3 % sur un seul facteur.
+        ccy_room = float("inf")
+        ccy_bloquante = ""
+        if k.max_risk_per_currency_pct > 0:
+            plafond = acc.initial_balance * k.max_risk_per_currency_pct / 100
+            for ccy in currencies_of(p.symbol):
+                reste = plafond - acc.open_risk_by_currency.get(ccy, 0.0)
+                if reste < ccy_room:
+                    ccy_room, ccy_bloquante = reste, ccy
+
+        budget = min(base_budget, daily_room, total_room, symbol_room, ccy_room)
         if budget <= 0:
-            return RiskDecision(False, ["Aucun budget de risque disponible (marges FTMO epuisees)."])
+            motif = ("Aucun budget de risque disponible (marges FTMO epuisees)."
+                     if budget != ccy_room else
+                     f"Exposition {ccy_bloquante} deja au plafond "
+                     f"({k.max_risk_per_currency_pct:.1f}% du compte) — trade correle refuse.")
+            return RiskDecision(False, [motif])
 
         # --- PERTE REELLE si le stop est touche : distance + spread + slippage,
         #     plus la commission aller-retour. C'est CA le risque a dimensionner.

@@ -103,6 +103,19 @@ class ExecutionConfig:
     weekend_guard: bool = field(default_factory=lambda:
                                 os.environ.get("AGENT_WEEKEND_GUARD", "1") == "1")
     gap_provision_atr: float = _f("AGENT_GAP_PROVISION_ATR", 1.0)
+    # Mise a plat avant le week-end : ferme TOUTES les positions au cutoff du vendredi.
+    # Protege du gap du dimanche, mais coupe les swings gagnants -> a vous de trancher.
+    weekend_flatten: bool = field(default_factory=lambda:
+                                  os.environ.get("AGENT_WEEKEND_FLATTEN", "0") == "1")
+    # N'agir QUE sur les positions de l'agent (magic). Les positions d'un autre EA
+    # comptent dans le risque (elles pesent sur l'equity FTMO) mais on n'y touche jamais.
+    magic: int = _i("AGENT_MAGIC", 770077)
+    own_positions_only: bool = field(default_factory=lambda:
+                                     os.environ.get("AGENT_OWN_POSITIONS_ONLY", "1") == "1")
+    # Surveillance deterministe entre deux cycles LLM (protections seules, sans IA).
+    watch_seconds: int = _i("AGENT_WATCH_SECONDS", 60)
+    # Budget de risque par DEVISE (corrélation) : EURUSD + GBPUSD longs = meme pari dollar.
+    max_risk_per_currency_pct: float = _f("AGENT_MAX_RISK_PER_CURRENCY_PCT", 2.0)
 
 
 @dataclass(frozen=True)
@@ -153,6 +166,10 @@ class NewsConfig:
     upcoming_hours: int = _i("NEWS_UPCOMING_HOURS", 72)  # horizon des events a venir
     cache_min: int = _i("NEWS_CACHE_MIN", 30)            # TTL du cache news (swing = lent)
     min_importance: int = _i("NEWS_MIN_IMPORTANCE", 2)   # 2=moyen, 3=fort
+    # 1 = AUCUNE entree tant que le calendrier economique n'est pas lisible (fail-closed).
+    # Par defaut 0 : on log une ERREUR bruyante mais on continue de trader.
+    fail_closed: bool = field(default_factory=lambda:
+                              os.environ.get("NEWS_FAIL_CLOSED", "0") == "1")
 
 
 @dataclass(frozen=True)
@@ -195,10 +212,19 @@ class BedrockConfig:
 
     ATTENTION : sur Bedrock, l'ID modele est un *inference profile* qui depend de
     la region/compte et de l'acces active dans la console Bedrock. Le format usuel
-    est `us.anthropic.claude-...-v1:0` (prefixe region `us.`/`eu.`/`apac.` pour
-    l'inference cross-region). Lister les IDs disponibles :
+    est `us.<provider>.<modele>-v1:0` (prefixe region `us.`/`eu.`/`apac.`). Lister :
         aws bedrock list-inference-profiles --region <region>
-        aws bedrock list-foundation-models --by-provider anthropic --region <region>
+        aws bedrock list-foundation-models --region <region>
+
+    AUTHENTIFICATION : soit la chaine boto3 classique (AWS_PROFILE / cles / role IAM),
+    soit une **cle API Bedrock** (`BEDROCK_API_KEY`) — un jeton porteur que boto3 lit
+    dans `AWS_BEARER_TOKEN_BEDROCK` ; on le positionne automatiquement au demarrage.
+
+    OUTILS : tous les modeles Bedrock ne savent PAS appeler des outils (tool calling).
+    DeepSeek-R1 notamment expose Converse mais pas le tool use. `tool_mode` :
+      "auto"  -> essaie les outils, bascule en mode JSON si le modele ne suit pas,
+      "tools" -> force le tool calling (Claude, Nova, Mistral Large...),
+      "json"  -> force le mode JSON (contexte injecte, reponse = plan d'actions JSON).
     """
     model_id: str = field(default_factory=lambda: os.environ.get(
         "BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0"))
@@ -206,6 +232,22 @@ class BedrockConfig:
         "AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1")))
     # Credentials : laisses vides -> chaine boto3 par defaut (env, ~/.aws, role IAM).
     aws_profile: str = field(default_factory=lambda: os.environ.get("AWS_PROFILE", ""))
+    # Cle API Bedrock (jeton porteur) : alternative aux credentials IAM.
+    api_key: str = field(default_factory=lambda: os.environ.get(
+        "BEDROCK_API_KEY", os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")))
+    tool_mode: str = field(default_factory=lambda:
+                           os.environ.get("BEDROCK_TOOL_MODE", "auto").strip().lower())
+
+    def __post_init__(self):
+        # boto3/botocore lisent le jeton porteur dans cette variable d'environnement.
+        if self.api_key and not os.environ.get("AWS_BEARER_TOKEN_BEDROCK"):
+            os.environ["AWS_BEARER_TOKEN_BEDROCK"] = self.api_key
+
+    @property
+    def supports_tools(self) -> bool:
+        """Heuristique : familles connues pour NE PAS supporter le tool calling."""
+        mid = self.model_id.lower()
+        return not any(p in mid for p in ("deepseek", "titan-text", "llama3-8b", "jamba-instruct"))
 
 
 @dataclass(frozen=True)

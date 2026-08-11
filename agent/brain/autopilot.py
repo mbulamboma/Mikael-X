@@ -57,25 +57,43 @@ class SafePilot:
 
     # ------------------------------------------------------------------ decision
     def actions(self, positions: list[dict], account: dict,
-                atr_by_symbol: dict[str, float] | None = None) -> list[dict]:
+                atr_by_symbol: dict[str, float] | None = None,
+                spec_of=None) -> list[dict]:
         """Renvoie la liste d'actions a executer ce cycle (jamais d'ouverture)."""
         if not positions:
             return []
-        atr_by_symbol = atr_by_symbol or {}
-
-        panic = self._panic_reason(account)
+        panic = self.panic_reason(account)
         if panic:
             log.error("PILOTE DE SECOURS — %s : fermeture de TOUTES les positions.", panic)
             return [{"type": "close", "ticket": p["ticket"], "fraction": 1.0,
                      "reason": f"secours: {panic}"} for p in positions]
+        return self.protective_actions(positions, atr_by_symbol, spec_of)
 
+    def protective_actions(self, positions: list[dict],
+                           atr_by_symbol: dict[str, float] | None = None,
+                           spec_of=None) -> list[dict]:
+        """Protections position par position (SL d'urgence, break-even, trailing,
+        time-stop) — SANS la regle de panique. Utilisees aussi hors mode degrade :
+        ce filet ne doit jamais dependre de la disponibilite du LLM.
+
+        `spec_of(symbol)` : fonction rendant la spec du symbole (digits reels). Sans
+        elle on retombe sur une heuristique, ce qui peut faire REJETER un stop par le
+        broker (ex : or cote a 2 decimales) — donc on la fournit toujours en production.
+        """
+        atr_by_symbol = atr_by_symbol or {}
         out: list[dict] = []
         for p in positions:
-            out.extend(self._manage(p, atr_by_symbol.get(p.get("symbol"))))
+            digits = None
+            if spec_of is not None:
+                try:
+                    digits = (spec_of(p.get("symbol", "")) or {}).get("digits")
+                except Exception:
+                    digits = None
+            out.extend(self._manage(p, atr_by_symbol.get(p.get("symbol")), digits))
         return out
 
     # ------------------------------------------------------------------ regles
-    def _panic_reason(self, account: dict) -> str:
+    def panic_reason(self, account: dict) -> str:
         """Faut-il tout fermer immediatement pour proteger le challenge ?"""
         seuil_jour = self.ftmo.daily_stop_pct * max(0.1, min(self.cfg.panic_ratio, 1.0))
         perte_jour = _f(account.get("perte_jour_pct"))
@@ -87,10 +105,12 @@ class SafePilot:
             return f"perte totale {pnl_total:.2f}% <= -{self.ftmo.total_soft_stop_pct:.2f}%"
         return ""
 
-    def _manage(self, p: dict, atr: float | None) -> list[dict]:
+    def _manage(self, p: dict, atr: float | None, digits: int | None = None) -> list[dict]:
         tk = p.get("ticket")
         entry, sl = _f(p.get("entry")), _f(p.get("sl"))
-        digits = 5 if entry < 100 else 3
+        if digits is None:                      # repli si la spec broker est indisponible
+            digits = 5 if entry < 20 else (3 if entry < 500 else 2)
+        digits = int(digits)
         r = implied_r(p)
         acts: list[dict] = []
 
