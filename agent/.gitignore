@@ -1,0 +1,5 @@
+# Etat local de l'agent : base SQLite (journal, positions suivies, session FTMO)
+state/
+# anciens etats JSON migres
+*.migrated
+__pycache__/

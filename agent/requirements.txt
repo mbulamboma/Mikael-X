@@ -1,0 +1,11 @@
+# Agent trader FTMO SWING multi-strategies (LangChain + AWS Bedrock + MT5)
+langchain>=0.3
+langchain-aws>=0.2        # ChatBedrockConverse (API Converse, tool-calling)
+langchain-core>=0.3
+boto3>=1.34               # SDK AWS (credentials + Bedrock runtime)
+MetaTrader5>=5.0.45       # Windows uniquement
+pandas
+numpy
+requests                  # news : FRED (Fed) + GDELT + recherche/lecture web
+beautifulsoup4            # facultatif : meilleure extraction du texte des pages web
+python-dotenv

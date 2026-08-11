@@ -1,0 +1,884 @@
+# -*- coding: utf-8 -*-
+"""Boucle de vie de l'agent trader FTMO (multi-strategies, AWS Bedrock).
+
+L'orchestrateur est aussi le FOURNISSEUR d'acces marche des outils du LLM
+(`brain/tools.bind_live`) : l'agent demande le symbole, le timeframe, l'indicateur
+ou la recherche d'actualite qu'il veut, et tout est charge a la demande (avec cache
+de cycle). La watchlist AGENT_SYMBOLS n'est qu'un pre-scan de depart.
+
+Cycle (toutes les AGENT_LOOP_SECONDS) :
+  1. Rafraichit compte + snapshots marche + positions ; resout les clotures.
+  2. Pour chaque cloture -> attribue le resultat (R) a la strategie utilisee,
+     met a jour le scoreboard, et REFLECHIT (ecrit une lecon) -> apprentissage.
+  3. Calcule le regime + le classement des strategies (adequation x track-record).
+  4. Garde-fous FTMO de portefeuille (peut-on trader ?).
+  5. Le LLM choisit la MEILLEURE strategie et rend trade/wait.
+  6. Le moteur de risque valide + dimensionne -> execution REELLE MT5 + memorise
+     la strategie de la position pour l'attribution future.
+
+Garde-fou news : pas de nouvelle entree si annonce a fort impact imminente (black-out).
+
+SECOURS SANS IA : si le LLM devient indisponible (Bedrock, credentials, quota...),
+`brain/autopilot.py` prend la main — regles Python deterministes, AUCUNE nouvelle
+entree, protection des positions ouvertes (SL d'urgence, break-even, trailing,
+time-stop, fermeture totale si la perte du jour approche la limite). Des que le book
+est vide, le script s'arrete (SafeExit) pour inspection manuelle puis relance.
+
+Lancement :
+    python run.py            # un cycle unique (test)
+    python run.py --loop     # boucle continue
+"""
+from __future__ import annotations
+import argparse
+import logging
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from config import CFG
+from broker.mt5_broker import MT5Broker, TIMEFRAMES
+from data.market import snapshot, _atr
+from data import chart, indicators
+from data.news import NewsFeed
+from data.web import WebResearch
+from risk.ftmo import FTMOEngine, AccountState, TradeProposal, TradeCosts
+from brain.memory import Memory
+from brain.autopilot import SafePilot
+from brain.postmortem import PostMortem
+from brain import tools as T
+from strategy import regime as regime_mod, playbooks
+from strategy.scoreboard import Scoreboard
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+log = logging.getLogger("run")
+
+
+class SafeExit(Exception):
+    """Arret volontaire : l'IA est indisponible ET le book est vide -> on rend la main
+    a l'humain (inspection manuelle puis relance)."""
+
+
+def _today_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _position_risk(pos: dict, spec: dict) -> float:
+    if not pos.get("sl"):
+        return 0.0
+    stop_pips = abs(pos["entry"] - pos["sl"]) * spec["price_to_pips"]
+    return stop_pips * spec["pip_value_per_lot"] * pos["volume"]
+
+
+class Orchestrator:
+    def __init__(self):
+        self.cfg = CFG
+        self.broker = MT5Broker(CFG.mt5, CFG)
+        self.risk = FTMOEngine(CFG.ftmo)
+        self.mem = Memory()
+        self.news = NewsFeed(CFG.news)
+        self.web = WebResearch(CFG.web)
+        self.pilot = SafePilot(CFG.safe, CFG.ftmo)     # secours deterministe (sans LLM)
+        self.agent = None
+        self._prev_tickets: set[int] = set()
+        self._tickets_init = False
+        # caches de CYCLE : specs et bougies deja chargees (l'agent peut demander
+        # n'importe quel symbole / timeframe, on ne retelecharge pas deux fois).
+        self._spec_cache: dict[str, dict] = {}
+        self._bars_cache: dict[tuple[str, str], "object"] = {}
+        self._last_regime = "unknown"          # regime dominant du cycle (trace post-mortem)
+
+    # -------------------------------------------------------- acces marche a la demande
+    def _spec(self, symbol: str) -> dict:
+        """Spec d'un symbole QUELCONQUE (l'ajoute au Market Watch si besoin).
+        {} = symbole inconnu du broker -> on ne trade pas dessus."""
+        sym = symbol.strip().upper()
+        if sym in self._spec_cache:
+            return self._spec_cache[sym]
+        spec = self.broker.symbol_spec(sym) if self.broker.ensure_symbol(sym) else {}
+        self._spec_cache[sym] = spec
+        return spec
+
+    def _bars(self, symbol: str, timeframe: str, n: int = 300):
+        tf = (timeframe or self.cfg.timeframe).strip().upper()
+        if tf not in TIMEFRAMES:
+            tf = self.cfg.timeframe
+        key = (symbol.strip().upper(), tf)
+        if key not in self._bars_cache:
+            self._bars_cache[key] = self.broker.candles(key[0], tf, n)
+        return self._bars_cache[key]
+
+    # ---- API exposee aux OUTILS du LLM (brain/tools.bind_live) -------------------
+    # C'est ce qui rend l'agent libre : il choisit son symbole, son timeframe,
+    # ses indicateurs et ses recherches d'actualite, sans passer par la watchlist.
+    def symbols(self, query: str = "", only_watchlist: bool = False, limit: int = 40) -> list:
+        return self.broker.symbols(query=query, only_watchlist=only_watchlist, limit=limit)
+
+    def market(self, symbol: str, timeframe: str | None = None) -> dict:
+        spec = self._spec(symbol)
+        if not spec:
+            return {"error": f"{symbol} inconnu ou non negociable chez ce broker"}
+        return snapshot(symbol.upper(), self._bars(symbol, timeframe or self.cfg.timeframe), spec)
+
+    def chart(self, symbol: str, timeframes: list[str], candles: int = 10) -> dict:
+        spec = self._spec(symbol)
+        if not spec:
+            return {"error": f"{symbol} inconnu ou non negociable chez ce broker"}
+        tfs = [t for t in (timeframes or []) if t in TIMEFRAMES] or list(self.cfg.chart_timeframes)
+        frames = {tf: self._bars(symbol, tf) for tf in tfs}
+        return chart.read(symbol.upper(), frames, spec, candles=candles)
+
+    def indicator(self, symbol: str, timeframe: str, name: str, params: dict) -> dict:
+        spec = self._spec(symbol)
+        if not spec:
+            return {"error": f"{symbol} inconnu ou non negociable chez ce broker"}
+        df = self._bars(symbol, timeframe)
+        res = indicators.compute(name, df, digits=spec.get("digits", 5), **(params or {}))
+        return {"symbol": symbol.upper(), "timeframe": timeframe.upper(), **res}
+
+    def news_for(self, symbol: str) -> dict:
+        return self.news.for_symbols([symbol.upper()]).get("per_symbol", {}).get(symbol.upper(), {})
+
+    def news_search(self, query: str, hours: int = 48) -> dict:
+        return self.news.search(query, hours)
+
+    def major_events(self, hours: int = 72) -> dict:
+        return self.news.major_events(hours)
+
+    def fred_series(self, series_id: str, limit: int = 12) -> dict:
+        return self.news.fred_series(series_id, limit)
+
+    # ---- enquete web (analyse macro / d'expert) ; budget par cycle dans WebResearch
+    def web_search(self, query: str, limit: int = 6) -> dict:
+        return self.web.search(query, limit)
+
+    def web_read(self, url: str, max_chars: int | None = None) -> dict:
+        return self.web.read(url, max_chars)
+
+    def retail_sentiment(self, symbol: str = "") -> dict:
+        return self.web.retail_sentiment(symbol)
+
+    # -------------------------------------------------------- couts et frictions reelles
+    def costs_view(self, symbol: str, lot: float = 0.0, direction: str = "buy") -> dict:
+        """Ce que coute VRAIMENT un trade sur ce symbole (vue lisible pour le LLM)."""
+        spec = self._spec(symbol)
+        if not spec:
+            return {"error": f"{symbol} inconnu ou non negociable chez ce broker"}
+        e = self.cfg.execution
+        pipv = spec.get("pip_value_per_lot", 0.0)
+        atr_pips = self._atr_pips(symbol, spec)
+        lot = lot or self.cfg.ftmo.account_size * self.cfg.ftmo.risk_per_trade_pct / 100 / max(
+            (atr_pips or 20) * pipv, 1e-9)
+        lot = round(max(spec.get("min_lot", 0.01), lot), 2)
+        spread = spec.get("spread_pips", 0.0)
+        swap = spec.get("swap_long" if direction == "buy" else "swap_short", 0.0)
+        marge = self.broker.margin_required(symbol, lot, direction)
+        return {
+            "symbole": symbol, "lot_reference": lot,
+            "valeur_pip_par_lot": round(pipv, 4),
+            "spread_pips": spread,
+            "spread_cout": round(spread * pipv * lot, 2),
+            "spread_pct_atr": round(spread / atr_pips * 100, 1) if atr_pips else None,
+            "commission_aller_retour": round(e.commission_per_lot * lot, 2),
+            "slippage_provision_pips": e.slippage_pips,
+            "cout_total_estime": round(((spread + 2 * e.slippage_pips) * pipv
+                                        + e.commission_per_lot) * lot, 2),
+            "swap_par_nuit_par_lot": swap,
+            "swap_3x_le": spec.get("swap_rollover3days"),
+            "stop_minimum_broker_pips": spec.get("stops_level_pips", 0.0),
+            "atr_pips": round(atr_pips, 1) if atr_pips else None,
+            "marge_requise": round(marge, 2) if marge else None,
+            "marge_libre": round(self.broker.account().get("free_margin", 0.0), 2),
+            "gap_week_end_provision_pips": round(e.gap_provision_atr * atr_pips, 1) if atr_pips else None,
+            "note": "Le stop REEL paye = distance + spread + slippage ; la commission "
+                    "s'ajoute. Un stop trop serre est mange par les frais : vise un stop "
+                    "large devant le spread et un R:R NET >= 2.",
+        }
+
+    def _atr_pips(self, symbol: str, spec: dict) -> float:
+        df = self._bars(symbol, self.cfg.timeframe)
+        if df is None or df.empty or len(df) < 20:
+            return 0.0
+        try:
+            return _atr(df, 14) * spec.get("price_to_pips", 0.0)
+        except Exception:
+            return 0.0
+
+    def _costs(self, symbol: str, spec: dict, direction: str) -> TradeCosts:
+        """Frictions passees au moteur de risque pour le sizing et les vetos."""
+        e = self.cfg.execution
+        acct = self.broker.account()
+        marge_1lot = self.broker.margin_required(symbol, 1.0, direction) or 0.0
+        return TradeCosts(
+            spread_pips=spec.get("spread_pips", 0.0),
+            slippage_pips=e.slippage_pips,
+            commission_per_lot=e.commission_per_lot,
+            stops_level_pips=spec.get("stops_level_pips", 0.0),
+            swap_per_lot_per_night=spec.get("swap_long" if direction == "buy" else "swap_short", 0.0),
+            atr_pips=self._atr_pips(symbol, spec),
+            free_margin=acct.get("free_margin", 0.0),
+            margin_required_per_lot=marge_1lot,
+            max_spread_pips=e.max_spread_pips,
+            max_spread_atr_ratio=e.max_spread_atr_ratio,
+            max_margin_pct_of_free=e.max_margin_pct_of_free)
+
+    def _weekend_guard(self, now: datetime | None = None) -> str:
+        """Pas de NOUVELLE entree juste avant la fermeture hebdomadaire (risque de gap)."""
+        e = self.cfg.execution
+        if not e.weekend_guard:
+            return ""
+        now = now or datetime.now(timezone.utc)
+        if now.weekday() == 4 and now.hour >= e.friday_cutoff_utc:      # vendredi
+            return (f"garde week-end: apres {e.friday_cutoff_utc}h UTC le vendredi, "
+                    f"risque de gap a la reouverture (AGENT_WEEKEND_GUARD=0 pour lever)")
+        return ""
+
+    # -------------------------------------------------------- session / FTMO state
+    def _session(self, account: dict) -> dict:
+        s = self.mem.load_session()
+        today = _today_key()
+        ph = self.cfg.ftmo.phase
+        # (re)demarrage d'une ETAPE : re-ancre solde initial + fenetre 30j + jours de trading
+        if s.get("phase") != ph:
+            log.info("Nouvelle ETAPE %s -> re-ancrage du solde initial et de la fenetre.", ph)
+            s.update({"phase": ph,
+                      "initial_balance": account["balance"] or self.cfg.ftmo.account_size,
+                      "phase_start": self.cfg.ftmo.phase_start or today,
+                      "trading_days": [], "day": today,
+                      "day_start_balance": account["balance"], "trades_today": 0,
+                      "last_loss_iso": None})
+        if s.get("initial_balance") is None:
+            s["initial_balance"] = account["balance"] or self.cfg.ftmo.account_size
+        if s.get("day") != today:
+            s["day"] = today
+            s["day_start_balance"] = account["balance"]
+            s["trades_today"] = 0
+        s.setdefault("day_start_balance", account["balance"])
+        s.setdefault("trades_today", 0)
+        s.setdefault("last_loss_iso", None)
+        s.setdefault("phase_start", self.cfg.ftmo.phase_start or today)
+        s.setdefault("trading_days", [])
+        self.mem.save_session(s)
+        return s
+
+    def _phase_info(self, s: dict, total_pnl_pct: float) -> dict:
+        """Contexte de l'etape : objectif, ecart, jours ecoules/restants, jours de trading."""
+        c = self.cfg.ftmo
+        try:
+            d0 = datetime.fromisoformat(str(s.get("phase_start"))).date()
+        except (TypeError, ValueError):
+            d0 = datetime.now(timezone.utc).date()
+        elapsed = (datetime.now(timezone.utc).date() - d0).days
+        target = c.profit_target_pct
+        return {
+            "etape": c.phase,
+            "objectif_etape_pct": target,
+            "reste_avant_objectif_pct": round(target - total_pnl_pct, 2),
+            "objectif_atteint": total_pnl_pct >= target,
+            "jours_ecoules": elapsed,
+            "jours_restants": max(0, c.phase_days - elapsed),
+            "jours_trades": len(set(s.get("trading_days", []))),
+            "jours_trades_min": c.min_trading_days,
+        }
+
+    def _account_state(self, account: dict, positions: list, s: dict) -> AccountState:
+        risk_by_sym: dict[str, float] = {}
+        for p in positions:
+            spec = self._spec(p["symbol"])
+            if spec:
+                risk_by_sym[p["symbol"]] = risk_by_sym.get(p["symbol"], 0.0) + _position_risk(p, spec)
+        last_loss = datetime.fromisoformat(s["last_loss_iso"]) if s.get("last_loss_iso") else None
+        return AccountState(
+            equity=account["equity"], balance=account["balance"],
+            day_start_balance=s["day_start_balance"], initial_balance=s["initial_balance"],
+            open_positions=len(positions), open_risk_by_symbol=risk_by_sym,
+            trades_today=s["trades_today"], last_loss_time=last_loss)
+
+    def _account_summary(self, acc: AccountState) -> dict:
+        c = self.cfg.ftmo
+        daily_loss_pct = (acc.day_start_balance - acc.equity) / acc.initial_balance * 100
+        total_pnl_pct = (acc.equity - acc.initial_balance) / acc.initial_balance * 100
+        return {
+            "equity": round(acc.equity, 2), "balance": round(acc.balance, 2),
+            "pnl_total_pct": round(total_pnl_pct, 2), "objectif_pct": c.profit_target_pct,
+            "reste_avant_objectif_pct": round(c.profit_target_pct - total_pnl_pct, 2),
+            "perte_jour_pct": round(max(0.0, daily_loss_pct), 2),
+            "stop_jour_agent_pct": c.daily_stop_pct,
+            "positions_ouvertes": acc.open_positions, "trades_du_jour": acc.trades_today,
+            "budget_risque_trade_pct": c.risk_per_trade_pct,
+        }
+
+    def _lazy_agent(self):
+        if self.agent is None:
+            from brain.agent import TraderAgent
+            self.agent = TraderAgent(self.cfg)
+        return self.agent
+
+    # -------------------------------------------------------- regime + strategies
+    def _dominant_regime(self, snaps: dict) -> str:
+        counts: dict[str, int] = {}
+        for snap in snaps.values():
+            r = regime_mod.classify(snap)
+            if r != "unknown":
+                counts[r] = counts.get(r, 0) + 1
+        return max(counts, key=counts.get) if counts else "range"
+
+    def _strategies_block(self, snaps: dict, sb: Scoreboard) -> str:
+        lines = ["Regimes par symbole :"]
+        for sym, snap in snaps.items():
+            lines.append(f"- {sym}: {regime_mod.classify(snap)}")
+        dominant = self._dominant_regime(snaps)
+        self._last_regime = dominant          # trace pour le post-mortem des trades ouverts
+        lines.append("\nClassement des strategies (regime dominant = %s) :" % dominant)
+        lines.append(sb.as_prompt_block(dominant))
+        return "\n".join(lines)
+
+    # -------------------------------------------------------- clotures + attribution
+    def _record_close(self, meta: dict, pnl: float | None, exit_price: float | None):
+        strat = meta.get("strategy", "unknown")
+        risk = meta.get("risk_dollars", 0.0)
+        rr = meta.get("rr", 0.0)
+        result = meta.get("result")
+        # R : PnL reel MT5 ; si l'historique n'est pas encore dispo, R=0 (neutre)
+        if pnl is None:
+            R = rr if result == "tp" else (-1.0 if result == "sl" else 0.0)
+            pnl = round(risk * R, 2)
+        else:
+            R = round(pnl / risk, 2) if risk else 0.0
+        trade = {"ticket": meta.get("ticket"), "symbol": meta.get("symbol"),
+                 "strategy": strat, "direction": meta.get("direction"),
+                 "entry": meta.get("entry"), "exit": exit_price,
+                 "R": R, "pnl": pnl, "result": result, "closed_at": _today_key(),
+                 # --- matiere du POST-MORTEM : plan vs realite ---
+                 "rr_planifie": rr, "rr_net_planifie": meta.get("rr_net"),
+                 "mfe_R": meta.get("mfe_R"), "mae_R": meta.get("mae_R"),
+                 "slippage_pips": meta.get("slippage_pips"),
+                 "spread_pips_entree": meta.get("spread_pips_entree"),
+                 "couts_estimes": meta.get("couts_estimes"),
+                 "regime": meta.get("regime"), "confidence": meta.get("confidence"),
+                 "duree_h": self._duree_h(meta.get("ouvert_le")),
+                 "entry_planifiee": meta.get("entry_planifiee")}
+        self.mem.log_event("trade_closed", trade)
+        log.info("Cloture %s [%s] -> R=%.2f, PnL=%.2f", meta.get("symbol"), strat, R, pnl)
+        try:
+            # la lecon s'appuie sur le bilan chiffre -> apprentissage fonde, pas de blabla
+            bilan = PostMortem(self.mem.closed_trades()).as_prompt_block()
+            lesson = self._lazy_agent().reflect(trade, bilan)
+            self.mem.add_lesson(meta.get("symbol", "?"), "win" if R > 0 else "loss", lesson,
+                                tags=[strat, str(meta.get("regime") or "")])
+            log.info("Lecon [%s]: %s", strat, lesson)
+        except Exception as e:
+            log.warning("Reflexion impossible: %s", e)
+        return R
+
+    @staticmethod
+    def _duree_h(iso: str | None) -> float | None:
+        if not iso:
+            return None
+        try:
+            t0 = datetime.fromisoformat(str(iso))
+        except (TypeError, ValueError):
+            return None
+        return round((datetime.now(timezone.utc) - t0).total_seconds() / 3600, 1)
+
+    def _handle_closes(self, positions: list, meta: dict, s: dict):
+        """Detecte les positions fermees (ticket disparu) et attribue le resultat."""
+        cur = {p["ticket"] for p in positions}
+        if not self._tickets_init:
+            # premier cycle : on ancre les positions deja ouvertes sans les "fermer"
+            self._prev_tickets = cur
+            self._tickets_init = True
+            return
+        for tk in self._prev_tickets - cur:
+            m = meta.pop(str(tk), {"ticket": tk})
+            pnl = self.broker.realized_pnl(tk)
+            R = self._record_close(m, pnl, None)
+            if R < 0:
+                s["last_loss_iso"] = datetime.now(timezone.utc).isoformat()
+        self._prev_tickets = cur
+        self.mem.save_meta(meta)
+        self.mem.save_session(s)
+
+    # -------------------------------------------------------- vue des positions
+    def _enrich_positions(self, positions: list, meta: dict) -> list:
+        """Ajoute a chaque position : profit flottant en R, distance SL/TP, strategie.
+        Met aussi a jour MFE/MAE (meilleur et pire point atteint, en R) : matiere
+        premiere du post-mortem (stop trop serre ? sortie trop tot ?)."""
+        out = []
+        touched = False
+        for p in positions:
+            spec = self._spec(p["symbol"])
+            m = meta.get(str(p["ticket"]), {})
+            risk = m.get("risk_dollars", 0.0)
+            if risk:
+                r_now = p.get("floating", 0.0) / risk
+                if r_now > m.get("mfe_R", 0.0):
+                    m["mfe_R"], touched = round(r_now, 2), True
+                if r_now < m.get("mae_R", 0.0):
+                    m["mae_R"], touched = round(r_now, 2), True
+            price = p["entry"]
+            tk = self.broker.tick(p["symbol"])
+            if tk:
+                price = tk["bid"] if p["direction"] == "buy" else tk["ask"]
+            p2p = spec.get("price_to_pips", 0.0)
+            out.append({
+                "ticket": p["ticket"], "symbol": p["symbol"], "direction": p["direction"],
+                "volume": p["volume"], "entry": p["entry"], "price_now": round(price, spec.get("digits", 5)),
+                "sl": p["sl"], "tp": p["tp"],
+                "strategy": m.get("strategy", "?"),
+                "trailing": m.get("trail") if m.get("trail", {}).get("enabled") else None,
+                "floating_R": round(p.get("floating", 0.0) / risk, 2) if risk else None,
+                "floating_pnl": round(p.get("floating", 0.0), 2),
+                "dist_sl_pips": round(abs(price - p["sl"]) * p2p, 1) if p["sl"] else None,
+                "dist_tp_pips": round(abs(p["tp"] - price) * p2p, 1) if p["tp"] else None,
+                "mfe_R": m.get("mfe_R"), "mae_R": m.get("mae_R"),
+                "age_h": round((datetime.now(timezone.utc) - p["open_time"]).total_seconds() / 3600, 1)
+                if p.get("open_time") else None,
+            })
+        if touched:
+            self.mem.save_meta(meta)
+        return out
+
+    # -------------------------------------------------------- trailing stop automatique
+    def _apply_trailing(self, meta: dict):
+        """Maintient a CHAQUE cycle les trailing stops armes par l'agent : remonte le SL
+        derriere le prix (jamais dans le mauvais sens), une fois le seuil d'activation atteint.
+        Fonctionne pour tout symbole, meme hors watchlist (donnees chargees a la demande)."""
+        changed = False
+        for p in self.broker.positions():
+            m = meta.get(str(p["ticket"]))
+            tr = m.get("trail") if m else None
+            if not tr or not tr.get("enabled", True):
+                continue
+            spec = self._spec(p["symbol"])
+            digits = spec.get("digits", 5)
+            # distance de suivi (en prix)
+            if tr.get("pips"):
+                dist = tr["pips"] / spec.get("price_to_pips", 10_000.0)
+            elif tr.get("atr_mult"):
+                df = self._bars(p["symbol"], tr.get("timeframe") or self.cfg.timeframe)
+                if df is None or df.empty:
+                    continue
+                dist = tr["atr_mult"] * _atr(df, 14)
+            else:
+                continue
+            tk = self.broker.tick(p["symbol"])
+            price = (tk["bid"] if p["direction"] == "buy" else tk["ask"]) if tk else p["entry"]
+            # activation par R (securiser le break-even d'abord)
+            risk = (m or {}).get("risk_dollars", 0.0)
+            floating_r = p.get("floating", 0.0) / risk if risk else tr.get("activate_r", 1.0)
+            if floating_r < tr.get("activate_r", 1.0):
+                continue
+            if p["direction"] == "buy":
+                new_sl = round(price - dist, digits)
+                better = new_sl > (p["sl"] or -1e18) and new_sl < price
+            else:
+                new_sl = round(price + dist, digits)
+                better = (not p["sl"] or new_sl < p["sl"]) and new_sl > price
+            if better:
+                res = self.broker.modify_position(p["ticket"], sl=new_sl)
+                if res.get("ok"):
+                    log.info("TRAILING ticket %s -> SL %.5f (%s)", p["ticket"], new_sl, p["symbol"])
+                    m["sl"] = new_sl
+                    changed = True
+        if changed:
+            self.mem.save_meta(meta)
+
+    # -------------------------------------------------------- execution des actions
+    def _execute_actions(self, actions: list, s: dict, meta: dict,
+                         news: dict, can_open: bool, account: dict):
+        if actions:
+            self.mem.log_event("plan", {"actions": actions})
+        closes = [a for a in actions if a.get("type") == "close"]
+        modifies = [a for a in actions if a.get("type") == "modify"]
+        trails = [a for a in actions if a.get("type") == "trail"]
+        opens = [a for a in actions if a.get("type") == "open"]
+
+        pos_by_tk = {p["ticket"]: p for p in self.broker.positions()}
+        for a in closes:
+            self._exec_close(a, meta)
+        for a in modifies:
+            self._exec_modify(a, pos_by_tk, meta)
+        for a in trails:
+            self._exec_trail(a, meta)
+
+        if not opens:
+            return
+        for a in opens:
+            if not can_open:
+                log.info("Ouverture %s ignoree (garde-fou portefeuille actif).", a.get("symbol"))
+                continue
+            positions = self.broker.positions()
+            acc = self._account_state(account, positions, s)
+            self._exec_open(a, acc, s, meta, news)
+
+    def _exec_close(self, a: dict, meta: dict):
+        tk = a["ticket"]; frac = a.get("fraction", 1.0)
+        res = self.broker.close_position(tk, frac, comment=str(a.get("reason", "AI-close"))[:24])
+        log.info("CLOTURE ticket %s x%.2f -> %s", tk, frac, res.get("message"))
+        self.mem.log_event("close", {"ticket": tk, "fraction": frac,
+                                     "reason": a.get("reason"), "result": res})
+        if res.get("ok") and not res.get("full"):        # partielle -> risque residuel reduit
+            m = meta.get(str(tk))
+            if m:
+                m["risk_dollars"] = m.get("risk_dollars", 0.0) * (1 - frac)
+                self.mem.save_meta(meta)
+
+    def _exec_modify(self, a: dict, pos_by_tk: dict, meta: dict):
+        tk = a["ticket"]; new_sl = a.get("sl"); new_tp = a.get("tp")
+        p = pos_by_tk.get(tk)
+        if p is None:
+            log.info("Modify ignore : ticket %s introuvable.", tk)
+            return
+        # garde-fou : un nouveau SL ne doit pas AUGMENTER le risque au-dela du budget FTMO
+        if new_sl:
+            spec = self._spec(p["symbol"])
+            stop_pips = abs(p["entry"] - new_sl) * spec.get("price_to_pips", 0.0)
+            risk = stop_pips * spec.get("pip_value_per_lot", 0.0) * p["volume"]
+            budget = self.cfg.ftmo.account_size * self.cfg.ftmo.risk_per_trade_pct / 100
+            if risk > budget * 1.2:
+                log.info("Modify %s refuse : SL trop large (risque %.0f$ > budget).", tk, risk)
+                self.mem.log_event("modify_veto", {"ticket": tk, "sl": new_sl, "risk": risk})
+                return
+        res = self.broker.modify_position(tk, new_sl, new_tp)
+        log.info("MODIFY ticket %s sl=%s tp=%s -> %s", tk, new_sl, new_tp, res.get("message"))
+        self.mem.log_event("modify", {"ticket": tk, "sl": new_sl, "tp": new_tp,
+                                      "reason": a.get("reason"), "result": res})
+        if res.get("ok"):
+            m = meta.get(str(tk))
+            if m:
+                if new_sl:
+                    m["sl"] = new_sl
+                if new_tp:
+                    m["tp"] = new_tp
+                self.mem.save_meta(meta)
+
+    def _exec_trail(self, a: dict, meta: dict):
+        """Arme / desarme le trailing stop d'une position (config persistee dans open_meta)."""
+        tk = a["ticket"]
+        m = meta.setdefault(str(tk), {"ticket": tk})
+        if not a.get("enabled", True):
+            m.pop("trail", None)
+            log.info("TRAILING desarme sur ticket %s.", tk)
+        else:
+            m["trail"] = {"enabled": True, "atr_mult": a.get("atr_mult"),
+                          "pips": a.get("pips"), "activate_r": a.get("activate_r", 1.0),
+                          "timeframe": a.get("timeframe") or self.cfg.timeframe}
+            log.info("TRAILING arme sur ticket %s (%s).", tk,
+                     f"{a['pips']:.0f} pips" if a.get("pips") else f"{a.get('atr_mult')}xATR")
+        self.mem.log_event("trail", {"ticket": tk, "config": m.get("trail"), "reason": a.get("reason")})
+        self.mem.save_meta(meta)
+
+    def _exec_open(self, a: dict, acc: AccountState, s: dict, meta: dict, news: dict):
+        sym = a["symbol"]; strat = a.get("strategy", "unknown")
+        # L'agent choisit LIBREMENT sa paire : on resout la spec a la demande.
+        # Seul refus possible ici : symbole inconnu / non negociable chez le broker.
+        spec = self._spec(sym)
+        if not spec:
+            log.warning("Ouverture %s ignoree : symbole inconnu ou non negociable.", sym)
+            self.mem.log_event("symbol_unknown", {"symbol": sym, "strategy": strat})
+            return
+        bo = news.get("blackout", {}).get(sym) or self.news.blackout_for(sym)
+        if bo.get("active"):
+            log.info("BLACK-OUT news sur %s (%s dans %sh) — entree bloquee.",
+                     sym, bo.get("reason"), bo.get("in_hours"))
+            self.mem.log_event("news_blackout", {"symbol": sym, **bo})
+            self.mem.add_lesson(sym, "vetoed",
+                                f"Entree {sym} bloquee: news '{bo.get('reason')}' imminente.",
+                                tags=[strat, "news"])
+            return
+        gap = self._weekend_guard()
+        if gap:
+            log.info("Ouverture %s bloquee : %s", sym, gap)
+            self.mem.log_event("weekend_guard", {"symbol": sym, "raison": gap})
+            self.mem.add_lesson(sym, "vetoed", f"Entree {sym} refusee: {gap}",
+                                tags=[strat, "gap"])
+            return
+        prop = TradeProposal(symbol=sym, direction=a["direction"], entry=a["entry"],
+                             sl=a["sl"], tp=a["tp"], confidence=a.get("confidence", 0.6),
+                             rationale=a.get("rationale", ""))
+        rd = self.risk.validate(prop, acc,
+                                pip_value_per_lot=spec["pip_value_per_lot"],
+                                price_to_pips=spec["price_to_pips"], min_lot=spec["min_lot"],
+                                max_lot=spec["max_lot"], lot_step=spec["lot_step"],
+                                costs=self._costs(sym, spec, prop.direction))
+        if not rd.approved:
+            log.info("VETO risque %s: %s", sym, "; ".join(rd.reasons))
+            self.mem.log_event("risk_veto", {"proposal": vars(prop), "reasons": rd.reasons})
+            self.mem.add_lesson(sym, "vetoed", f"Setup {sym} [{strat}] refuse: {rd.reasons[0]}",
+                                tags=[strat])
+            return
+        log.info("OUVERTURE [%s]: %s %s lot %.2f (%s)", strat, prop.direction, sym,
+                 rd.lot, rd.reasons[0])
+        res = self.broker.place_order(sym, prop.direction, rd.lot, prop.sl, prop.tp,
+                                      comment=f"{strat} conf={prop.confidence:.2f}")
+        self.mem.log_event("order_sent", {"proposal": vars(prop), "strategy": strat,
+                                          "lot": rd.lot, "risk_pct": rd.risk_pct,
+                                          "rr": rd.rr, "rr_net": rd.rr_net,
+                                          "couts_estimes": rd.costs_dollars,
+                                          "stop_pips": rd.stop_pips,
+                                          "stop_effectif_pips": rd.effective_stop_pips,
+                                          "result": res})
+        if res["ok"]:
+            s["trades_today"] += 1
+            today = _today_key()                          # suivi du minimum 4 jours de trading
+            if today not in s.setdefault("trading_days", []):
+                s["trading_days"].append(today)
+            meta[str(res["ticket"])] = {
+                "ticket": res["ticket"], "symbol": sym, "strategy": strat,
+                "direction": prop.direction, "entry": res["price"], "sl": prop.sl,
+                "tp": prop.tp, "risk_dollars": rd.risk_dollars, "rr": rd.rr,
+                # --- traces pour le POST-MORTEM (apprentissage) ---
+                "rr_net": rd.rr_net, "lot": rd.lot, "regime": self._last_regime,
+                "confidence": prop.confidence, "rationale": prop.rationale[:400],
+                "entry_planifiee": prop.entry, "slippage_pips": res.get("slippage_pips", 0.0),
+                "spread_pips_entree": res.get("spread_pips", 0.0),
+                "couts_estimes": rd.costs_dollars, "ouvert_le": datetime.now(timezone.utc).isoformat(),
+                "mfe_R": 0.0, "mae_R": 0.0}
+            self.mem.save_meta(meta)
+            self.mem.save_session(s)
+            self._prev_tickets.add(res["ticket"])
+        log.info("Execution: %s", res["message"])
+
+    # -------------------------------------------------------- un cycle complet
+    def cycle(self):
+        if not self.broker.connected:
+            log.error("MT5 non connecte — aucun trade possible ce cycle.")
+            return
+        account = self.broker.account()
+        if account["balance"] <= 0:
+            log.error("Solde MT5 indisponible — cycle ignore.")
+            return
+        # nouveau cycle -> donnees fraiches (specs et bougies rechargees a la demande)
+        self._spec_cache.clear()
+        self._bars_cache.clear()
+        self.web.reset_budget()          # quota de recherches web rendu a l'agent
+
+        s = self._session(account)
+        positions = self.broker.positions()
+        meta = self.mem.load_meta()
+        self._handle_closes(positions, meta, s)
+        positions = self.broker.positions()
+
+        # Pre-scan de la WATCHLIST (point de depart). L'agent reste libre d'aller
+        # chercher n'importe quel autre symbole du broker via list_symbols/get_chart.
+        watch = list(dict.fromkeys(list(self.cfg.symbols)
+                                   + [p["symbol"] for p in positions]))
+        snaps, charts = {}, {}
+        for sym in watch:
+            spec = self._spec(sym)
+            if not spec:
+                log.warning("Symbole %s indisponible chez le broker — ignore du scan.", sym)
+                continue
+            frames = {tf: self._bars(sym, tf) for tf in self.cfg.chart_timeframes}
+            snaps[sym] = snapshot(sym, self._bars(sym, self.cfg.timeframe), spec)
+            charts[sym] = chart.read(sym, frames, spec)
+
+        # trailing stops armes -> maintenus AUTOMATIQUEMENT a chaque cycle (avant tout le reste)
+        self._apply_trailing(meta)
+        positions = self.broker.positions()          # SL potentiellement resserres
+
+        acc = self._account_state(account, positions, s)
+        summary = self._account_summary(acc)
+        summary.update(self._phase_info(s, summary["pnl_total_pct"]))
+        sb = Scoreboard(self.mem.closed_trades())
+        news = self.news.snapshot(watch)
+        pos_view = self._enrich_positions(positions, meta)
+        log.info("Etape %s | PnL %.2f%%/objectif %.0f%% (reste %.2f%%) | perte jour %.2f%% | "
+                 "J%s/%s | jours trades %s/%s | pos %d",
+                 summary["etape"], summary["pnl_total_pct"], summary["objectif_etape_pct"],
+                 summary["reste_avant_objectif_pct"], summary["perte_jour_pct"],
+                 summary["jours_ecoules"], self.cfg.ftmo.phase_days,
+                 summary["jours_trades"], summary["jours_trades_min"], acc.open_positions)
+
+        # Le garde-fou FTMO bloque les OUVERTURES, mais l'agent doit toujours pouvoir
+        # GERER (cloturer/securiser) ses positions ouvertes.
+        gate = self.risk.portfolio_gate(acc)
+        can_open = not gate
+        if gate:
+            for g in gate:
+                log.info("Ouvertures suspendues: %s", g)
+            self.mem.log_event("gate_block", {"reasons": gate, **summary})
+            if not positions:
+                # book vide : si l'IA etait deja hors service, plus rien ne justifie de tourner
+                if self.agent is not None and getattr(self.agent, "degraded", False):
+                    self._exit_if_flat(0, "IA indisponible et plus aucune position ouverte")
+                return                       # rien a gerer, rien a ouvrir -> on saute le cycle
+
+        strat_block = self._strategies_block(snaps, sb)
+        pm = PostMortem(self.mem.closed_trades())
+        lessons = self.mem.relevant_lessons_text(
+            symbols=watch + [p["symbol"] for p in pos_view],
+            strategies=[p.get("strategy", "") for p in pos_view] + playbooks.names())
+        T.bind_context(snaps, charts, summary, pos_view, lessons,
+                       strat_block, news, postmortem=pm.as_prompt_block())
+        T.bind_live(self)          # acces libre : symboles, timeframes, indicateurs, news
+        try:
+            agent = self._lazy_agent()
+            actions = agent.decide(summary)
+            degraded, why = bool(agent.degraded), str(agent.last_error or "")
+        except Exception as e:                       # meme la construction de l'agent a echoue
+            log.warning("Decision agent impossible: %s", e)
+            actions, degraded, why = [], True, str(e)
+
+        if degraded:
+            # --- L'IA EST HORS SERVICE -> pilote deterministe, aucune nouvelle entree.
+            can_open = False
+            actions = self._safe_actions(pos_view, summary, why)
+        else:
+            self._clear_safe_marker()
+
+        log.info("Actions du cycle%s: %s", " [SECOURS]" if degraded else "",
+                 [f"{a.get('type')} {a.get('symbol', a.get('ticket',''))}" for a in actions] or "aucune")
+        self._execute_actions(actions, s, meta, news, can_open, account)
+
+        if degraded:
+            restantes = len(self.broker.positions())
+            self._exit_if_flat(restantes, why)
+
+    # -------------------------------------------------------- mode secours (sans LLM)
+    def _safe_actions(self, pos_view: list, summary: dict, why: str) -> list:
+        """L'IA ne repond plus : un script dur protege les positions en cours."""
+        log.error("IA INDISPONIBLE (%s) — PILOTE DE SECOURS DETERMINISTE : "
+                  "aucune nouvelle entree, on protege les %d position(s) jusqu'a la sortie.",
+                  why or "raison inconnue", len(pos_view))
+        atr_by_sym = {}
+        for p in pos_view:
+            df = self._bars(p["symbol"], self.cfg.timeframe)
+            if df is not None and not df.empty:
+                try:
+                    atr_by_sym[p["symbol"]] = _atr(df, 14)
+                except Exception:
+                    pass
+        actions = self.pilot.actions(pos_view, summary, atr_by_sym)
+        self.mem.log_event("safe_mode", {"raison": why, "positions": len(pos_view),
+                                         "actions": actions, **summary})
+        self._write_safe_marker(why, pos_view, summary)
+        return actions
+
+    def _write_safe_marker(self, why: str, pos_view: list, summary: dict):
+        """Trace persistante pour l'inspection manuelle (table kv, cle `safe_mode`).
+        En base : elle survit a un arret brutal et au redemarrage du script."""
+        prev = self.mem.load_safe_mode()
+        self.mem.save_safe_mode({
+            "actif": True,
+            "depuis": prev.get("depuis") or datetime.now(timezone.utc).isoformat(),
+            "dernier_cycle": datetime.now(timezone.utc).isoformat(),
+            "cycles": int(prev.get("cycles", 0)) + 1,
+            "raison": why,
+            "positions_restantes": [{"ticket": p["ticket"], "symbol": p["symbol"],
+                                     "direction": p["direction"], "floating_R": p.get("floating_R")}
+                                    for p in pos_view],
+            "compte": {k: summary.get(k) for k in ("equity", "pnl_total_pct", "perte_jour_pct")},
+        })
+
+    def _clear_safe_marker(self):
+        """L'IA repond de nouveau -> on efface la trace de mode degrade."""
+        if self.mem.load_safe_mode():
+            log.info("IA de nouveau disponible — sortie du pilote de secours.")
+            self.mem.clear_safe_mode()
+
+    def _exit_if_flat(self, restantes: int, why: str):
+        """Book vide en mode secours -> arret du script pour inspection manuelle."""
+        if restantes > 0:
+            log.warning("PILOTE DE SECOURS actif : %d position(s) encore ouverte(s), "
+                        "on continue de les gerer.", restantes)
+            return
+        if not self.cfg.safe.exit_when_flat:
+            log.warning("PILOTE DE SECOURS : book vide (SAFE_EXIT_WHEN_FLAT=0, on continue).")
+            return
+        self.mem.log_event("safe_exit", {"raison": why})
+        self._clear_safe_marker()
+        raise SafeExit(why or "IA indisponible")
+
+    # -------------------------------------------------------- inspection manuelle
+    def print_status(self):
+        """`python run.py --status` : tout l'etat persistant, lisible, sans SQL."""
+        st = self.mem.store
+        print(f"\n=== ETAT PERSISTANT — {st.path} ===\n")
+
+        session = self.mem.load_session()
+        if session:
+            print("SESSION FTMO")
+            for k in ("phase", "phase_start", "initial_balance", "day",
+                      "day_start_balance", "trades_today", "last_loss_iso"):
+                if k in session:
+                    print(f"  {k:20s} {session[k]}")
+            print(f"  {'jours_trades':20s} {len(set(session.get('trading_days', [])))}")
+        else:
+            print("SESSION FTMO : (aucune — jamais demarre)")
+
+        safe = self.mem.load_safe_mode()
+        print("\nMODE SECOURS : " + ("INACTIF" if not safe else
+              f"ACTIF depuis {safe.get('depuis')} ({safe.get('cycles')} cycles) — "
+              f"{safe.get('raison')}"))
+
+        meta = self.mem.load_meta()
+        print(f"\nPOSITIONS SUIVIES : {len(meta)}")
+        for tk, m in meta.items():
+            print(f"  #{tk} {m.get('symbol')} {m.get('direction')} [{m.get('strategy')}] "
+                  f"risque {m.get('risk_dollars', 0):.0f}$ | MFE {m.get('mfe_R')} / "
+                  f"MAE {m.get('mae_R')} | trailing {'oui' if m.get('trail') else 'non'}")
+
+        events = st.events(limit=12)
+        print(f"\nDERNIERS EVENEMENTS ({len(events)}) :")
+        for e in events:
+            detail = e.get("symbol") or e.get("ticket") or e.get("raison") or ""
+            print(f"  {e['ts'][:19]}  {e['kind']:16s} {str(detail)[:60]}")
+
+        print("\nBILAN / POST-MORTEM :")
+        print(PostMortem(self.mem.closed_trades()).as_prompt_block())
+        print()
+        st.close()
+
+    def run(self, loop: bool) -> int:
+        ok = self.broker.connect()
+        if not ok:
+            log.error("Connexion MT5 ECHOUEE — verifier terminal/credentials. "
+                      "L'agent ne pourra pas trader.")
+        log.info("=== Agent trader FTMO SWING multi-strategies — EXECUTION DIRECTE | "
+                 "Bedrock %s | TF %s ===", self.cfg.bedrock.model_id, self.cfg.timeframe)
+        log.info("Etat persistant SQLite: %s", self.mem.store.path)
+        reprise = self.mem.load_safe_mode()
+        if reprise:
+            log.warning("Reprise apres arret en MODE SECOURS (%s, depuis %s) — "
+                        "l'etat des positions suivies a ete restaure depuis la base.",
+                        reprise.get("raison"), reprise.get("depuis"))
+        code = 0
+        try:
+            while True:
+                try:
+                    self.cycle()
+                except SafeExit as e:
+                    log.warning("=" * 78)
+                    log.warning("ARRET DU SCRIPT — IA indisponible (%s) et PLUS AUCUNE "
+                                "position ouverte.", e)
+                    log.warning("Les positions ont ete gerees jusqu'a leur fermeture par le "
+                                "pilote de secours. Inspecte avec `python run.py --status` "
+                                "puis relance.")
+                    log.warning("=" * 78)
+                    break
+                except Exception as e:
+                    log.exception("Erreur de cycle: %s", e)
+                if not loop:
+                    break
+                time.sleep(self.cfg.loop_seconds)
+        finally:
+            self.broker.shutdown()
+            self.mem.store.close()          # WAL flush : rien ne se perd a l'arret
+        return code
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--loop", action="store_true", help="boucle continue")
+    ap.add_argument("--status", action="store_true",
+                    help="inspecte l'etat persistant (SQLite) et quitte")
+    args = ap.parse_args()
+    if args.status:
+        Orchestrator().print_status()
+        sys.exit(0)
+    sys.exit(Orchestrator().run(loop=args.loop))
