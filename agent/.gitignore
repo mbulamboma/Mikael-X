@@ -1,3 +1,5 @@
+# SECRETS : configuration reelle (MT5, Bedrock, SMTP) — jamais versionnee
+.env
 # Etat local de l'agent : base SQLite (journal, positions suivies, session FTMO)
 state/
 # anciens etats JSON migres

@@ -326,6 +326,44 @@ L'agent connaît l'**étape en cours** (`FTMO_PHASE=1` ou `2`) et adapte son obj
 - **Perte jour → −4 %** : l'agent arrête les nouvelles ouvertures (marge avant le −5 % fatal).
 - Passage à l'étape 2 : mettre `FTMO_PHASE=2` → l'agent ré-ancre le solde initial et la fenêtre.
 
+## Notifications email
+
+Vous recevez un message à chaque moment qui compte, avec **l'état du portefeuille dans
+chaque mail** (equity, PnL, perte du jour, objectif, positions ouvertes avec leur R
+flottant) :
+
+| Événement | Contenu |
+|---|---|
+| **Position ouverte** | sens, symbole, stratégie, lot, entrée réelle **vs** prévue et slippage, SL/TP, risque en $ et en %, R:R brut **et** net, coûts estimés, et le raisonnement de l'agent |
+| **Position fermée** | GAIN/PERTE, résultat en R et en $, MFE/MAE, R:R planifié, durée, et la **leçon retenue** |
+| **Urgence FTMO** | perte du jour proche de la limite → fermeture totale, avec l'action requise |
+| **IA indisponible** | passage en pilote de secours (une seule alerte par panne) |
+| **Arrêt du script** | plus aucune position ouverte : que faire pour relancer |
+| **IA rétablie** | reprise du pilotage normal |
+
+Configuration dans `agent/.env` (`MAIL_HOST`, `MAIL_PORT`, `MAIL_SECURE`, `MAIL_USER`,
+`MAIL_PASSWORD`, `MAIL_FROM`, `MAIL_TO`). Le mode SSL/STARTTLS est déduit du port si
+`MAIL_SECURE` n'est pas renseigné. Vérifier la configuration :
+
+```bash
+python run.py --test-mail
+```
+
+L'envoi part dans un thread avec timeout : **un serveur SMTP injoignable ne bloque ni
+n'interrompt jamais le trading** (l'erreur est simplement journalisée).
+
+## Configuration : un seul fichier
+
+`agent/.env` est **autonome** — MT5, Bedrock, FTMO, coûts, news, web, mail, état. Le
+`.env` du projet parent n'est lu qu'en repli, si `agent/.env` n'existe pas. Une variable
+définie dans l'environnement l'emporte sur le fichier (`AGENT_WEEKEND_FLATTEN=1 python
+run.py`). Les placeholders non remplacés (`<votre_cle>`) sont traités comme vides, pour
+ne jamais s'authentifier avec une fausse clé.
+
+```bash
+cp .env.example .env   # puis remplir
+```
+
 ## Installation
 
 ```bash

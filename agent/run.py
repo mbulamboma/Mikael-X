@@ -50,6 +50,7 @@ from brain.memory import Memory
 from brain.autopilot import SafePilot
 from brain.postmortem import PostMortem
 from brain import tools as T
+from notify import Mailer
 from strategy import regime as regime_mod, playbooks
 from strategy.scoreboard import Scoreboard
 
@@ -86,7 +87,10 @@ class Orchestrator:
         self.news = NewsFeed(CFG.news)
         self.web = WebResearch(CFG.web)
         self.pilot = SafePilot(CFG.safe, CFG.ftmo)     # secours deterministe (sans LLM)
+        self.mail = Mailer(CFG.mail)                   # notifications (trades, urgences)
         self.agent = None
+        self._degrade_signale = False                  # une seule alerte par panne d'IA
+        self._last_summary: dict = {}                  # etat compte pour les emails
         self._prev_tickets: set[int] = set()
         self._tickets_init = False
         # caches de CYCLE : specs et bougies deja chargees (l'agent peut demander
@@ -337,6 +341,24 @@ class Orchestrator:
             "budget_risque_trade_pct": c.risk_per_trade_pct,
         }
 
+    # -------------------------------------------------------- notifications
+    def _mail_context(self) -> tuple[dict, list]:
+        """Etat du compte + positions enrichies, pour le corps des emails."""
+        try:
+            meta = self.mem.load_meta()
+            positions = self._enrich_positions(self.broker.positions(), meta)
+        except Exception:
+            positions = []
+        return self._last_summary, positions
+
+    def _notifier(self, methode: str, *args, **kwargs):
+        """Envoie une notification sans jamais faire echouer le cycle."""
+        try:
+            summary, positions = self._mail_context()
+            getattr(self.mail, methode)(*args, **kwargs, summary=summary, positions=positions)
+        except Exception as e:
+            log.warning("Notification %s impossible: %s", methode, e)
+
     def _lazy_agent(self):
         if self.agent is None:
             from brain.agent import TraderAgent
@@ -389,6 +411,7 @@ class Orchestrator:
                  "entry_planifiee": meta.get("entry_planifiee")}
         self.mem.log_event("trade_closed", trade)
         log.info("Cloture %s [%s] -> R=%.2f, PnL=%.2f", meta.get("symbol"), strat, R, pnl)
+        lesson = ""
         try:
             # la lecon s'appuie sur le bilan chiffre -> apprentissage fonde, pas de blabla
             bilan = PostMortem(self.mem.closed_trades()).as_prompt_block()
@@ -398,6 +421,7 @@ class Orchestrator:
             log.info("Lecon [%s]: %s", strat, lesson)
         except Exception as e:
             log.warning("Reflexion impossible: %s", e)
+        self._notifier("trade_ferme", trade, lesson)
         return R
 
     @staticmethod
@@ -546,6 +570,12 @@ class Orchestrator:
                           len(etrangeres))
             self.mem.add_lesson("*", "loss", f"Urgence FTMO declenchee: {panique}",
                                 tags=["risque", "urgence"])
+            self._last_summary = summary
+            self._notifier("alerte", "URGENCE FTMO — fermeture totale", panique,
+                           action_requise=(
+                               f"{len(etrangeres)} position(s) hors agent restent ouvertes : "
+                               f"a fermer MANUELLEMENT." if etrangeres else
+                               "Verifier le compte et la cause de la perte avant de relancer."))
             return True
 
         if self._flatten_weekend_due():
@@ -608,6 +638,7 @@ class Orchestrator:
         meta = self.mem.load_meta()
         acc = self._account_state(account, positions + etrangeres, s)
         summary = self._account_summary(acc)
+        self._last_summary = summary
         self._protect(positions, etrangeres, summary, meta, s, account)
 
     # -------------------------------------------------------- execution des actions
@@ -769,6 +800,9 @@ class Orchestrator:
             self.mem.save_meta(meta)
             self.mem.save_session(s)
             self._prev_tickets.add(res["ticket"])
+            self._notifier("trade_ouvert", {**meta[str(res["ticket"])],
+                                            "lot": rd.lot, "risk_pct": rd.risk_pct,
+                                            "rr": rd.rr, "rr_net": rd.rr_net})
         log.info("Execution: %s", res["message"])
 
     # -------------------------------------------------------- un cycle complet
@@ -823,6 +857,7 @@ class Orchestrator:
         positions = self.broker.positions()
         acc = self._account_state(account, positions + etrangeres, s)
         summary.update(self._account_summary(acc))
+        self._last_summary = summary             # etat de reference pour les emails
         sb = Scoreboard(self.mem.closed_trades())
         news = self.news.snapshot(watch)
         pos_view = self._enrich_positions(positions, meta)
@@ -884,6 +919,15 @@ class Orchestrator:
         log.error("IA INDISPONIBLE (%s) — PILOTE DE SECOURS DETERMINISTE : "
                   "aucune nouvelle entree, on protege les %d position(s) jusqu'a la sortie.",
                   why or "raison inconnue", len(pos_view))
+        if not self._degrade_signale:            # une seule alerte par episode de panne
+            self._degrade_signale = True
+            self._last_summary = summary
+            self._notifier("alerte", "IA indisponible — pilote de secours actif",
+                           why or "raison inconnue",
+                           action_requise="Aucune nouvelle position ne sera ouverte. Les "
+                                          "positions en cours sont protegees par des regles "
+                                          "deterministes ; le script s'arretera une fois le "
+                                          "book vide. Verifier Bedrock (modele, cle, quota).")
         atr_by_sym = {}
         for p in pos_view:
             df = self._bars(p["symbol"], self.cfg.timeframe)
@@ -919,6 +963,10 @@ class Orchestrator:
         if self.mem.load_safe_mode():
             log.info("IA de nouveau disponible — sortie du pilote de secours.")
             self.mem.clear_safe_mode()
+            self._notifier("alerte", "IA de nouveau disponible",
+                           "Le modele repond : reprise du pilotage normal.",
+                           action_requise="")
+        self._degrade_signale = False
 
     def _exit_if_flat(self, restantes: int, why: str):
         """Book vide en mode secours -> arret du script pour inspection manuelle."""
@@ -930,7 +978,14 @@ class Orchestrator:
             log.warning("PILOTE DE SECOURS : book vide (SAFE_EXIT_WHEN_FLAT=0, on continue).")
             return
         self.mem.log_event("safe_exit", {"raison": why})
-        self._clear_safe_marker()
+        self.mem.clear_safe_mode()
+        self._notifier("alerte", "ARRET DU SCRIPT — plus aucune position ouverte",
+                       f"L'IA est indisponible ({why or 'raison inconnue'}) et le pilote de "
+                       f"secours a fini de gerer les positions : elles sont toutes fermees.",
+                       action_requise="Le script est ARRETE. Inspecter avec "
+                                      "`python run.py --status`, corriger l'acces au modele, "
+                                      "puis relancer `python run.py --loop`.")
+        self.mail.flush(15)                      # on part : on laisse l'email sortir
         raise SafeExit(why or "IA indisponible")
 
     # -------------------------------------------------------- inspection manuelle
@@ -1038,8 +1093,23 @@ if __name__ == "__main__":
     ap.add_argument("--loop", action="store_true", help="boucle continue")
     ap.add_argument("--status", action="store_true",
                     help="inspecte l'etat persistant (SQLite) et quitte")
+    ap.add_argument("--test-mail", action="store_true",
+                    help="envoie un email de test et quitte (verifie la config SMTP)")
     args = ap.parse_args()
     if args.status:
         Orchestrator().print_status()
+        sys.exit(0)
+    if args.test_mail:
+        o = Orchestrator()
+        c = o.cfg.mail
+        if not c.ready:
+            log.error("Config mail incomplete : MAIL_HOST=%s MAIL_TO=%s (voir agent/.env)",
+                      c.host or "(vide)", ", ".join(c.to) or "(vide)")
+            sys.exit(1)
+        log.info("Envoi d'un email de test vers %s via %s:%s (%s)...",
+                 ", ".join(c.to), c.host, c.port, c.mode)
+        o.mail._send_sync("[AGENT FTMO] Email de test",
+                          "Si vous lisez ceci, les notifications fonctionnent.\n\n"
+                          + Mailer.portefeuille({}, []))
         sys.exit(0)
     sys.exit(Orchestrator().run(loop=args.loop))

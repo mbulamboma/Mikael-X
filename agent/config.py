@@ -14,10 +14,29 @@ from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent
 TRADING = ROOT.parent
-load_dotenv(TRADING / ".env")          # reutilise le .env deja present a la racine
+
+# CONFIGURATION UNIFIEE : `agent/.env` fait foi et se suffit a lui-meme (MT5, Bedrock,
+# news, mail...). Le .env du projet parent n'est lu qu'en REPLI, si agent/.env n'existe
+# pas encore — l'agent ne depend donc plus d'un fichier exterieur.
+# Une variable deja definie dans l'ENVIRONNEMENT l'emporte sur le fichier (pratique
+# pour un lancement ponctuel : `AGENT_WEEKEND_FLATTEN=1 python run.py`).
+AGENT_ENV = ROOT / ".env"
+if AGENT_ENV.exists():
+    load_dotenv(AGENT_ENV)
+elif (TRADING / ".env").exists():
+    load_dotenv(TRADING / ".env")
 
 STATE_DIR = ROOT / "state"
 STATE_DIR.mkdir(exist_ok=True)
+
+
+def _s(name: str, default: str = "") -> str:
+    """Chaine d'environnement. Un PLACEHOLDER non remplace (`<votre_cle>`) vaut vide :
+    mieux vaut une fonction desactivee qu'une authentification avec une fausse cle."""
+    v = os.environ.get(name, default).strip()
+    if v.startswith("<") and v.endswith(">"):
+        return ""
+    return v
 
 
 def _f(name: str, default: float) -> float:
@@ -144,9 +163,9 @@ class SafeModeConfig:
 @dataclass(frozen=True)
 class MT5Config:
     login: int = _i("MT5_LOGIN", 0)
-    password: str = field(default_factory=lambda: os.environ.get("MT5_PASSWORD", ""))
-    server: str = field(default_factory=lambda: os.environ.get("MT5_SERVER", ""))
-    path: str = field(default_factory=lambda: os.environ.get("MT5_PATH", ""))  # optionnel
+    password: str = field(default_factory=lambda: _s("MT5_PASSWORD"))
+    server: str = field(default_factory=lambda: _s("MT5_SERVER"))
+    path: str = field(default_factory=lambda: _s("MT5_PATH"))  # optionnel
 
 
 @dataclass(frozen=True)
@@ -157,7 +176,7 @@ class NewsConfig:
     enabled: bool = field(default_factory=lambda: os.environ.get("NEWS_ENABLED", "1") == "1")
     # Dossier MQL5\Files du terminal MT5 (calendar_history.csv, macro_features.csv).
     mt5_files: str = field(default_factory=lambda: os.environ.get("MT5_FILES", ""))
-    fred_key: str = field(default_factory=lambda: os.environ.get("FRED_API", ""))
+    fred_key: str = field(default_factory=lambda: _s("FRED_API"))
     use_gdelt: bool = field(default_factory=lambda: os.environ.get("NEWS_GDELT", "1") == "1")
     # Fenetre "black-out" : pas de NOUVELLE entree si un event a fort impact touche
     # une devise du symbole dans +/- ces minutes (regle FTMO : 60 min avant news).
@@ -198,12 +217,51 @@ class WebConfig:
     deny_domains: tuple[str, ...] = field(default_factory=lambda: tuple(
         d.strip().lower() for d in os.environ.get("WEB_DENY_DOMAINS", "").split(",") if d.strip()))
     # Moteur de recherche : Google Custom Search si les deux cles sont presentes.
-    google_key: str = field(default_factory=lambda: os.environ.get("GOOGLE_API_KEY", ""))
-    google_cse: str = field(default_factory=lambda: os.environ.get("GOOGLE_CSE_ID", ""))
+    google_key: str = field(default_factory=lambda: _s("GOOGLE_API_KEY"))
+    google_cse: str = field(default_factory=lambda: _s("GOOGLE_CSE_ID"))
     # Sentiment retail myfxbook : la page publique est protegee (403). L'API officielle
     # demande un compte -> renseignez VOS identifiants dans .env pour l'activer.
-    myfxbook_email: str = field(default_factory=lambda: os.environ.get("MYFXBOOK_EMAIL", ""))
-    myfxbook_password: str = field(default_factory=lambda: os.environ.get("MYFXBOOK_PASSWORD", ""))
+    myfxbook_email: str = field(default_factory=lambda: _s("MYFXBOOK_EMAIL"))
+    myfxbook_password: str = field(default_factory=lambda: _s("MYFXBOOK_PASSWORD"))
+
+
+@dataclass(frozen=True)
+class MailConfig:
+    """Notifications par email : ouverture/cloture de trade, urgences, arret du script.
+
+    L'envoi ne doit JAMAIS bloquer ni casser la boucle de trading : il part dans un
+    thread, avec timeout, et toute erreur est simplement journalisee.
+    """
+    enabled: bool = field(default_factory=lambda: os.environ.get("MAIL_ENABLED", "1") == "1")
+    host: str = field(default_factory=lambda: _s("MAIL_HOST"))
+    port: int = _i("MAIL_PORT", 465)
+    secure: str = field(default_factory=lambda:
+                        os.environ.get("MAIL_SECURE", "").strip().lower())
+    user: str = field(default_factory=lambda: _s("MAIL_USER"))
+    password: str = field(default_factory=lambda: _s("MAIL_PASSWORD"))
+    sender: str = field(default_factory=lambda: _s("MAIL_FROM"))
+    to: tuple[str, ...] = field(default_factory=lambda: tuple(
+        a.strip() for a in _s("MAIL_TO").split(",") if a.strip()))
+    on_trade: bool = field(default_factory=lambda: os.environ.get("MAIL_ON_TRADE", "1") == "1")
+    on_alert: bool = field(default_factory=lambda: os.environ.get("MAIL_ON_ALERT", "1") == "1")
+    timeout: int = _i("MAIL_TIMEOUT", 20)
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.enabled and self.host and self.to)
+
+    @property
+    def mode(self) -> str:
+        """ssl | tls | none — deduit du port si MAIL_SECURE n'est pas explicite."""
+        if self.secure in ("ssl", "smtps"):
+            return "ssl"
+        if self.secure in ("tls", "starttls"):
+            return "tls"
+        if self.secure in ("none", "false", "0", "no"):
+            return "none"
+        if self.secure in ("true", "1", "yes"):
+            return "ssl" if self.port == 465 else "tls"
+        return "ssl" if self.port == 465 else ("tls" if self.port == 587 else "none")
 
 
 @dataclass(frozen=True)
@@ -233,8 +291,8 @@ class BedrockConfig:
     # Credentials : laisses vides -> chaine boto3 par defaut (env, ~/.aws, role IAM).
     aws_profile: str = field(default_factory=lambda: os.environ.get("AWS_PROFILE", ""))
     # Cle API Bedrock (jeton porteur) : alternative aux credentials IAM.
-    api_key: str = field(default_factory=lambda: os.environ.get(
-        "BEDROCK_API_KEY", os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "")))
+    api_key: str = field(default_factory=lambda:
+                         _s("BEDROCK_API_KEY") or _s("AWS_BEARER_TOKEN_BEDROCK"))
     tool_mode: str = field(default_factory=lambda:
                            os.environ.get("BEDROCK_TOOL_MODE", "auto").strip().lower())
 
@@ -285,6 +343,7 @@ class AgentConfig:
     web: WebConfig = field(default_factory=WebConfig)
     safe: SafeModeConfig = field(default_factory=SafeModeConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    mail: MailConfig = field(default_factory=MailConfig)
 
 
 CFG = AgentConfig()
