@@ -33,12 +33,13 @@ import argparse
 import logging
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from config import CFG
+from config import CFG, STATE_DIR
 from broker.mt5_broker import MT5Broker, TIMEFRAMES
 from data.market import snapshot, _atr
 from data import chart, indicators
@@ -50,7 +51,9 @@ from brain.memory import Memory
 from brain.autopilot import SafePilot
 from brain.postmortem import PostMortem
 from brain import tools as T
+from desk import journal
 from notify import Mailer
+import process
 from strategy import regime as regime_mod, playbooks
 from strategy.scoreboard import Scoreboard
 
@@ -99,6 +102,7 @@ class Orchestrator:
         self._bars_cache: dict[tuple[str, str], "object"] = {}
         self._last_regime = "unknown"          # regime dominant du cycle (trace post-mortem)
         self._server_now: datetime | None = None   # horloge serveur (journee FTMO)
+        self._vigie_last: dict[str, datetime] = {}  # anti-spam de la vigie, par ticket
 
     # -------------------------------------------------------- acces marche a la demande
     def _spec(self, symbol: str) -> dict:
@@ -235,6 +239,44 @@ class Orchestrator:
             max_margin_pct_of_free=e.max_margin_pct_of_free,
             max_risk_per_currency_pct=e.max_risk_per_currency_pct)
 
+    def _entry_guard(self, sym: str, spec: dict, prop: TradeProposal) -> tuple[TradeProposal, str]:
+        """Recale l'entree sur le PRIX REEL avant le sizing — ou refuse si elle est trop loin.
+
+        Les ordres partent AU MARCHE (`TRADE_ACTION_DEAL`) : le niveau `entry` propose par
+        le LLM n'est JAMAIS le prix d'execution. Il sert uniquement a calculer la distance
+        au stop, donc le LOT et le R:R. Si le LLM annonce une entree a 40 pips du marche,
+        le lot est dimensionne sur une distance fictive et le risque reellement pris n'est
+        pas celui du budget. Deux garde-fous :
+
+          1. derive > `AGENT_MAX_ENTRY_DRIFT_ATR` x ATR  -> REFUS (niveau perime ou invente :
+             ce n'est plus le trade qui a ete raisonne) ;
+          2. sinon on recale `entry` sur le prix executable (ask si buy, bid si sell). Le
+             R:R est alors recalcule sur la realite — si le prix a couru vers la cible, le
+             moteur refusera de lui-meme (R:R devenu insuffisant).
+
+        Renvoie (proposition, raison_de_refus). Raison vide = on continue.
+        """
+        e = self.cfg.execution
+        tick = self.broker.tick(sym)
+        if not tick:
+            return prop, ""                     # pas de cotation : le broker tranchera
+        prix = tick["ask"] if prop.direction == "buy" else tick["bid"]
+        if prix <= 0:
+            return prop, ""
+        p2p = spec.get("price_to_pips", 0.0)
+        derive_pips = abs(prop.entry - prix) * p2p
+        atr_pips = self._atr_pips(sym, spec)
+        if e.max_entry_drift_atr > 0 and atr_pips > 0 and \
+                derive_pips > e.max_entry_drift_atr * atr_pips:
+            return prop, (f"entree proposee {prop.entry} a {derive_pips:.1f} pips du prix reel "
+                          f"{prix} (> {e.max_entry_drift_atr:.2f} x ATR = "
+                          f"{e.max_entry_drift_atr * atr_pips:.1f} pips)")
+        if not e.entry_reprice or derive_pips <= 0:
+            return prop, ""
+        log.info("Entree %s recalee sur le marche: %s -> %s (%.1f pips) — sizing sur le reel.",
+                 sym, prop.entry, prix, derive_pips)
+        return replace(prop, entry=prix), ""
+
     def _weekend_guard(self, now: datetime | None = None) -> str:
         """Pas de NOUVELLE entree juste avant la fermeture hebdomadaire (risque de gap)."""
         e = self.cfg.execution
@@ -360,9 +402,17 @@ class Orchestrator:
             log.warning("Notification %s impossible: %s", methode, e)
 
     def _lazy_agent(self):
+        """Choisit le cerveau selon AGENT_MODE : DESK multi-agents (defaut) ou agent SOLO
+        (repli historique). Les deux exposent le meme contrat (decide/reflect/degraded)."""
         if self.agent is None:
-            from brain.agent import TraderAgent
-            self.agent = TraderAgent(self.cfg)
+            if self.cfg.desk.mode == "solo":
+                from brain.agent import TraderAgent
+                self.agent = TraderAgent(self.cfg)
+                log.info("Cerveau: agent SOLO (AGENT_MODE=solo).")
+            else:
+                from desk.desk import TradingDesk
+                self.agent = TradingDesk(self.cfg)
+                log.info("Cerveau: DESK multi-agents (AGENT_MODE=desk).")
         return self.agent
 
     # -------------------------------------------------------- regime + strategies
@@ -408,7 +458,10 @@ class Orchestrator:
                  "couts_estimes": meta.get("couts_estimes"),
                  "regime": meta.get("regime"), "confidence": meta.get("confidence"),
                  "duree_h": self._duree_h(meta.get("ouvert_le")),
-                 "entry_planifiee": meta.get("entry_planifiee")}
+                 "entry_planifiee": meta.get("entry_planifiee"),
+                 "derive_entree_pips": meta.get("derive_entree_pips"),
+                 # trace de QUI a decide : sert a l'attribution par rol a la cloture
+                 "dossier": meta.get("dossier") or {}}
         self.mem.log_event("trade_closed", trade)
         log.info("Cloture %s [%s] -> R=%.2f, PnL=%.2f", meta.get("symbol"), strat, R, pnl)
         lesson = ""
@@ -639,7 +692,85 @@ class Orchestrator:
         acc = self._account_state(account, positions + etrangeres, s)
         summary = self._account_summary(acc)
         self._last_summary = summary
-        self._protect(positions, etrangeres, summary, meta, s, account)
+        if self._protect(positions, etrangeres, summary, meta, s, account):
+            return                       # urgence deja traitee : on ne reveille personne
+        self._vigie_watch(self.broker.positions(), meta, summary)
+
+    # -------------------------------------------------------- vigie & session extraordinaire
+    def _vigie_triggers(self, p: dict) -> list[str]:
+        """Declencheurs DETERMINISTES et bon marche : c'est ce qui autorise (ou non) a
+        reveiller la Vigie. Sans eux, on paierait un appel LLM par position toutes les
+        60 secondes pour ne rien apprendre."""
+        d = self.cfg.desk
+        out = []
+        fr = p.get("floating_R")
+        mfe = p.get("mfe_R") or 0.0
+        if fr is not None and fr <= d.vigie_alert_r:
+            out.append(f"perte flottante {fr}R (seuil {d.vigie_alert_r}R)")
+        if fr is not None and mfe >= d.vigie_giveback_r and fr <= mfe * 0.5:
+            out.append(f"gains rendus: MFE {mfe}R -> {fr}R")
+        bo = self.news.blackout_for(p["symbol"]) if self.cfg.news.enabled else {}
+        if bo.get("active"):
+            out.append(f"news imminente: {bo.get('reason')} (dans {bo.get('in_hours')}h)")
+        return out
+
+    def _vigie_watch(self, positions: list, meta: dict, summary: dict):
+        """Boucle d'escalade Vigie -> DG -> session extraordinaire, ENTRE deux cycles.
+
+        Distincte des protections deterministes (deja passees juste avant) : elle sert aux
+        degradations qu'un seuil ne sait pas voir (these cassee, news, gains rendus). Elle ne
+        peut que REDUIRE le risque : les ouvertures sont filtrees ici, pas seulement cote desk.
+        Toute panne (LLM, agent solo sans vigie) est silencieuse : le filet deterministe reste."""
+        d = self.cfg.desk
+        watch = getattr(self.agent, "watch", None)
+        if not d.vigie_enabled or not positions or watch is None \
+                or getattr(self.agent, "degraded", False):
+            return
+        pos_view = self._enrich_positions(positions, meta)
+        now = datetime.now(timezone.utc)
+        alertes = []
+        for p in pos_view:
+            declencheurs = self._vigie_triggers(p)
+            if not declencheurs:
+                continue
+            precedent = self._vigie_last.get(str(p["ticket"]))
+            if precedent and (now - precedent).total_seconds() < d.vigie_min_minutes * 60:
+                continue                     # anti-spam : un meme ticket n'est pas harcele
+            self._vigie_last[str(p["ticket"])] = now
+            alertes.append({"position": p, "declencheurs": declencheurs})
+        if not alertes:
+            return
+        log.info("Vigie reveillee sur %d position(s): %s", len(alertes),
+                 [a["position"]["ticket"] for a in alertes])
+        # dossier FRAIS pour la vigie (le contexte du dernier cycle a vieilli)
+        T.bind_context({}, {}, summary, pos_view, "", "", self.news.snapshot(
+            [p["symbol"] for p in pos_view]))
+        T.bind_live(self)
+        try:
+            actions = watch(alertes, summary) or []
+        except Exception as e:
+            log.warning("Boucle vigie interrompue (%s) — protections deterministes seules.", e)
+            return
+        # SECURITE : une session extraordinaire ne peut QUE reduire le risque.
+        actions = [a for a in actions if a.get("type") in ("close", "modify", "trail")]
+        if not actions:
+            return
+        self.mem.log_event("session_extraordinaire",
+                           {"alertes": alertes, "actions": actions, **summary})
+        pos_by_tk = {p["ticket"]: p for p in self.broker.positions()}
+        for a in actions:
+            if a["type"] == "close":
+                self._exec_close(a, meta)
+            elif a["type"] == "modify":
+                self._exec_modify(a, pos_by_tk, meta)
+            else:
+                self._exec_trail(a, meta)
+        self._notifier("alerte", "Session extraordinaire — position en degradation",
+                       "; ".join(f"ticket {a['position']['ticket']}: "
+                                 f"{', '.join(a['declencheurs'])}" for a in alertes),
+                       action_requise=f"{len(actions)} action(s) de reduction du risque "
+                                      f"appliquee(s) hors cycle : "
+                                      f"{[a['type'] for a in actions]}.")
 
     # -------------------------------------------------------- execution des actions
     def _execute_actions(self, actions: list, s: dict, meta: dict,
@@ -759,11 +890,27 @@ class Orchestrator:
         prop = TradeProposal(symbol=sym, direction=a["direction"], entry=a["entry"],
                              sl=a["sl"], tp=a["tp"], confidence=a.get("confidence", 0.6),
                              rationale=a.get("rationale", ""))
+        # L'ordre part au marche : on dimensionne sur le prix REEL, pas sur le niveau annonce.
+        entry_ia = prop.entry
+        prop, refus = self._entry_guard(sym, spec, prop)
+        if refus:
+            log.info("Ouverture %s refusee : %s", sym, refus)
+            self.mem.log_event("entry_drift", {"symbol": sym, "strategy": strat,
+                                               "entry_ia": entry_ia, "raison": refus})
+            self.mem.add_lesson(sym, "vetoed",
+                                f"Entree {sym} [{strat}] refusee: {refus}. Proposer un niveau "
+                                f"executable maintenant, pas un prix espere.", tags=[strat, "entree"])
+            return
+        # Plafond de risque impose par le Risk Manager LLM du desk (durcit seulement).
+        risk_override = float(a.get("risk_pct") or 0.0)
+        if risk_override:
+            log.info("Risk Manager plafonne %s a %.2f%% du solde.", sym, risk_override)
         rd = self.risk.validate(prop, acc,
                                 pip_value_per_lot=spec["pip_value_per_lot"],
                                 price_to_pips=spec["price_to_pips"], min_lot=spec["min_lot"],
                                 max_lot=spec["max_lot"], lot_step=spec["lot_step"],
-                                costs=self._costs(sym, spec, prop.direction))
+                                costs=self._costs(sym, spec, prop.direction),
+                                risk_pct_override=risk_override)
         if not rd.approved:
             log.info("VETO risque %s: %s", sym, "; ".join(rd.reasons))
             self.mem.log_event("risk_veto", {"proposal": vars(prop), "reasons": rd.reasons})
@@ -793,9 +940,16 @@ class Orchestrator:
                 # --- traces pour le POST-MORTEM (apprentissage) ---
                 "rr_net": rd.rr_net, "lot": rd.lot, "regime": self._last_regime,
                 "confidence": prop.confidence, "rationale": prop.rationale[:400],
-                "entry_planifiee": prop.entry, "slippage_pips": res.get("slippage_pips", 0.0),
+                "entry_planifiee": entry_ia,          # le niveau ANNONCE par le cerveau
+                "entry_sizing": prop.entry,           # le niveau reel ayant servi au sizing
+                "derive_entree_pips": round(abs(entry_ia - prop.entry)
+                                            * spec.get("price_to_pips", 0.0), 1),
+                "slippage_pips": res.get("slippage_pips", 0.0),
                 "spread_pips_entree": res.get("spread_pips", 0.0),
                 "couts_estimes": rd.costs_dollars, "ouvert_le": datetime.now(timezone.utc).isoformat(),
+                # DOSSIER DE DECISION : qui a dit quoi (mandat, briefs, debat, verdict risque).
+                # Sans lui, impossible d'attribuer un resultat a un rol (apprentissage Phase 4).
+                "dossier": a.get("dossier") or {},
                 "mfe_R": 0.0, "mae_R": 0.0}
             self.mem.save_meta(meta)
             self.mem.save_session(s)
@@ -872,6 +1026,10 @@ class Orchestrator:
         # GERER (cloturer/securiser) ses positions ouvertes.
         gate = self.risk.portfolio_gate(acc)
         can_open = not gate
+        # Le gate FTMO deterministe reste l'autorite : on l'expose au cerveau (le Gerant du
+        # desk evite ainsi de convoquer analystes/debat quand les ouvertures sont bloquees).
+        summary["ouvertures_bloquees"] = not can_open
+        summary["gate_raisons"] = gate
         if gate:
             for g in gate:
                 log.info("Ouvertures suspendues: %s", g)
@@ -905,13 +1063,41 @@ class Orchestrator:
         else:
             self._clear_safe_marker()
 
+        # MESURE : on archive le dossier d'entree + le plan AVANT execution. C'est ce qui
+        # rend le cycle rejouable (desk/replay.py) et comparable entre cerveaux.
+        self._journal_cycle(actions, degraded)
+
         log.info("Actions du cycle%s: %s", " [SECOURS]" if degraded else "",
                  [f"{a.get('type')} {a.get('symbol', a.get('ticket',''))}" for a in actions] or "aucune")
+        if self.cfg.eval.shadow and not degraded:
+            # MODE OMBRE : le cerveau est OBSERVE, pas suivi. Son plan est journalise,
+            # aucune de ses actions n'est executee. Les protections deterministes
+            # (trailing, stop d'urgence, panique perte-jour) ont deja tourne ce cycle.
+            log.warning("MODE OMBRE (EVAL_SHADOW=1) : %d action(s) journalisee(s), "
+                        "AUCUNE executee.", len(actions))
+            return
         self._execute_actions(actions, s, meta, news, can_open, account)
 
         if degraded:
             restantes = len(self.broker.positions())
             self._exit_if_flat(restantes, why)
+
+    # -------------------------------------------------------- mesure / rejeu
+    def _journal_cycle(self, actions: list, degraded: bool):
+        """Archive le dossier d'entree du cycle + le plan rendu, en rotation.
+
+        Sans cette trace, comparer deux cerveaux revient a comparer deux souvenirs :
+        `desk/replay.py` rejoue ces dossiers hors-ligne et simule l'issue des trades."""
+        e = self.cfg.eval
+        store = getattr(self.mem, "store", None)
+        if store is None or not (e.journal_cycles or e.shadow):
+            return                          # memoire sans journal (tests, stubs) : on passe
+        try:
+            journal.record_cycle(store, T.cycle_context(), actions,
+                                 mode=self.cfg.desk.mode, degraded=degraded, shadow=e.shadow,
+                                 server_now=self.server_now().isoformat(), keep=e.journal_keep)
+        except Exception as exc:            # mesurer ne doit JAMAIS empecher de trader
+            log.warning("Journalisation du cycle impossible (ignore): %s", exc)
 
     # -------------------------------------------------------- mode secours (sans LLM)
     def _safe_actions(self, pos_view: list, summary: dict, why: str) -> list:
@@ -1035,7 +1221,10 @@ class Orchestrator:
         restant = int(seconds)
         while restant > 0:
             dodo = min(pas, restant)
-            time.sleep(dodo)
+            # `wait` plutot que `sleep` : un SIGTERM pendant l'heure d'attente doit
+            # rendre la main tout de suite, pas au bout d'une minute de watchdog.
+            if process.ARRET.wait(dodo):
+                return False
             restant -= dodo
             try:
                 self.watchdog()
@@ -1046,6 +1235,14 @@ class Orchestrator:
         return True
 
     def run(self, loop: bool) -> int:
+        # INSTANCE UNIQUE d'abord : deux agents sur le meme compte doublent le risque
+        # reellement pris et faussent le calcul de la perte journaliere FTMO.
+        verrou = process.VerrouInstance(STATE_DIR / "agent.lock")
+        if not verrou.acquerir():
+            return 3
+        # Le signal ne tue plus : il DEMANDE l'arret. La boucle finit ce qu'elle fait,
+        # les emails partent, la base est fermee proprement.
+        process.install_signal_handlers()
         ok = self.broker.connect()
         if not ok:
             log.error("Connexion MT5 ECHOUEE — verifier terminal/credentials. "
@@ -1053,6 +1250,7 @@ class Orchestrator:
         log.info("=== Agent trader FTMO SWING multi-strategies — EXECUTION DIRECTE | "
                  "Bedrock %s | TF %s ===", self.cfg.bedrock.model_id, self.cfg.timeframe)
         log.info("Etat persistant SQLite: %s", self.mem.store.path)
+        self.mem.store.purge_events(self.cfg.eval.event_retention_days)
         reprise = self.mem.load_safe_mode()
         if reprise:
             log.warning("Reprise apres arret en MODE SECOURS (%s, depuis %s) — "
@@ -1061,6 +1259,9 @@ class Orchestrator:
         code = 0
         try:
             while True:
+                if process.arret_demande():
+                    log.warning("Arret demande — on ne demarre pas de nouveau cycle.")
+                    break
                 try:
                     self.cycle()
                 except SafeExit as e:
@@ -1082,9 +1283,21 @@ class Orchestrator:
                     break
         except SafeExit as e:                    # levee depuis le watchdog
             log.warning("ARRET DU SCRIPT (watchdog) — %s", e)
+        except KeyboardInterrupt:
+            log.warning("Interruption clavier — arret immediat demande.")
         finally:
+            # ORDRE IMPORTANT. Le broker d'abord (on lache la connexion), puis les emails
+            # (une alerte qui n'arrive pas ne sert a rien : c'est ici que se jouait la
+            # perte des alertes, les threads daemon mourant avec le process), puis la
+            # base (checkpoint WAL), et enfin le verrou — libere en dernier pour qu'aucune
+            # autre instance ne demarre pendant qu'on referme.
             self.broker.shutdown()
-            self.mem.store.close()          # WAL flush : rien ne se perd a l'arret
+            if not self.mail.flush(15):
+                log.warning("Des notifications n'ont pas pu partir avant l'arret.")
+            self.mem.store.close()          # checkpoint WAL : rien ne se perd a l'arret
+            verrou.liberer()
+            log.info("Arret propre termine (envoyes=%d, echoues=%d, jetes=%d).",
+                     self.mail.envoyes, self.mail.echoues, self.mail.jetes)
         return code
 
 
@@ -1103,13 +1316,17 @@ if __name__ == "__main__":
         o = Orchestrator()
         c = o.cfg.mail
         if not c.ready:
-            log.error("Config mail incomplete : MAIL_HOST=%s MAIL_TO=%s (voir agent/.env)",
+            log.error("Config mail incomplete : MAIL_HOST=%s MAIL_TO=%s (voir .env)",
                       c.host or "(vide)", ", ".join(c.to) or "(vide)")
             sys.exit(1)
         log.info("Envoi d'un email de test vers %s via %s:%s (%s)...",
                  ", ".join(c.to), c.host, c.port, c.mode)
-        o.mail._send_sync("[AGENT FTMO] Email de test",
-                          "Si vous lisez ceci, les notifications fonctionnent.\n\n"
-                          + Mailer.portefeuille({}, []))
-        sys.exit(0)
+        # on passe par la file reelle (reessai compris) : c'est le chemin de production
+        # qu'on veut verifier, pas un envoi direct qui court-circuiterait tout.
+        o.mail.send("Email de test",
+                    "Si vous lisez ceci, les notifications fonctionnent.\n\n"
+                    + Mailer.portefeuille({}, []))
+        o.mail.flush(60)
+        log.info("Resultat : %d envoye(s), %d echoue(s).", o.mail.envoyes, o.mail.echoues)
+        sys.exit(0 if o.mail.envoyes else 1)
     sys.exit(Orchestrator().run(loop=args.loop))

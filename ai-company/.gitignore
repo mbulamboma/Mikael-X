@@ -1,0 +1,9 @@
+# SECRETS : configuration reelle (MT5, Bedrock, SMTP) et reglages de l'entreprise
+.env
+# Etat local : base SQLite (journal, positions suivies, session FTMO) + verrou d'instance.
+# Ne JAMAIS deployer l'etat d'une machine sur une autre : il decrit un compte precis.
+state/
+# anciens etats JSON migres
+*.migrated
+__pycache__/
+.pytest_cache/

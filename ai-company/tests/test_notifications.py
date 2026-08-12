@@ -18,7 +18,10 @@ CFG = dict(enabled=True, host="smtp.test", port=465, user="u", password="p",
 def _mailer(**kw):
     m = Mailer(MailConfig(**{**CFG, **kw}))
     m.envois = []
-    m.send = lambda sujet, corps, urgent=False: m.envois.append((sujet, corps, urgent))
+    # `send(sujet, corps_texte, html, urgent)` : on capture le repli TEXTE (corps) et le
+    # HTML separement — les assertions de contenu portent sur le texte, plus stable.
+    m.send = lambda sujet, corps, html="", urgent=False: m.envois.append(
+        (sujet, corps, urgent, html))
     return m
 
 
@@ -53,10 +56,13 @@ def test_mail_ouverture_contient_le_risque_et_la_these():
                     "couts_estimes": 18.0, "spread_pips_entree": 1.5, "confidence": 0.72,
                     "rationale": "Cassure Donchian avec dollar faible."},
                    summary=SUMMARY, positions=POSITIONS)
-    sujet, corps, urgent = m.envois[0]
+    sujet, corps, urgent, html = m.envois[0]
     assert "Ouverture BUY XAUUSD" in sujet and not urgent
     assert "donchian_breakout" in corps and "0.98 %" in corps
     assert "Cassure Donchian" in corps and "ETAT DU PORTEFEUILLE" in corps
+    # version HTML : document complet, statut et metrique phare presents
+    assert html.startswith("<!DOCTYPE html>") and "color-scheme" in html
+    assert "Achat" in html and "de risque" in html
 
 
 def test_mail_cloture_marque_les_pertes_comme_urgentes():
@@ -67,7 +73,7 @@ def test_mail_cloture_marque_les_pertes_comme_urgentes():
              "duree_h": 30.0}
     m.trade_ferme(trade, "Stop dans le bruit : elargir a 1 ATR.",
                   summary=SUMMARY, positions=[])
-    sujet, corps, urgent = m.envois[0]
+    sujet, corps, urgent, html = m.envois[0]
     assert "PERTE" in sujet and urgent is True
     assert "MFE / MAE" in corps and "Stop dans le bruit" in corps
 
@@ -81,9 +87,10 @@ def test_alerte_porte_l_action_requise():
     m.alerte("IA indisponible — pilote de secours actif", "Bedrock: quota depasse",
              summary=SUMMARY, positions=POSITIONS,
              action_requise="Verifier la cle Bedrock.")
-    sujet, corps, urgent = m.envois[0]
+    sujet, corps, urgent, html = m.envois[0]
     assert urgent and "IA indisponible" in sujet
     assert "ACTION REQUISE" in corps and "Verifier la cle Bedrock." in corps
+    assert "Action requise" in html and "Verifier la cle Bedrock." in html
 
 
 def test_notifications_desactivables():
@@ -105,11 +112,17 @@ def test_mode_smtp_deduit_du_port():
 
 
 def test_panne_smtp_ne_casse_jamais_le_trading():
-    """Un serveur mail injoignable ne doit pas remonter d'exception."""
+    """Un serveur mail injoignable ne doit jamais remonter dans la boucle de trading.
+
+    `_send_sync` LEVE desormais (c'est la couche de reessai qui decide de la suite) ;
+    l'API publique `send()`, elle, ne doit ni lever ni bloquer."""
+    import pytest
     m = Mailer(MailConfig(**{**CFG, "host": "127.0.0.1", "port": 1, "timeout": 1}))
-    m._send_sync("test", "corps")               # ne doit PAS lever
-    m.send("test", "corps")
-    m.flush(2)
+    with pytest.raises(Exception):
+        m._send_sync("test", "corps")
+    m.send("test", "corps")                     # ne doit PAS lever
+    m.flush(5)
+    assert m.echoues == 1 and m.envoyes == 0
 
 
 def test_orchestrateur_notifie_sans_planter_sans_smtp():

@@ -83,6 +83,21 @@ def pop_actions() -> list[dict]:
     return list(_CTX["actions"])
 
 
+def cycle_context() -> dict:
+    """Vue LECTURE SEULE du contexte de cycle deja prepare par l'orchestrateur.
+
+    Utilisee par le desk multi-agents (desk/) : ses employes (Gerant, Trade Manager,
+    Trader, Risk Manager, Vigie) lisent le meme dossier que celui bind_context() ci-dessus,
+    sans re-telecharger quoi que ce soit. On renvoie des references (pas des copies) : le
+    desk NE DOIT PAS muter ce dict."""
+    return {
+        "account": _CTX["account"], "positions": _CTX["positions"],
+        "snapshots": _CTX["snapshots"], "charts": _CTX["charts"],
+        "news": _CTX["news"], "strategies": _CTX["strategies"],
+        "postmortem": _CTX.get("postmortem", ""), "lessons": _CTX["lessons"],
+    }
+
+
 # ============================================================ MODE SANS OUTILS
 # Pour les modeles Bedrock qui ne savent pas appeler d'outils (DeepSeek...) : on leur
 # livre le dossier deja constitue, et on valide leur plan JSON par les MEMES fonctions.

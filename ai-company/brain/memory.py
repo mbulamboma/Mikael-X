@@ -50,14 +50,32 @@ class Memory:
         return self.relevant_lessons_text(k=k)
 
     def relevant_lessons_text(self, symbols: Optional[list[str]] = None,
-                              strategies: Optional[list[str]] = None, k: int = 12) -> str:
+                              strategies: Optional[list[str]] = None, k: int = 12,
+                              roles: Optional[list[str]] = None) -> str:
         """Lecons PERTINENTES d'abord : celles qui concernent les symboles/strategies du
-        moment, puis les plus recentes. Doublons ecartes (le LLM se repete beaucoup)."""
+        moment, puis les plus recentes. Doublons ecartes (le LLM se repete beaucoup).
+
+        `roles` (desk multi-agents) : si fourni, on ne garde QUE les lecons taguees d'un de
+        ces roles (ex ["trader"], ["suivi"]) — chaque employe apprend de SES propres erreurs.
+        Une lecon sans tag de rol reste visible de tous (heritage de l'agent solo)."""
         lessons = self.lessons
         if not lessons:
             return "(aucune lecon pour l'instant — premier demarrage)"
         syms = {s.upper() for s in (symbols or [])}
         strats = {s.lower() for s in (strategies or [])}
+        wanted_roles = {r.lower() for r in (roles or [])}
+        role_tags = {"gerant", "trader", "risk", "analyste", "debat", "suivi", "vigie",
+                     "technique", "fondamental", "sentiment", "actualite", "bull", "bear",
+                     "juge", "agressif", "neutre", "prudent"}
+
+        if wanted_roles:
+            def keep(l) -> bool:
+                tags = {(t or "").lower() for t in l.tags}
+                has_role = bool(tags & role_tags)
+                return (not has_role) or bool(tags & wanted_roles)
+            lessons = [l for l in lessons if keep(l)]
+            if not lessons:
+                return "(aucune lecon specifique a ce rol pour l'instant)"
 
         def score(idx_lesson) -> tuple:
             i, l = idx_lesson

@@ -142,9 +142,14 @@ class FTMOEngine:
                  pip_value_per_lot: float, price_to_pips: float,
                  min_lot: float, max_lot: float, lot_step: float,
                  now: Optional[datetime] = None,
-                 costs: Optional[TradeCosts] = None) -> RiskDecision:
+                 costs: Optional[TradeCosts] = None,
+                 risk_pct_override: float = 0.0) -> RiskDecision:
         """Valide ET dimensionne. `costs` = frictions reelles (spread, commission,
-        slippage, stop minimum, marge) : sans elles le risque annonce est sous-estime."""
+        slippage, stop minimum, marge) : sans elles le risque annonce est sous-estime.
+
+        `risk_pct_override` : plafond de risque/trade impose par le Risk Manager LLM du
+        desk. Il ne peut que DURCIR — on prend min(budget cfg, override). Jamais au-dela
+        du plancher deterministe. 0 = pas d'override (comportement historique)."""
         reasons: list[str] = []
         k = costs or TradeCosts()
 
@@ -194,7 +199,11 @@ class FTMOEngine:
 
         # budget de risque = min(risque/trade, marge journaliere restante, marge totale restante)
         c = self.cfg
-        base_budget = acc.initial_balance * c.risk_per_trade_pct / 100
+        # Le Risk Manager LLM ne peut que REDUIRE le risque/trade, jamais l'augmenter.
+        risk_pct = c.risk_per_trade_pct
+        if risk_pct_override and 0 < risk_pct_override < risk_pct:
+            risk_pct = risk_pct_override
+        base_budget = acc.initial_balance * risk_pct / 100
 
         daily_loss_now = acc.day_start_balance - acc.equity
         daily_room = acc.initial_balance * c.daily_stop_pct / 100 - daily_loss_now

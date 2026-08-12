@@ -27,7 +27,7 @@ import logging
 import os
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -102,6 +102,16 @@ class Store:
             return self.db.execute(sql, args).fetchall()
 
     def close(self):
+        """Fermeture propre : on replie le WAL dans la base avant de fermer.
+
+        Sans ce checkpoint, `agent.db-wal` peut atteindre plusieurs dizaines de Mo sur un
+        process qui tourne des mois, et une copie de sauvegarde du seul `.db` serait
+        incomplete. TRUNCATE remet le journal a zero une fois integre."""
+        try:
+            with self._lock:
+                self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as e:
+            log.debug("Checkpoint WAL impossible a la fermeture: %s", e)
         try:
             self.db.close()
         except sqlite3.Error:
@@ -129,6 +139,47 @@ class Store:
                 data = {}
             out.append({"ts": r["ts"], "kind": r["kind"], **(data if isinstance(data, dict) else {})})
         return out
+
+    def trim_events(self, kind: str, keep: int):
+        """Ne garde que les `keep` evenements les plus recents d'un type (rotation).
+
+        Reserve aux journaux VOLUMINEUX et rejouables (dossiers de cycle) : le journal
+        metier (ordres, vetos, clotures) n'est jamais purge, c'est la memoire du compte."""
+        if keep <= 0:
+            return
+        self._exec(
+            "DELETE FROM events WHERE kind = ? AND id NOT IN "
+            "(SELECT id FROM events WHERE kind = ? ORDER BY id DESC LIMIT ?)",
+            (str(kind), str(kind), int(keep)))
+
+    #: Journal qu'on ne purge JAMAIS : c'est la memoire du compte (apprentissage,
+    #: attribution, post-mortem, audit d'un incident). Quelques milliers de lignes par an.
+    KINDS_PERMANENTS = frozenset({
+        "trade_closed", "order_sent", "risk_veto", "urgence_ftmo", "safe_mode",
+        "safe_exit", "session_extraordinaire", "weekend_flatten", "entry_drift",
+    })
+
+    def purge_events(self, jours: int, garder: frozenset | set | None = None) -> int:
+        """Supprime les evenements OPERATIONNELS plus vieux que `jours`.
+
+        Le journal grossit a chaque cycle (`plan`, `modify`, `trail`, `gate_block`...)
+        et, sur un VPS qui tourne des mois, personne ne le regarde jamais — mais il
+        alourdit chaque sauvegarde. On ne touche PAS aux types permanents ci-dessus :
+        perdre un `trade_closed` reviendrait a effacer l'experience de l'agent.
+        Renvoie le nombre de lignes supprimees."""
+        if jours <= 0:
+            return 0
+        garder = set(garder if garder is not None else self.KINDS_PERMANENTS)
+        limite = (datetime.now(timezone.utc) - timedelta(days=int(jours))).isoformat()
+        marques = ",".join("?" * len(garder)) or "''"
+        cur = self._exec(
+            f"DELETE FROM events WHERE ts < ? AND kind NOT IN ({marques})",
+            (limite, *sorted(garder)))
+        n = cur.rowcount or 0
+        if n:
+            log.info("Journal : %d evenement(s) operationnel(s) de plus de %d jours purge(s).",
+                     n, jours)
+        return n
 
     # ------------------------------------------------------------------ lecons
     def add_lesson(self, symbol: str, outcome: str, text: str, tags: list[str] | None = None):
@@ -244,13 +295,18 @@ class Store:
 
 
 _DEFAULT: Optional[Store] = None
+#: la creation paresseuse doit rester atomique : le worker email, le watchdog et la
+#: boucle principale peuvent demander le store en meme temps.
+_DEFAULT_LOCK = threading.Lock()
 
 
 def default_store() -> Store:
-    """Store partage du process (cree a la premiere utilisation)."""
+    """Store partage du process (cree a la premiere utilisation, une seule fois)."""
     global _DEFAULT
     if _DEFAULT is None:
-        _DEFAULT = Store()
+        with _DEFAULT_LOCK:
+            if _DEFAULT is None:            # re-verification sous verrou
+                _DEFAULT = Store()
     return _DEFAULT
 
 

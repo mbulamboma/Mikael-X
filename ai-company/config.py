@@ -8,26 +8,35 @@ ne peut pas les contourner.
 from __future__ import annotations
 import math
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from dotenv import load_dotenv
 
+#: Racine du DEPLOYABLE. Ce dossier se suffit a lui-meme : code, configuration, etat.
+#: On le copie sur une machine, on remplit `.env`, il tourne. Rien au-dessus n'est requis.
 ROOT = Path(__file__).resolve().parent
-TRADING = ROOT.parent
+COMPANY = ROOT               # alias historique : l'entreprise EST le deployable
 
-# CONFIGURATION UNIFIEE : `agent/.env` fait foi et se suffit a lui-meme (MT5, Bedrock,
-# news, mail...). Le .env du projet parent n'est lu qu'en REPLI, si agent/.env n'existe
-# pas encore — l'agent ne depend donc plus d'un fichier exterieur.
-# Une variable deja definie dans l'ENVIRONNEMENT l'emporte sur le fichier (pratique
-# pour un lancement ponctuel : `AGENT_WEEKEND_FLATTEN=1 python run.py`).
-AGENT_ENV = ROOT / ".env"
-if AGENT_ENV.exists():
-    load_dotenv(AGENT_ENV)
-elif (TRADING / ".env").exists():
-    load_dotenv(TRADING / ".env")
+# UN SEUL `.env`, a la racine du dossier deploye. Il porte l'ORGANISATION (AGENT_MODE,
+# DESK_*, EVAL_*) ET la MACHINE (MT5, Bedrock/AWS, SMTP, FTMO) — les deux sections sont
+# separees et commentees dans `.env.example`.
+# Une variable deja definie dans l'ENVIRONNEMENT l'emporte toujours sur le fichier
+# (`EVAL_SHADOW=1 python run.py`), ce qui permet aussi de tout piloter par variables
+# d'environnement dans un conteneur, sans `.env` du tout.
+ENV_FILE = ROOT / ".env"
+if ENV_FILE.exists():
+    load_dotenv(ENV_FILE)
 
-STATE_DIR = ROOT / "state"
-STATE_DIR.mkdir(exist_ok=True)
+# Le paquet est importable meme lance depuis un autre repertoire de travail
+# (`python /opt/ai-company/run.py`, service systemd, tache planifiee).
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+#: Etat local (SQLite, verrou d'instance). Redirigeable hors du dossier pour un
+#: deploiement ou le code est en lecture seule : `AGENT_STATE_DIR=/var/lib/ai-company`.
+STATE_DIR = Path(os.environ.get("AGENT_STATE_DIR", "").strip() or (ROOT / "state"))
+STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _s(name: str, default: str = "") -> str:
@@ -135,6 +144,15 @@ class ExecutionConfig:
     watch_seconds: int = _i("AGENT_WATCH_SECONDS", 60)
     # Budget de risque par DEVISE (corrélation) : EURUSD + GBPUSD longs = meme pari dollar.
     max_risk_per_currency_pct: float = _f("AGENT_MAX_RISK_PER_CURRENCY_PCT", 2.0)
+    # NIVEAU D'ENTREE PROPOSE PAR LE LLM vs PRIX REEL. Les ordres partent AU MARCHE :
+    # l'`entry` du LLM ne sert qu'au SIZING et au R:R. S'il est loin du prix reel, le lot
+    # calcule et le R:R annonce sont des fictions (risque reel different du budget).
+    #  - `entry_reprice`        : recaler l'entree sur le prix executable avant le sizing ;
+    #  - `max_entry_drift_atr`  : au-dela de N x ATR d'ecart, on REFUSE (niveau perime ou
+    #                             invente : la these n'est plus celle qu'on executerait).
+    entry_reprice: bool = field(default_factory=lambda:
+                                os.environ.get("AGENT_ENTRY_REPRICE", "1") == "1")
+    max_entry_drift_atr: float = _f("AGENT_MAX_ENTRY_DRIFT_ATR", 0.5)
 
 
 @dataclass(frozen=True)
@@ -309,6 +327,111 @@ class BedrockConfig:
 
 
 @dataclass(frozen=True)
+class DeskConfig:
+    """DESK MULTI-AGENTS — l'agent unique devient une *entreprise* de rôles specialises
+    qui collaborent, se challengent et apprennent (cf. ai-company/IMPLEMENTATION.md).
+
+    L'orchestrateur choisit le cerveau via `mode` :
+      "desk" (defaut) -> Gerant + analystes + debat Bull/Bear + Trader + Risk Manager +
+                         Trade Manager, chacun un rol distinct ;
+      "solo"          -> agent unique historique (brain/agent.py), garde comme REPLI.
+
+    IMPORTANT : quel que soit le mode, le moteur de risque FTMO deterministe (risk/ftmo.py)
+    reste le plancher non negociable. Le Risk Manager LLM ne fait que DURCIR.
+    """
+    mode: str = field(default_factory=lambda:
+                      (os.environ.get("AGENT_MODE", "desk").strip().lower() or "desk"))
+    # C'est le GERANT qui convoque le desk complet (analystes + debat) a la demande ;
+    # au repos, seul le book est gere. Ces bascules permettent de couper une brique.
+    use_analysts: bool = field(default_factory=lambda: os.environ.get("DESK_USE_ANALYSTS", "1") == "1")
+    use_debate: bool = field(default_factory=lambda: os.environ.get("DESK_USE_DEBATE", "1") == "1")
+    # Risque en DEBAT (agressif/neutre/prudent + arbitrage du DG) plutot qu'un officier
+    # unique dont l'humeur devient la politique de la maison. 0 = Risk Manager mono-voix.
+    use_risk_debate: bool = field(default_factory=lambda:
+                                  os.environ.get("DESK_RISK_DEBATE", "1") == "1")
+    # DEBAT ADAPTATIF : `debate_rounds` est un MAXIMUM. Le 2e tour n'a lieu que si le debat
+    # est serre (ecart de conviction <= `debate_gap`) — payer une relance quand un camp
+    # ecrase l'autre n'apprend rien.
+    debate_rounds: int = _i("DESK_DEBATE_ROUNDS", 2)
+    debate_gap: float = _f("DESK_DEBATE_GAP", 0.2)
+    # nb max de symboles envoyes au desk complet par cycle (borne le cout LLM)
+    max_candidates: int = _i("DESK_MAX_CANDIDATS", 2)
+    # tokens/temperature propres aux agents du desk (reponses courtes et structurees)
+    max_tokens: int = _i("DESK_MAX_TOKENS", 1500)
+    temperature: float = _f("DESK_TEMPERATURE", 0.2)
+
+    # VIGIE DES POSITIONS : surveille les trades ouverts EN CONTINU (au-dela du watchdog
+    # deterministe), alerte le DG quand un trade se degrade, et peut declencher une
+    # SESSION EXTRAORDINAIRE (arreter/modifier le trade). Conditionnee + rate-limitee.
+    vigie_enabled: bool = field(default_factory=lambda: os.environ.get("DESK_VIGIE_ENABLED", "1") == "1")
+    vigie_alert_r: float = _f("DESK_VIGIE_ALERT_R", -0.6)      # perte flottante (R) declencheuse
+    vigie_giveback_r: float = _f("DESK_VIGIE_GIVEBACK_R", 1.0) # MFE atteint -> "gains rendus"
+    vigie_min_minutes: int = _i("DESK_VIGIE_MIN_MINUTES", 30)  # anti-spam par ticket
+
+    # MODELES A DEUX VITESSES (optionnel). Trois niveaux, du plus general au plus precis :
+    #   1. `BEDROCK_MODEL_ID`  — le modele partage, defaut de tout le monde ;
+    #   2. `DESK_MODEL_RAPIDE` / `DESK_MODEL_FORT` — par CLASSE de role : rapide pour ceux
+    #      qu'on appelle a chaque cycle (Gerant, Trade Manager, Vigie), fort pour ceux qui
+    #      raisonnent rarement mais lourdement (Trader, analystes, debat, risque) ;
+    #   3. `DESK_MODEL_<ROLE>` — override individuel, gagne sur tout le reste.
+    # C'est ce qui finance les tours de debat : payer un gros modele pour dire « rien a
+    # signaler » 24 fois par jour n'a aucun sens.
+    model_rapide: str = field(default_factory=lambda: _s("DESK_MODEL_RAPIDE"))
+    model_fort: str = field(default_factory=lambda: _s("DESK_MODEL_FORT"))
+    model_gerant: str = field(default_factory=lambda: _s("DESK_MODEL_GERANT"))
+    model_trader: str = field(default_factory=lambda: _s("DESK_MODEL_TRADER"))
+    model_risk: str = field(default_factory=lambda: _s("DESK_MODEL_RISK"))
+    model_analyste: str = field(default_factory=lambda: _s("DESK_MODEL_ANALYSTE"))
+    model_debat: str = field(default_factory=lambda: _s("DESK_MODEL_DEBAT"))
+    model_suivi: str = field(default_factory=lambda: _s("DESK_MODEL_SUIVI"))
+    model_vigie: str = field(default_factory=lambda: _s("DESK_MODEL_VIGIE"))
+
+    #: roles appeles a CHAQUE cycle (ou plus souvent) -> classe "rapide" ; les autres
+    #: raisonnent rarement et profitent d'un modele fort.
+    ROLES_RAPIDES = ("gerant", "suivi", "vigie")
+
+    def model_for(self, role: str, fallback: str) -> str:
+        """Modele d'un rol : override individuel > classe rapide/fort > modele partage."""
+        individuel = {
+            "gerant": self.model_gerant, "trader": self.model_trader,
+            "risk": self.model_risk, "analyste": self.model_analyste,
+            "debat": self.model_debat, "suivi": self.model_suivi,
+            "vigie": self.model_vigie,
+        }.get(role, "")
+        classe = self.model_rapide if role in self.ROLES_RAPIDES else self.model_fort
+        return individuel or classe or fallback
+
+
+@dataclass(frozen=True)
+class EvalConfig:
+    """MESURE — on ne croit pas un cerveau sur parole, on l'observe.
+
+    Empiler des agents LLM sans instrument de mesure augmente la variance, pas la
+    qualite. Trois leviers, tous inoffensifs pour le trading reel :
+
+    - `journal_cycles` : chaque cycle enregistre son DOSSIER D'ENTREE complet (compte,
+      scan, charts, news, lecons, bilan) + le plan rendu par le cerveau. C'est la
+      matiere premiere du rejeu hors-ligne (`desk/replay.py`) : sans ca, impossible de
+      comparer solo vs desk sur les MEMES donnees.
+    - `shadow` : MODE OMBRE. Le cerveau decide et son plan est journalise, mais AUCUNE
+      de ses actions n'est executee. Les protections deterministes (trailing, stop
+      d'urgence, panique perte-jour, garde week-end) continuent de tourner normalement.
+      Sert a observer un nouveau cerveau en conditions reelles sans lui confier l'argent.
+    - `journal_keep` : rotation (nb de cycles conserves), pour borner la taille de la base.
+    """
+    shadow: bool = field(default_factory=lambda: os.environ.get("EVAL_SHADOW", "0") == "1")
+    journal_cycles: bool = field(default_factory=lambda:
+                                 os.environ.get("EVAL_JOURNAL_CYCLES", "1") == "1")
+    journal_keep: int = _i("EVAL_JOURNAL_KEEP", 500)
+    # bougies max parcourues en aval d'une decision pour simuler son issue (rejeu)
+    replay_max_bars: int = _i("EVAL_REPLAY_MAX_BARS", 30)
+    # Retention du journal OPERATIONNEL (plans, modifications, blocages...). Les
+    # evenements qui font la memoire du compte (trades clotures, ordres, vetos,
+    # urgences) ne sont JAMAIS purges — cf. Store.KINDS_PERMANENTS. 0 = ne rien purger.
+    event_retention_days: int = _i("AGENT_EVENT_RETENTION_DAYS", 90)
+
+
+@dataclass(frozen=True)
 class AgentConfig:
     # LLM (AWS Bedrock)
     bedrock: BedrockConfig = field(default_factory=BedrockConfig)
@@ -344,6 +467,8 @@ class AgentConfig:
     safe: SafeModeConfig = field(default_factory=SafeModeConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     mail: MailConfig = field(default_factory=MailConfig)
+    desk: DeskConfig = field(default_factory=DeskConfig)
+    eval: EvalConfig = field(default_factory=EvalConfig)
 
 
 CFG = AgentConfig()

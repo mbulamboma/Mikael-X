@@ -126,7 +126,7 @@ demander une analyse supplémentaire : il décide avec le dossier, ou s'abstient
 
 ## État persistant : SQLite, pas des fichiers
 
-Tout l'état vit dans **`state/agent.db`** ([store.py](agent/store.py)) — journal,
+Tout l'état vit dans **`state/agent.db`** ([store.py](store.py)) — journal,
 leçons, positions suivies, session FTMO, marqueur de mode secours, cache news.
 
 Pourquoi : `write_text()` n'est **pas atomique**. Un process tué (VPS qui redémarre,
@@ -159,7 +159,7 @@ python run.py --status
 
 Dès que le LLM devient indisponible (Bedrock injoignable, credentials expirées, quota,
 dépendance manquante, erreur d'exécution), l'agent **bascule automatiquement** sur
-[brain/autopilot.py](agent/brain/autopilot.py) — **zéro IA, que des règles fixes** :
+[brain/autopilot.py](brain/autopilot.py) — **zéro IA, que des règles fixes** :
 
 1. **Aucune nouvelle position.** Jamais, quelles que soient les conditions.
 2. **Protection du compte d'abord** : si la perte du jour atteint 75 % du stop agent
@@ -183,7 +183,7 @@ Réglages (`.env`) : `SAFE_BE_AT_R`, `SAFE_TRAIL_ATR`, `SAFE_TRAIL_ACTIVATE_R`,
 ## Coûts réels : spread, commission, slippage, swap, gap, marge
 
 Le risque d'un trade n'est **pas** `entrée − stop`. Le moteur de risque dimensionne sur
-le **coût réel** ([risk/ftmo.py](agent/risk/ftmo.py), `TradeCosts`) :
+le **coût réel** ([risk/ftmo.py](risk/ftmo.py), `TradeCosts`) :
 
 ```
 perte si stop touché = (distance + spread + slippage) × valeur_du_pip × lot
@@ -216,7 +216,7 @@ Trois étages, du plus factuel au plus interprétatif :
 1. **Traces** — à l'ouverture on enregistre le plan (R:R brut et net, régime, confiance,
    coûts estimés, slippage subi) ; à **chaque cycle** on met à jour **MFE/MAE** (le meilleur
    et le pire point atteint, en R) ; à la clôture on écrit plan **vs** réalité.
-2. **Post-mortem chiffré** ([brain/postmortem.py](agent/brain/postmortem.py)) — winrate,
+2. **Post-mortem chiffré** ([brain/postmortem.py](brain/postmortem.py)) — winrate,
    espérance R, écart R:R planifié / R encaissé, coût d'exécution en % du PnL, performance
    par stratégie / symbole / régime, et surtout des **défauts récurrents** nommés :
    *gains rendus*, *stop trop serré*, *asymétrie défavorable*, *frais excessifs*,
@@ -258,6 +258,70 @@ L'agent n'est plus enfermé dans une méthode. À chaque cycle :
                                                        clôture ─▶ R imputé ─▶ apprend
 ```
 
+## Le cerveau par défaut : une entreprise d'agents, pas un agent
+
+Depuis la refonte `ai-company/`, le cerveau n'est plus un LLM unique mais une **équipe
+de rôles spécialisés** qui se challengent (`AGENT_MODE=desk`, défaut ; `solo` reste le
+repli historique). Chaîne d'un cycle :
+
+```
+GÉRANT (mandat : posture, convoque-t-on le desk ? quels candidats ?)
+   ├─ TRADE MANAGER — gère le book ouvert à chaque cycle
+   └─ si convoqué :
+        4 ANALYSTES INDÉPENDANTS (technique, fondamental, sentiment, actualité)
+              ↓ briefs (aucun ne voit celui des autres)
+        DÉBAT BULL vs BEAR  →  JUGE : plan écrit + direction retenue (contraignant)
+              ↓
+        TRADER — traduit le plan en niveaux exécutables
+              ↓
+        COLLÈGE DU RISQUE (agressif / neutre / prudent) → arbitrage du DG
+              ↓ ne peut que DURCIR
+        MOTEUR FTMO DÉTERMINISTE (sizing + veto) → exécution MT5
+```
+
+Entre deux cycles, une **VIGIE** surveille les positions ; sur déclencheur déterministe
+(perte flottante, gains rendus, news imminente) elle peut faire convoquer une **session
+extraordinaire** qui ne peut que réduire le risque.
+
+Deux garanties structurelles, appliquées en Python et non par la prière du prompt : le
+verdict du juge **supprime** toute ouverture qui le contredit, et un refus **unanime** du
+collège du risque supprime le trade sans arbitrage. Le moteur `risk/ftmo.py` reste le
+plancher : aucune couche LLM ne peut desserrer une limite.
+
+L'entreprise vit dans son **propre dossier**, `ai-company/`, avec sa propre
+configuration (`ai-company/.env` : composition, rythme, modèles, mesure — aucun
+secret ; `.env` garde les identifiants MT5/Bedrock/SMTP). Détail complet,
+organigramme et phases : [ai-company/IMPLEMENTATION.md](IMPLEMENTATION.md).
+
+## Mesurer avant de croire : mode ombre et rejeu
+
+Empiler des agents augmente le coût et la variance ; rien ne garantit que ça augmente la
+qualité. Trois outils, dans `desk/journal.py` et `desk/replay.py` :
+
+- **journal des cycles** (`EVAL_JOURNAL_CYCLES=1`) — chaque cycle archive son dossier
+  d'entrée complet et le plan rendu, en rotation : un cycle devient **rejouable** ;
+- **mode ombre** (`EVAL_SHADOW=1`) — le cerveau décide, son plan est journalisé, **rien
+  n'est exécuté** ; les protections déterministes continuent de tourner ;
+- **rejeu** — pour chaque ouverture proposée, on déroule les bougies postérieures :
+  stop ou cible touché en premier → R réalisé, puis expectancy / winrate / profit factor
+  / drawdown, et **propositions vs trades réellement exécutés**.
+
+```bash
+python desk/replay.py --shadow --cout-r 0.05
+```
+
+Deux vues complémentaires : `--roles` sort la **revue de performance par employé**
+(l'analyste sentiment fait-il mieux quand il est d'accord ou quand il s'oppose ? le collège
+du risque protège-t-il ou coupe-t-il les gagnants ?), sans MT5 ni appel LLM ; `--rejouer
+solo` **re-décide** sur les mêmes dossiers archivés avec l'autre cerveau, pour comparer les
+deux sur des données identiques (appels LLM réels, donc facturés). Toute statistique sous
+5 observations est affichée comme **échantillon insuffisant** plutôt que comme un résultat.
+
+Limites assumées : hors frais (sauf `--cout-r`), chemin intra-bougie inconnu (stop **et**
+cible dans la même bougie → tranché pour le stop), sans sizing ni règles FTMO. Ça mesure
+la **qualité du signal**, pas la courbe d'equity — et sur quelques dizaines de trades,
+ça ne prouve rien.
+
 ## Architecture — le LLM propose, le risque dispose
 
 Le LLM **ne calcule jamais le lot** et **ne peut pas contourner** les limites :
@@ -280,14 +344,23 @@ déterministe (perte jour/total, nb positions, trades/jour, cooldown, concentrat
 | `strategy/playbooks.py` | Catalogue des stratégies (modes d'emploi) |
 | `strategy/scoreboard.py` | Apprentissage : quelle stratégie marche (bandit UCB) |
 | `brain/tools.py` | Outils LangChain : observer (`list_symbols`, `get_chart`, `compute_indicator`, `get_news`, `get_macro_events`, `search_news`…) + agir (`plan_open/close/modify/trail`) |
-| `brain/agent.py` | Le trader swing autonome (Bedrock) + le coach (réflexion) |
+| `brain/agent.py` | Le trader swing autonome (Bedrock) + le coach (réflexion) — mode `solo` |
+| `ai-company/desk/desk.py` | **Le desk** : orchestration de l'entreprise d'agents (drop-in de l'agent solo) |
+| `ai-company/desk/gerant.py` | Gérant/DG : mandat du cycle, escalade de la vigie, arbitrage du risque |
+| `ai-company/desk/analysts.py` | Les 4 analystes indépendants (dossiers spécialisés pré-chargés) |
+| `ai-company/desk/debat.py` | Débat Bull/Bear **adaptatif** + juge (plan contraignant) |
+| `ai-company/desk/trader.py` / `desk/risque.py` | Trader ; collège du risque à 3 tempéraments |
+| `ai-company/desk/trade_manager.py` / `desk/vigie.py` | Gestion du book ; surveillance entre deux cycles |
+| `ai-company/desk/situation.py` | **Mémoire situationnelle** : signature de marché + cas passés proches |
+| `ai-company/desk/journal.py` / `desk/replay.py` | Journal des cycles ; mode ombre, rejeu et métriques |
+| `ai-company/desk/bilan_roles.py` | **Revue de performance par employé** (avec refus de conclure sous 5 cas) |
 | `store.py` | **Persistance SQLite** (journal, états, migration depuis les anciens JSON) |
 | `brain/memory.py` | Journal + leçons + attribution stratégie (au-dessus de `store.py`) |
 | `run.py` | Boucle de vie |
 
 ## News & profil swing
 
-L'agent est **news-aware** ([data/news.py](agent/data/news.py)) — à chaque cycle il
+L'agent est **news-aware** ([data/news.py](data/news.py)) — à chaque cycle il
 reçoit, par devise du symbole :
 
 - **Calendrier économique MT5** (`calendar_history.csv`, exporté par votre
@@ -341,7 +414,7 @@ flottant) :
 | **Arrêt du script** | plus aucune position ouverte : que faire pour relancer |
 | **IA rétablie** | reprise du pilotage normal |
 
-Configuration dans `agent/.env` (`MAIL_HOST`, `MAIL_PORT`, `MAIL_SECURE`, `MAIL_USER`,
+Configuration dans `.env` (`MAIL_HOST`, `MAIL_PORT`, `MAIL_SECURE`, `MAIL_USER`,
 `MAIL_PASSWORD`, `MAIL_FROM`, `MAIL_TO`). Le mode SSL/STARTTLS est déduit du port si
 `MAIL_SECURE` n'est pas renseigné. Vérifier la configuration :
 
@@ -354,8 +427,8 @@ n'interrompt jamais le trading** (l'erreur est simplement journalisée).
 
 ## Configuration : un seul fichier
 
-`agent/.env` est **autonome** — MT5, Bedrock, FTMO, coûts, news, web, mail, état. Le
-`.env` du projet parent n'est lu qu'en repli, si `agent/.env` n'existe pas. Une variable
+`.env` est **autonome** — MT5, Bedrock, FTMO, coûts, news, web, mail, état. Le
+`.env` du projet parent n'est lu qu'en repli, si `.env` n'existe pas. Une variable
 définie dans l'environnement l'emporte sur le fichier (`AGENT_WEEKEND_FLATTEN=1 python
 run.py`). Les placeholders non remplacés (`<votre_cle>`) sont traités comme vides, pour
 ne jamais s'authentifier avec une fausse clé.
@@ -367,10 +440,13 @@ cp .env.example .env   # puis remplir
 ## Installation
 
 ```bash
-cd agent
+cd ai-company
 pip install -r requirements.txt
 cp .env.example .env
 ```
+
+Ce dossier **est** l'application : on le copie sur une machine, on remplit `.env`, il
+tourne. Rien au-dessus n'est requis.
 
 Renseigner dans `.env` :
 - **`BEDROCK_MODEL_ID`** et **`AWS_REGION`**. L'ID est un *inference profile* qui
@@ -381,7 +457,10 @@ Renseigner dans `.env` :
   et vérifiez que l'accès au modèle Claude est activé dans la console Bedrock.
 - **Credentials AWS** : chaîne boto3 par défaut (`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`,
   ou `AWS_PROFILE`, ou rôle IAM).
-- MT5 : déjà présent dans le `.env` racine, réutilisé automatiquement.
+- **MT5** : `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER` (le terminal doit tourner
+  sur la machine).
+- La composition de l'entreprise (`AGENT_MODE`, `DESK_*`) et la mesure (`EVAL_*`)
+  sont dans le même fichier, en sections séparées.
 
 ## Utilisation
 
@@ -399,6 +478,28 @@ d'inspecter (`python run.py --status`) puis de relancer.
 explicite). La discipline (perte jour/total, cooldown, black-out news, R:R) reste
 intégralement appliquée. **Lancez-le sur un compte démo ou challenge FTMO** le
 temps de valider son comportement, jamais directement sur un compte financé non testé.
+
+## Mise en production
+
+```bash
+python run.py --status      # inspecte l'état persistant, ne trade pas
+python run.py --test-mail   # vérifie SMTP par le vrai chemin (file + réessai)
+python run.py --loop        # production
+```
+
+Quatre garanties, chacune couverte par [tests/test_deploiement.py](tests/test_deploiement.py) :
+
+| Garantie | Comportement |
+|---|---|
+| **Instance unique** | verrou système sur `state/agent.lock` ; un second lancement **refuse de démarrer** (code de sortie `3`). Deux agents sur le même compte doubleraient le risque réel et fausseraient la perte journalière FTMO |
+| **Arrêt propre** | `SIGTERM`/`SIGINT` *demandent* l'arrêt : le cycle se termine, les emails partent, le WAL est replié, le verrou est libéré. Un second signal tue immédiatement. Les positions ouvertes ne sont **pas** fermées — elles restent protégées par leur SL/TP chez le broker |
+| **Alertes qui arrivent** | file bornée + un worker + 3 tentatives ; `flush()` à l'arrêt. Avant, les threads d'envoi mouraient avec le process et l'alerte était perdue |
+| **Journal borné** | checkpoint WAL à la fermeture, purge des événements *opérationnels* après `AGENT_EVENT_RETENTION_DAYS` (90 j). Les trades clôturés, ordres, vetos et urgences ne sont **jamais** purgés : c'est la mémoire de l'agent |
+
+`AGENT_STATE_DIR` déplace SQLite et le verrou hors du dossier si le code est monté en
+lecture seule. Ne pas arrêter avec `kill -9` : ni les alertes ni le WAL n'auraient le
+temps d'être écrits.
+
 
 ## Notes
 
