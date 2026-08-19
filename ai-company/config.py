@@ -190,12 +190,11 @@ class MT5Config:
 class NewsConfig:
     """Flux d'actualite pour un trader swing : calendrier economique WEB (faireconomy /
     ForexFactory, meme source que la regle news FTMO), donnees Reserve federale (FRED),
-    titres d'actualite (GDELT) et biais macro par devise calcule dans le cycle
+    titres d'actualite (flux RSS de data/sources.py) et biais macro par devise
     (`data/macro_web.py`). AUCUN fichier MT5 : ni calendar_history.csv, ni
     macro_features.csv — ces CSV pouvaient perimer sans que rien ne le signale."""
     enabled: bool = field(default_factory=lambda: os.environ.get("NEWS_ENABLED", "1") == "1")
     fred_key: str = field(default_factory=lambda: _s("FRED_API"))
-    use_gdelt: bool = field(default_factory=lambda: os.environ.get("NEWS_GDELT", "1") == "1")
     # Fenetre "black-out" : pas de NOUVELLE entree si un event a fort impact touche
     # une devise du symbole dans +/- ces minutes (regle FTMO : 60 min avant news).
     blackout_min: int = _i("NEWS_BLACKOUT_MIN", 60)
@@ -253,9 +252,6 @@ class SourcesConfig:
     # RSS : flux libres (Reuters, banques centrales, medias). URLs separees par des virgules.
     rss_feeds: tuple[str, ...] = field(default_factory=lambda: tuple(
         u.strip() for u in os.environ.get("SOURCES_RSS", "").split(",") if u.strip()))
-    # Cles API (paliers gratuits) : activent news/social/fondamentaux quand renseignees.
-    finnhub_key: str = field(default_factory=lambda: _s("FINNHUB_API_KEY"))
-    eodhd_key: str = field(default_factory=lambda: _s("EODHD_API_KEY"))
     # FXSSI : sentiment retail long/short SANS compte (alternative a myfxbook). Best-effort
     # (page publique) et fail-closed. Sert de repli quand myfxbook n'est pas configure.
     fxssi_enabled: bool = field(default_factory=lambda:

@@ -34,7 +34,9 @@ import logging
 
 log = logging.getLogger("data.macro_web")
 
-CCYS = ("EUR", "USD", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF")
+#: XAU y figure : l'or n'a pas de taux directeur, mais il a des moteurs macro chiffres
+#: (taux reels, dollar, inflation anticipee) — cf. NewsFeed.FRED_OR.
+CCYS = ("EUR", "USD", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF", "XAU")
 
 # Indicateurs ou un chiffre PLUS HAUT est une MAUVAISE nouvelle pour la devise : la
 # surprise brute doit etre retournee. Liste volontairement courte et sans ambiguite —
@@ -138,6 +140,14 @@ def macro_bias(recent: list[dict], taux: dict | None, now, ccys=CCYS) -> dict:
         if mom is not None:
             fiche["taux"] = {"momentum": mom, "serie": tx.get("libelle"),
                              "age_jours": tx.get("age_jours")}
+            # Le DETAIL chiffre (variation 90j de chaque moteur) doit remonter tel quel :
+            # le filtre de preuves du desk n'accepte que des valeurs CITABLES. Un analyste
+            # ne peut rien sourcer avec "momentum -0.295" ; il peut sourcer "taux reel
+            # 10 ans +0.67 pt sur 90 jours".
+            if tx.get("detail"):
+                fiche["taux"]["detail"] = tx["detail"]
+            if tx.get("variation_points") is not None:
+                fiche["taux"]["variation_points"] = tx["variation_points"]
         out[c] = fiche
     return out
 

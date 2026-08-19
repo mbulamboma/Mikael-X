@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """COUCHE DE SOURCES EXTENSIBLE — brancher de nouvelles donnees sans toucher aux analystes.
 
-Le desk lisait jusqu'ici : MT5 (prix/chart/couts), FRED (taux), GDELT (titres), Google/DDG
+Le desk lisait jusqu'ici : MT5 (prix/chart/couts), FRED (taux), calendrier web, DuckDuckGo
 (web), myfxbook (sentiment retail). Ce module ajoute une couche PLUGGABLE ou chaque source
 est un petit adaptateur a interface uniforme, et une agregation par CATEGORIE (a l'image de
 TradingAgents : Marche / Social / News / Fondamentaux).
@@ -16,9 +16,6 @@ TROIS PRINCIPES, herites du reste du desk :
 
 CE QUI EST BRANCHE ICI (realiste, sans secret invente) :
   - RSS     : n'importe quel flux (Reuters, banques centrales...) via la stdlib -> news ;
-  - Finnhub : cle FINNHUB_API_KEY (palier gratuit) -> news societe, sentiment social score,
-              profil + transactions d'inities (couvre l'essentiel de la colonne Fondamentaux) ;
-  - EODHD   : cle EODHD_API_KEY -> news + sentiment.
 
 CE QUI N'EST PAS BRANCHE, et pourquoi (honnetete) :
   - X/Twitter : plus d'API gratuite exploitable -> hors de portee sans budget ;
@@ -165,91 +162,6 @@ class RSSNewsSource(Source):
         return out
 
 
-# --------------------------------------------------------------------------- Finnhub (cle)
-class FinnhubSource(Source):
-    """Palier gratuit avec cle FINNHUB_API_KEY : news societe, sentiment social score, profil
-    + transactions d'inities. Couvre l'essentiel de la colonne Fondamentaux de l'image."""
-    name = "finnhub"
-    BASE = "https://finnhub.io/api/v1"
-
-    @property
-    def enabled(self) -> bool:
-        return bool(getattr(self.cfg, "finnhub_key", ""))
-
-    def _call(self, path: str, params: dict) -> Any:
-        return self._get_json(f"{self.BASE}{path}", {**params, "token": self.cfg.finnhub_key})
-
-    def social_items(self, symbol: str) -> list[dict]:
-        if not self.enabled:
-            return []
-        data = self._call("/stock/social-sentiment", {"symbol": symbol})
-        items: list[dict] = []
-        for canal in ("reddit", "twitter"):
-            for m in ((data or {}).get(canal) or [])[:20]:
-                score = _num(m.get("score"))
-                if score is None:
-                    pos, neg = _num(m.get("positiveScore")), _num(m.get("negativeScore"))
-                    score = (pos or 0) - (neg or 0) if (pos is not None or neg is not None) else None
-                items.append({"sentiment": score, "text": ""})
-        return items
-
-    def news_items(self, symbol: str, limit: int = 8) -> list[dict]:
-        if not self.enabled:
-            return []
-        data = self._call("/company-news", {"symbol": symbol,
-                                            "from": "2020-01-01", "to": "2100-01-01"})
-        out = []
-        for a in (data or [])[:limit]:
-            titre = clean_snippet(a.get("headline", ""), 200)
-            if titre:
-                out.append({"title": titre, "source": a.get("source") or "finnhub",
-                            "date": a.get("datetime")})
-        return out
-
-    def fundamentals(self, symbol: str) -> dict:
-        if not self.enabled:
-            return {}
-        profil = self._call("/stock/profile2", {"symbol": symbol}) or {}
-        metrics = (self._call("/stock/metric", {"symbol": symbol, "metric": "all"}) or {})
-        inities = self._call("/stock/insider-transactions", {"symbol": symbol}) or {}
-        # on ne garde que des CHAMPS CHIFFRES/BORNES : pas de prose a ingerer telle quelle.
-        return _compact({
-            "profil": _compact({"nom": clean_snippet(profil.get("name", ""), 80),
-                                "secteur": clean_snippet(profil.get("finnhubIndustry", ""), 80),
-                                "capitalisation": _num(profil.get("marketCapitalization")),
-                                "devise": profil.get("currency")}),
-            "metriques": _compact({
-                "per": _num((metrics.get("metric") or {}).get("peTTM")),
-                "beta": _num((metrics.get("metric") or {}).get("beta")),
-                "haut_52s": _num((metrics.get("metric") or {}).get("52WeekHigh")),
-                "bas_52s": _num((metrics.get("metric") or {}).get("52WeekLow"))}),
-            "inities_net": _insider_net(inities),
-        })
-
-
-# --------------------------------------------------------------------------- EODHD (cle)
-class EODHDSource(Source):
-    """Cle EODHD_API_KEY : news + sentiment financier. Meme discipline (agregat + assaini)."""
-    name = "eodhd"
-
-    @property
-    def enabled(self) -> bool:
-        return bool(getattr(self.cfg, "eodhd_key", ""))
-
-    def news_items(self, symbol: str, limit: int = 8) -> list[dict]:
-        if not self.enabled:
-            return []
-        data = self._get_json("https://eodhd.com/api/news",
-                              {"s": symbol, "limit": limit, "api_token": self.cfg.eodhd_key,
-                               "fmt": "json"})
-        out = []
-        for a in (data or [])[:limit]:
-            titre = clean_snippet(a.get("title", ""), 200)
-            if titre:
-                out.append({"title": titre, "source": "eodhd", "date": a.get("date")})
-        return out
-
-
 # --------------------------------------------------------------------------- FXSSI (libre)
 class FXSSISource(Source):
     """SENTIMENT RETAIL positionnel (long/short %) — l'alternative a myfxbook, SANS compte.
@@ -300,9 +212,13 @@ class Sources:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self._social = [FinnhubSource(cfg)]
-        self._news = [RSSNewsSource(cfg), FinnhubSource(cfg), EODHDSource(cfg)]
-        self._fond = [FinnhubSource(cfg)]
+        # Finnhub et EODHD retires le 2026-08-19 : 403 sur les endpoints utiles (leurs
+        # donnees societe/social sont orientees ACTIONS, et leur calendrier est payant).
+        # Une cle qui ne rend rien est pire qu'une source absente : elle laisse croire
+        # que la colonne est couverte. Les seams restent ouverts pour une vraie source.
+        self._social = []
+        self._news = [RSSNewsSource(cfg)]
+        self._fond = []
         self._retail = [FXSSISource(cfg)]
 
     def actives(self) -> list[str]:

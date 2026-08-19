@@ -158,9 +158,6 @@ class Orchestrator:
     def news_for(self, symbol: str) -> dict:
         return self.news.for_symbols([symbol.upper()]).get("per_symbol", {}).get(symbol.upper(), {})
 
-    def news_search(self, query: str, hours: int = 48) -> dict:
-        return self.news.search(query, hours)
-
     def major_events(self, hours: int = 72) -> dict:
         return self.news.major_events(hours)
 
@@ -196,12 +193,12 @@ class Orchestrator:
 
     # ---- sources pluggables (data/sources.py) : Social / News / Fondamentaux ----
     def social_sentiment(self, symbol: str = "") -> dict:
-        """Sentiment social AGREGE et assaini (Reddit/Finnhub...). {} si aucune source active.
+        """Sentiment social AGREGE et assaini. {} si aucune source active.
         Consomme par desk/social.py -> analyste Sentiment (Point 4)."""
         return self.sources.social_sentiment(symbol)
 
     def news_extra(self, symbol: str = "", limit: int = 8) -> list[dict]:
-        """News supplementaires (RSS/Finnhub/EODHD), en plus du calendrier et de GDELT."""
+        """News supplementaires (flux RSS), en plus du calendrier economique."""
         return self.sources.news_extra(symbol, limit)
 
     def fundamentals(self, symbol: str = "") -> dict:

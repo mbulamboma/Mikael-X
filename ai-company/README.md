@@ -87,7 +87,7 @@ désarmer et gérer son stop à la main (`plan_modify`).
 | **Recherche web** | DuckDuckGo (sans clé, sans compte) | rien à configurer |
 | **myfxbook** (sentiment retail) | API officielle (la page publique renvoie 403) | `MYFXBOOK_EMAIL` + `MYFXBOOK_PASSWORD` — **vos** identifiants, envoyés uniquement à myfxbook |
 | **Calendrier économique** | flux faireconomy (miroir ForexFactory), libre et sans clé | rien à configurer |
-| GDELT (titres) | libre | `NEWS_GDELT` |
+| **Titres d'actualite** | flux RSS libres (`SOURCES_RSS`) | rien a configurer |
 
 ## Filet de sécurité déterministe (indépendant du LLM)
 
@@ -337,7 +337,7 @@ déterministe (perte jour/total, nb positions, trades/jour, cooldown, concentrat
 | `data/market.py` | Indicateurs → snapshot chiffré (scan) |
 | `data/chart.py` | **Lecture chart** : multi-TF **au choix de l'agent** + bougies + swings + niveaux |
 | `data/indicators.py` | **Boîte à outils d'indicateurs** calculés à la demande (17 indicateurs) |
-| `data/news.py` | **News** : calendrier web + FRED (Fed, série au choix) + GDELT + biais macro/devise |
+| `data/news.py` | **News** : calendrier web + FRED (Fed, série au choix) + biais macro/devise |
 | `data/calendar_web.py` | **Calendrier économique** (faireconomy/ForexFactory) — source du black-out news, sans MT5 |
 | `data/macro_web.py` | **Biais macro par devise** : momentum des taux FRED + surprises — calculé, jamais stocké |
 | `data/web.py` | **Recherche/lecture web** (DuckDuckGo, pages publiques, sentiment retail myfxbook) + garde-fous |
@@ -370,10 +370,15 @@ reçoit, par devise du symbole :
   faireconomy, miroir du calendrier ForexFactory — **la source même sur laquelle repose la
   règle news de FTMO**. Aucun terminal MT5, aucun CSV à exporter.
 - **Réserve fédérale / taux** via **FRED** (`FRED_API`) : Fed funds, 2 ans, 10 ans.
-- **Actualités** via **GDELT** (gratuit) : titres 48 h/devise, sentiment jugé par le LLM.
+- **Actualités** via les **flux RSS** de `SOURCES_RSS` (libres) : titres récents, sentiment jugé par le LLM.
 - **Biais macro par devise** ([data/macro_web.py](data/macro_web.py)) : momentum des taux
   de référence (FRED, une série par devise) + surprises du calendrier quand la source en
   fournit. Calculé dans le cycle, **sans fichier** — donc rien qui puisse périmer en silence.
+- **Biais de l'or** : XAU n'a pas de taux directeur, son biais se construit sur trois
+  moteurs FRED — **taux réels 10 ans (DFII10)**, dollar index (DTWEXBGS) et point mort
+  d'inflation (T10YIE) — avec des poids signés : taux réels et dollar qui montent pèsent
+  sur l'or, l'inflation anticipée le soutient. Le détail chiffré (variation 90 j de chaque
+  moteur) remonte dans le dossier pour que l'analyste puisse le **citer**.
 
 > **Pourquoi ce changement.** Le calendrier et le biais macro venaient de deux CSV
 > (`calendar_history.csv`, `macro_features.csv`) écrits dans `MQL5\Files` par un indicateur

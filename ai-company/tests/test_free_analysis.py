@@ -66,8 +66,6 @@ class FakeProvider:
         self.calls.append(("news_for", symbol))
         return {"currencies": ["AUD", "NZD"], "blackout": {"active": False}}
 
-    def news_search(self, query, hours=48):
-        self.calls.append(("news_search", query, hours))
         return {"enabled": True, "articles": [{"titre": "RBA holds rates", "source": "x.com"}]}
 
     def major_events(self, hours=72):
@@ -138,12 +136,11 @@ def test_outils_libres_utilisent_le_provider_live():
                                          timeframe="H4", period=14))
     assert ind["indicator"] == "adx" and ind["timeframe"] == "H4"
 
-    assert "RBA" in appel(T.search_news, query="RBA decision", hours=24)
     assert "CPI" in appel(T.get_macro_events, hours=48)
     assert "AUD" in appel(T.get_news, symbol="AUDNZD")
 
     kinds = [c[0] for c in p.calls]
-    assert kinds == ["symbols", "market", "chart", "chart", "indicator", "news_search",
+    assert kinds == ["symbols", "market", "chart", "chart", "indicator",
                      "major_events", "news_for"]
 
 
@@ -153,7 +150,6 @@ def test_outils_degradent_sans_provider():
     assert "error" in json.loads(appel(T.list_symbols))
     assert json.loads(appel(T.get_market, symbol="EURUSD"))["symbol"] == "EURUSD"   # cache du cycle
     assert "error" in json.loads(appel(T.get_chart, symbol="AUDNZD"))
-    assert "indisponible" in appel(T.search_news, query="gold")
 
 
 def test_news_construit_a_la_demande_un_symbole_hors_watchlist():
@@ -193,7 +189,7 @@ def test_news_desactivees_pas_de_blackout():
     feed = NewsFeed(NewsConfig(enabled=False))
     assert feed.blackout_for("EURUSD")["active"] is False
     assert feed.major_events()["enabled"] is False
-    assert feed.search("gold")["articles"] == []
+    assert feed.snapshot(["EURUSD"])["per_symbol"] == {}
 
 
 # ----------------------------------------------------------------- enquete web

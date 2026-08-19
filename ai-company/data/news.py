@@ -6,8 +6,6 @@ Agrege, avec degradation gracieuse (chaque source protegee), et met en cache :
      Donne les surprises recentes (actual-forecast) ET les events a venir a fort
      impact -> sert au "black-out" (ne pas entrer juste avant une grosse annonce).
   2. Reserve federale / taux    -> FRED (cle FRED_API) : Fed funds, 2 ans, 10 ans.
-  3. Actualites generales        -> GDELT (gratuit, sans cle) : titres 48h/devise,
-     dont la sentiment est jugee par le LLM lui-meme.
   4. Brain macro par devise      -> `macro_features.csv` (tools/macro_service.py),
      s'il est present : score composite calendrier+taux+news deja calcule.
 
@@ -29,20 +27,6 @@ log = logging.getLogger("news")
 CACHE_KEY = "news_cache"          # etat persiste en SQLite (survit a un redemarrage)
 
 CCYS = ["EUR", "USD", "JPY", "GBP", "AUD", "NZD", "CAD", "CHF"]
-
-# requetes GDELT par devise (banques centrales + devise) — reutilise l'univers macro
-GDELT_Q = {
-    "EUR": '(ECB OR "European Central Bank" OR eurozone)',
-    "USD": '("Federal Reserve" OR "US inflation" OR "US economy")',
-    "JPY": '("Bank of Japan" OR "japanese yen")',
-    "GBP": '("Bank of England" OR "pound sterling")',
-    "AUD": '("Reserve Bank of Australia" OR "australian dollar")',
-    "NZD": '(RBNZ OR "new zealand dollar")',
-    "CAD": '("Bank of Canada" OR "canadian dollar")',
-    "CHF": '("Swiss National Bank" OR "swiss franc")',
-    "XAU": '(gold OR "gold price" OR bullion)',
-}
-
 
 def symbol_ccys(sym: str) -> list[str]:
     """Devises pertinentes pour un symbole. EURUSD -> [EUR, USD] ; XAUUSD -> [XAU, USD]."""
@@ -125,27 +109,6 @@ class NewsFeed:
                 "surprises_recentes": strong_recent, "agenda_fort_impact": strong_next,
                 "taux_fred": cached.get("fred") or self._fred()}
 
-    def search(self, query: str, hours: int = 48, limit: int = 8) -> dict:
-        """Recherche libre d'actualite (GDELT) : l'agent enquete sur un theme/actif
-        (ex "gold", "ECB rate decision", "oil supply"). Titres bruts, a lui de juger."""
-        if not (self.cfg.enabled and self.cfg.use_gdelt):
-            return {"enabled": False, "articles": []}
-        try:
-            r = requests.get(
-                "https://api.gdeltproject.org/api/v2/doc/doc",
-                params={"query": str(query)[:200], "mode": "ArtList",
-                        "maxrecords": max(1, min(int(limit), 20)), "format": "json",
-                        "timespan": f"{max(1, min(int(hours), 168))}h",
-                        "sourcelang": "english"}, timeout=15)
-            arts = r.json().get("articles", []) if r.text.strip().startswith("{") else []
-        except Exception as e:
-            log.info("GDELT recherche '%s' indispo: %s", query, e)
-            return {"enabled": True, "articles": [], "error": str(e)}
-        return {"enabled": True, "query": query, "hours": hours,
-                "articles": [{"titre": a.get("title", "").strip(),
-                              "source": a.get("domain", ""), "date": a.get("seendate", "")}
-                             for a in arts if a.get("title")]}
-
     def _read_cache(self) -> dict | None:
         data = self.store.kv_get(CACHE_KEY)
         if isinstance(data, dict) and time.time() - data.get("_ts", 0) < self.cfg.cache_min * 60:
@@ -162,9 +125,6 @@ class NewsFeed:
         recent, upcoming = self._calendar(now)
         fred = self._fred()
         macro = self._macro_features(recent, now)
-        wanted = sorted({c for sym in symbols for c in symbol_ccys(sym)})
-        headlines = self._gdelt(wanted) if self.cfg.use_gdelt else {}
-
         per_symbol, blackout = {}, {}
         for sym in symbols:
             ccys = symbol_ccys(sym)
@@ -179,7 +139,6 @@ class NewsFeed:
                 "macro_bias": {c: macro.get(c) for c in ccys if c in macro},
                 "recent_events": [e for e in recent if e["currency"] in ccys][:5],
                 "upcoming_events": [e for e in upcoming if e["currency"] in ccys][:5],
-                "headlines": {c: headlines.get(c, []) for c in ccys if c in headlines},
                 "blackout": blackout[sym],
             }
         return {"enabled": True, "as_of": now.isoformat(), "fred": fred,
@@ -233,42 +192,70 @@ class NewsFeed:
         "CHF": ("IRLTLT01CHM156N", "10 ans Suisse (mensuel)"),
     }
 
-    def _fred_rates(self) -> dict:
-        """Momentum des taux par devise sur ~90 jours, borne dans [-1, +1] (tanh).
+    #: Moteurs du COURS DE L'OR. XAU n'a pas de taux directeur : son biais se construit
+    #: sur trois series, avec un poids SIGNE et une echelle de normalisation calee sur
+    #: l'amplitude d'un mouvement de 90 jours. Taux reels et dollar qui montent pesent
+    #: sur l'or (poids negatif) ; l'inflation anticipee le soutient (poids positif).
+    FRED_OR = {
+        "DFII10":   (-0.5, 2.0, "taux reel 10 ans US (TIPS)"),
+        "DTWEXBGS": (-0.3, 0.2, "dollar index large"),
+        "T10YIE":   (+0.2, 3.0, "point mort d'inflation 10 ans"),
+    }
 
-        Des taux qui montent soutiennent une devise : c'est le socle du biais macro
-        depuis la suppression de `macro_features.csv`. Chaque serie est protegee
-        separement — une devise indisponible manque, elle ne casse pas les autres.
-        """
-        if not self.cfg.fred_key:
-            return {}
-        import math
-        out = {}
-        for ccy, (sid, libelle) in self.FRED_TAUX.items():
-            try:
-                r = requests.get(
-                    "https://api.stlouisfed.org/fred/series/observations",
-                    params={"series_id": sid, "api_key": self.cfg.fred_key,
-                            "file_type": "json", "sort_order": "desc", "limit": 200},
-                    timeout=15)
-                obs = [o for o in r.json().get("observations", [])
-                       if o.get("value") not in (".", "", None)]
-            except Exception as e:
-                log.info("FRED %s (%s) indispo: %s", sid, ccy, e)
-                continue
-            if len(obs) < 2:
-                continue
-            dernier = obs[0]
+    def _fred_obs(self, sid: str, limit: int = 200) -> list:
+        """Observations FRED d'une serie (recentes d'abord). [] si indisponible."""
+        try:
+            r = requests.get(
+                "https://api.stlouisfed.org/fred/series/observations",
+                params={"series_id": sid, "api_key": self.cfg.fred_key,
+                        "file_type": "json", "sort_order": "desc", "limit": limit},
+                timeout=15)
+            return [o for o in r.json().get("observations", [])
+                    if o.get("value") not in (".", "", None)]
+        except Exception as e:
+            log.info("FRED %s indispo: %s", sid, e)
+            return []
+
+    def _fred_lot(self, ids: list[str]) -> dict:
+        """Plusieurs series EN PARALLELE. En sequence, 14 series coutaient ~25 s a chaque
+        reconstruction du snapshot — sur le chemin critique d'un cycle."""
+        from concurrent.futures import ThreadPoolExecutor
+        ids = list(dict.fromkeys(ids))
+        with ThreadPoolExecutor(max_workers=min(6, len(ids) or 1)) as ex:
+            return dict(zip(ids, ex.map(self._fred_obs, ids)))
+
+    @staticmethod
+    def _delta_90j(obs: list) -> tuple[float, dict] | None:
+        """(variation sur ~90 jours, derniere observation). None si illisible."""
+        if len(obs) < 2:
+            return None
+        dernier = obs[0]
+        try:
             d_last = datetime.fromisoformat(dernier["date"]).replace(tzinfo=timezone.utc)
             cible = d_last - timedelta(days=90)
-            # premiere observation d'il y a >= 90 jours ; a defaut, la plus ancienne connue
             ref = next((o for o in obs
                         if datetime.fromisoformat(o["date"]).replace(tzinfo=timezone.utc) <= cible),
                        obs[-1])
-            try:
-                delta = float(dernier["value"]) - float(ref["value"])
-            except (TypeError, ValueError):
+            return float(dernier["value"]) - float(ref["value"]), dernier
+        except (TypeError, ValueError, KeyError):
+            return None
+
+    def _fred_rates(self) -> dict:
+        """Momentum des taux par devise sur ~90 jours, borne dans [-1, +1] (tanh), PLUS le
+        biais de l'or (FRED_OR). Des taux qui montent soutiennent une devise ; l'or, lui,
+        suit l'inverse des taux REELS. Chaque serie est protegee separement — une devise
+        indisponible manque, elle ne casse pas les autres."""
+        if not self.cfg.fred_key:
+            return {}
+        import math
+        lot = self._fred_lot([sid for sid, _ in self.FRED_TAUX.values()] + list(self.FRED_OR))
+        out = {}
+        for ccy, (sid, libelle) in self.FRED_TAUX.items():
+            calc = self._delta_90j(lot.get(sid) or [])
+            if calc is None:
                 continue
+            delta, dernier = calc
+            d_last = datetime.fromisoformat(dernier["date"]).replace(tzinfo=timezone.utc)
             out[ccy] = {
                 "momentum": round(math.tanh(delta), 3),   # +-1 pt de taux ~ +-0.76
                 "libelle": libelle,
@@ -277,28 +264,51 @@ class NewsFeed:
                 "date": dernier["date"],
                 "age_jours": (datetime.now(timezone.utc) - d_last).days,
             }
+        or_ = self._biais_or(lot)
+        if or_:
+            out["XAU"] = or_
         return out
 
-    # ------------------------------------------------------------- FRED (Fed)
+    def _biais_or(self, lot: dict) -> dict:
+        """Biais de l'or : somme ponderee et bornee des trois moteurs de FRED_OR.
+        Rend {} si aucune des trois series n'est lisible (on n'invente pas un neutre)."""
+        import math
+        total, poids_vus, detail, ages = 0.0, 0.0, {}, []
+        for sid, (poids, echelle, libelle) in self.FRED_OR.items():
+            calc = self._delta_90j(lot.get(sid) or [])
+            if calc is None:
+                continue
+            delta, dernier = calc
+            contrib = poids * math.tanh(delta * echelle)
+            total += contrib
+            poids_vus += abs(poids)
+            detail[libelle] = {"variation_90j": round(delta, 3),
+                               "dernier": float(dernier["value"]),
+                               "effet_sur_l_or": round(contrib, 3)}
+            try:
+                d = datetime.fromisoformat(dernier["date"]).replace(tzinfo=timezone.utc)
+                ages.append((datetime.now(timezone.utc) - d).days)
+            except (TypeError, ValueError):
+                pass
+        if not detail:
+            return {}
+        return {"momentum": round(max(-1.0, min(1.0, total / max(poids_vus, 1e-9))), 3),
+                "libelle": "or : taux reels + dollar + inflation anticipee (FRED)",
+                "detail": detail,
+                "age_jours": max(ages) if ages else None}
+
     def _fred(self) -> dict:
-        key = self.cfg.fred_key
-        if not key:
+        """Photo des taux US pour le dossier : directeur, 2 ans, 10 ans."""
+        if not self.cfg.fred_key:
             return {}
         series = {"fed_funds": "DFF", "yield_2y": "DGS2", "yield_10y": "DGS10"}
+        lot = self._fred_lot(list(series.values()))
         out = {}
         for label, sid in series.items():
-            try:
-                r = requests.get(
-                    "https://api.stlouisfed.org/fred/series/observations",
-                    params={"series_id": sid, "api_key": key, "file_type": "json",
-                            "sort_order": "desc", "limit": 10}, timeout=15)
-                obs = [float(o["value"]) for o in r.json().get("observations", [])
-                       if o["value"] not in (".", "")]
-                if obs:
-                    out[label] = {"last": obs[0], "prev": obs[-1],
-                                  "momentum": round(obs[0] - obs[-1], 3)}
-            except Exception as e:
-                log.info("FRED %s indispo: %s", sid, e)
+            obs = [float(o["value"]) for o in (lot.get(sid) or [])[:10]]
+            if obs:
+                out[label] = {"last": obs[0], "prev": obs[-1],
+                              "momentum": round(obs[0] - obs[-1], 3)}
         return out
 
     def fred_series(self, series_id: str, limit: int = 12) -> dict:
@@ -324,24 +334,3 @@ class NewsFeed:
         return {"serie": sid, "dernier": obs[0], "observations": obs,
                 "variation": round(obs[0]["valeur"] - obs[-1]["valeur"], 4),
                 "sur_n_observations": len(obs)}
-
-    # ------------------------------------------------------------- GDELT news
-    def _gdelt(self, ccys: list[str]) -> dict:
-        out = {}
-        for c in ccys:
-            q = GDELT_Q.get(c)
-            if not q:
-                continue
-            try:
-                r = requests.get(
-                    "https://api.gdeltproject.org/api/v2/doc/doc",
-                    params={"query": q, "mode": "ArtList", "maxrecords": 5,
-                            "format": "json", "timespan": "48h",
-                            "sourcelang": "english"}, timeout=15)
-                arts = r.json().get("articles", []) if r.text.strip().startswith("{") else []
-                titles = [a.get("title", "").strip() for a in arts if a.get("title")]
-                if titles:
-                    out[c] = titles[:5]
-            except Exception as e:
-                log.info("GDELT %s indispo: %s", c, e)
-        return out

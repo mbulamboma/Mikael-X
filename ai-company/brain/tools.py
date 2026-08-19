@@ -8,7 +8,7 @@ OBSERVER — il decide LUI-MEME de quoi il a besoin :
   - get_market        : snapshot technique (n'importe quel symbole, n'importe quel TF),
   - get_chart         : chargement du graphique (timeframes et profondeur au choix),
   - compute_indicator : calcul a la demande de l'indicateur qu'il veut (rsi, adx, atr...),
-  - get_news / get_macro_events / search_news : actualite d'un actif, grandes annonces
+  - get_news / get_macro_events : actualite d'un actif, grandes annonces
     macro qui bougent les marches, et recherche libre de titres,
   - web_search / web_read : enquete sur le web (banques centrales, analyses, medias),
   - get_fred_series / get_retail_sentiment : serie macro officielle au choix (FRED) et
@@ -299,7 +299,7 @@ def get_strategies() -> str:
 @tool
 def get_news(symbol: str = "") -> str:
     """Contexte d'ACTUALITE d'un symbole (biais macro par devise, events economiques recents
-    et a venir, taux FRED, titres GDELT a evaluer) + drapeau `blackout` (True = grosse annonce
+    et a venir, taux FRED, titres RSS a evaluer) + drapeau `blackout` (True = grosse annonce
     imminente -> ne pas ouvrir sur ce symbole). Fonctionne pour tout symbole, meme hors
     watchlist (charge a la demande). En swing, aligne-toi sur le biais macro et n'entre
     jamais juste avant une annonce a fort impact."""
@@ -330,19 +330,6 @@ def get_macro_events(hours: int = 72) -> str:
     if p is None:
         return "(evenements macro indisponibles)"
     return json.dumps(p.major_events(max(1, min(int(_f(hours, 72)), 336))),
-                      ensure_ascii=False, default=str)
-
-
-@tool
-def search_news(query: str, hours: int = 48) -> str:
-    """ENQUETER librement sur l'actualite (recherche de titres, 1 a 168h) : geopolitique,
-    banques centrales, matieres premieres, secteur, actif precis... Ex : "ECB rate decision",
-    "gold safe haven", "oil supply OPEC", "US tariffs". Les titres sont bruts : c'est TOI qui
-    juges le sentiment et l'impact probable sur le symbole que tu envisages."""
-    p = _live()
-    if p is None:
-        return "(recherche news indisponible)"
-    return json.dumps(p.news_search(str(query), max(1, min(int(_f(hours, 48)), 168))),
                       ensure_ascii=False, default=str)
 
 
@@ -582,7 +569,7 @@ def plan_trail(ticket: int, atr_mult: float = 2.0, pips: float = 0.0,
 
 ALL_TOOLS = [list_symbols, get_market, get_chart, compute_indicator, get_account,
              get_open_positions, get_postmortem, get_trading_costs,
-             get_strategies, get_news, get_macro_events, search_news,
+             get_strategies, get_news, get_macro_events,
              web_search, web_search_multiple, web_read, web_read_multiple,
              get_retail_sentiment, get_fred_series,
              plan_open, plan_close, plan_modify, plan_trail]

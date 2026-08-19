@@ -164,3 +164,50 @@ def test_calendrier_perime_ne_protege_plus_et_rend_vide(monkeypatch):
     cal.cache_min = 0
     cal.peremption_min = 0                 # cache trop vieux : ce n'est plus une protection
     assert cal._fetch() == []              # -> calendar_ok=False -> log ERROR dans news.py
+
+
+# ------------------------------------------------------------------ biais de l'or
+def _feed_or(lot):
+    """NewsFeed nu dont `_fred_lot` rend des observations fabriquees."""
+    from config import NewsConfig
+    from data.news import NewsFeed
+    f = NewsFeed.__new__(NewsFeed)
+    f.cfg = NewsConfig()
+    f._fred_lot = lambda ids: lot
+    return f
+
+
+def _obs(recent, ancien):
+    """Deux observations espacees de 100 jours (au-dela de la fenetre de 90)."""
+    return [{"date": "2026-08-18", "value": str(recent)},
+            {"date": "2026-05-10", "value": str(ancien)}]
+
+
+def test_taux_reels_qui_montent_pesent_sur_l_or():
+    """LE signe qui compte : l'or suit l'INVERSE des taux reels. Se tromper ici, c'est
+    fabriquer un biais rigoureusement contraire au marche."""
+    f = _feed_or({"DFII10": _obs(2.5, 1.5)})           # +1 pt de taux reel
+    assert f._biais_or({"DFII10": _obs(2.5, 1.5)})["momentum"] < 0
+    assert f._biais_or({"DFII10": _obs(1.5, 2.5)})["momentum"] > 0   # taux reels en baisse
+
+
+def test_dollar_et_inflation_ont_les_bons_signes():
+    f = _feed_or({})
+    assert f._biais_or({"DTWEXBGS": _obs(125.0, 115.0)})["momentum"] < 0   # dollar fort
+    assert f._biais_or({"T10YIE": _obs(2.8, 2.0)})["momentum"] > 0         # inflation anticipee
+
+
+def test_le_detail_chiffre_est_citable():
+    """Sans chiffres sourcables, le filtre de preuves du desk neutralise le brief."""
+    f = _feed_or({})
+    d = f._biais_or({"DFII10": _obs(2.5, 1.5)})["detail"]
+    fiche = d["taux reel 10 ans US (TIPS)"]
+    assert fiche["variation_90j"] == 1.0 and fiche["dernier"] == 2.5
+    assert fiche["effet_sur_l_or"] < 0
+
+
+def test_aucune_serie_lisible_nrend_rien():
+    """On n'invente pas un neutre : sans donnee, XAU est absent du biais macro."""
+    f = _feed_or({})
+    assert f._biais_or({}) == {}
+    assert f._biais_or({"DFII10": [{"date": "2026-08-18", "value": "."}]}) == {}

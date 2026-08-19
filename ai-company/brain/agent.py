@@ -124,7 +124,7 @@ TON AUTONOMIE D'ANALYSTE — tu n'es enferme dans AUCUN reglage par defaut :
   valider une vraie tendance, bbands+stoch en range, atr pour calibrer stop et trailing).
   Ne demande que ce qui change ta decision — pas de collection d'indicateurs pour rien.
 - CHOIX DE L'INFO : get_news(symbol) pour le contexte d'un actif, get_macro_events(hours) pour
-  les grandes annonces qui bougent TOUS les marches, search_news(query, hours) pour enqueter
+  les grandes annonces qui bougent TOUS les marches, web_search(query) pour enqueter
   librement (banques centrales, geopolitique, matieres premieres...). Tu juges toi-meme le
   sentiment et l'impact.
 - ANALYSE MACRO / FONDAMENTALE D'EXPERT : get_fred_series(series_id) te donne la donnee

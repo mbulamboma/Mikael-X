@@ -497,3 +497,44 @@ garder ce qui a deja ete lu, comme le faisait `max_iterations`. Autre rupture 1.
 effet en production, qui passe par les fonctions privees, mais les tests sont adaptes.
 Verifie en reel sur Nova 2 Lite : appel simple OK, et boucle d'outils complete (l'agent
 appelle l'outil, l'observation revient dans `intermediate_steps`).
+
+**Sources retirees apres mesure (2026-08-19).** Trois API annoncees comme actives ne
+rendaient rien, et le disaient mal :
+
+| Source | Mesure | Verdict |
+|---|---|---|
+| GDELT | HTTP 429 « one request every 5 seconds », ~43 s par cycle, titres en arabe malgre `sourcelang=english`, requetes tirees d'affilee sans cadence ni cache | retiree |
+| Finnhub | 403 sur `/stock/social-sentiment?symbol=XAUUSD` ; `fundamentals()` = `{}` | retiree |
+| EODHD | 403 (palier gratuit = EOD seulement) | retiree |
+
+Le point commun avec le bug du calendrier : un garde `startswith("{")` avalait la reponse
+d'erreur en silence. L'analyste Actualite tournait sur les seuls flux RSS **sans que rien ne
+le signale**, et rendait des briefs neutres qu'on prenait pour de la prudence. Regle qui en
+sort : une source qui echoue doit LE DIRE avec le code HTTP et le debut du corps ; une cle
+qui ne rend rien est pire qu'une source absente, parce qu'elle fait croire la colonne
+couverte. L'outil `search_news` disparait avec GDELT — `web_search` (DuckDuckGo) couvre
+deja l'enquete libre. Reste actif : calendrier web, FRED, RSS, FXSSI, myfxbook.
+Effet mesure : le snapshot news passe de ~45 s a ~25 s (le reste est FRED, 11 series en
+sequence, cache 30 min).
+
+**Biais de l'or (2026-08-19).** L'analyste Fondamental rendait `neutre/0.0` a chaque cycle
+sur XAUUSD, et ce n'etait pas une panne : XAU n'a ni serie de taux directeur ni evenement
+au calendrier, donc son biais macro se reduisait au dollar. Trois series FRED — deja
+payees par la cle existante — portent l'essentiel du cours de l'or :
+
+| Serie | Role | Poids |
+|---|---|---|
+| `DFII10` | taux reel 10 ans (TIPS) | **-0.5** — des taux reels qui montent pesent sur l'or |
+| `DTWEXBGS` | dollar index large | **-0.3** |
+| `T10YIE` | point mort d'inflation 10 ans | **+0.2** — soutient l'or |
+
+Chaque variation sur 90 jours est normalisee (tanh) avec une echelle calee sur l'amplitude
+typique du mouvement, puis ponderee et bornee. Le `detail` chiffre (variation 90 j, derniere
+valeur, effet sur l'or) remonte tel quel dans le dossier : le filtre de preuves du desk
+n'accepte que des valeurs CITABLES, et « momentum -0.295 » n'en est pas une — « taux reel
+10 ans +0.26 pt sur 90 jours » en est une. Quatre tests verrouillent les signes : se tromper
+la produirait un biais rigoureusement contraire au marche.
+
+Au passage, les series FRED sont desormais tirees EN PARALLELE (`_fred_lot`) : 14 series en
+sequence coutaient ~25 s a chaque reconstruction du snapshot, sur le chemin critique d'un
+cycle.

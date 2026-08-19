@@ -248,7 +248,7 @@ class AnalysteSentiment(Analyste):
 
 class AnalysteActualite(Analyste):
     role, title = "actualite", "ACTUALITE MONDIALE"
-    outils = tuple(_outils("get_news", "search_news", "get_macro_events"))
+    outils = tuple(_outils("get_news", "get_macro_events"))
     mission = ("reperer ce qui, dans l'actualite et la geopolitique, peut deplacer ce "
                "symbole a l'echelle de quelques jours : annonces a fort impact, decisions "
                "de banques centrales, tensions, flux de refuge. Distingue le BRUIT "
@@ -262,7 +262,7 @@ class AnalysteActualite(Analyste):
              "blackout": bo.get(symbol), "evenements_a_venir": commun.get("evenements")}
         if live is not None and not d["news_du_symbole"]:
             d["recherche"] = _safe(lambda: live.news_search(symbol, 48), "recherche news")
-        # sources pluggables : titres RSS/Finnhub/EODHD, en plus du calendrier et de GDELT.
+        # sources pluggables : titres RSS, en plus du calendrier economique.
         if live is not None and self.cfg.sources.inject_news:
             extra = _safe(lambda: live.news_extra(symbol, 6), "news supplementaires")
             if extra:
