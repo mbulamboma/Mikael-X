@@ -287,3 +287,66 @@ def test_analystes_desactivables(monkeypatch):
     assert len(actions) == 1                       # le desk fonctionne toujours sans eux
     assert "technique" not in cap.prompts
     assert "briefs" not in actions[0]["dossier"]
+
+
+# ------------------------------------------------------ preuves : nombres a 4 chiffres
+def test_un_niveau_de_lor_compte_comme_preuve():
+    """REGRESSION. La regex des nombres plafonnait la partie entiere a 3 chiffres :
+    « 4402.35 » se decoupait en « 440 » + « 2.35 », « 2451 » en « 245 » + « 1 ». Invisible
+    sur EURUSD (1.0850), devastateur sur l'OR : aucun niveau cite par l'analyste technique
+    ne pouvait etre reconnu, donc TOUS ses points partaient comme « sans preuve » et son
+    brief etait neutralise. Le desk s'abstenait ensuite, faute d'analyse."""
+    from desk import preuves as P
+    f = P.faits({"prix": 4402.35, "donchian_haut": 4451.0, "atr_D1": 38.7})
+    assert P.sourcee("Le prix 4402.35 reste sous le Donchian 4451", f)
+    assert P.sourcee("Resistance 4,402.35 (notation anglaise)", f)
+    assert P.sourcee("ATR journalier a 38.7", f)
+
+
+def test_les_deux_notations_de_la_virgule_sont_acceptees():
+    """« 1,085 » vaut 1085 en anglais et 1.085 en francais. Le filtre accepte si l'UNE des
+    lectures existe : une citation fortuite coute moins cher qu'un analyste bailonne."""
+    from desk import preuves as P
+    assert P.sourcee("niveau 1,085", P.faits({"prix": 1085.0}))
+    assert P.sourcee("niveau 1,085", P.faits({"prix": 1.085}))
+
+
+def test_le_filtre_rejette_toujours_le_vague_et_l_invente():
+    """Le correctif ne doit pas ouvrir la porte : sans chiffre du dossier, rien ne passe."""
+    from desk import preuves as P
+    f = P.faits({"prix": 4402.35})
+    assert not P.sourcee("la structure semble haussiere", f)
+    assert not P.sourcee("objectif vers 5000", f)      # absent du dossier
+    assert not P.sourcee("environ 3 zones de liquidite", f)   # nombre trop banal
+
+
+# ------------------------------------------------ preuves : citation textuelle verbatim
+def _faits_titres():
+    from desk import preuves as P
+    return P.faits({"news_sources": [
+        {"title": "Gold prices rise as weaker dollar, softer US data boost rate-cut hopes"},
+        {"title": "Fed officials signal caution on further easing"}]})
+
+
+def test_un_analyste_peut_sourcer_en_recopiant_un_titre():
+    """L'ACTUALITE travaille sur des titres, pas des nombres. Exiger un chiffre la
+    neutralisait a chaque cycle quel que soit son travail : le filtre ne mesurait plus
+    sa rigueur, il mesurait la nature de sa matiere."""
+    from desk import preuves as P
+    p = "Un titre note que gold prices rise as weaker dollar, softer US data boost rate-cut hopes"
+    assert P.sourcee(p, _faits_titres(), texte_ok=True)
+
+
+def test_la_citation_textuelle_ne_couvre_ni_la_paraphrase_ni_l_invention():
+    from desk import preuves as P
+    f = _faits_titres()
+    assert not P.sourcee("Le contexte macro semble porteur pour les metaux precieux", f, texte_ok=True)
+    assert not P.sourcee("Les banques centrales achetent massivement de l or", f, texte_ok=True)
+
+
+def test_le_trader_reste_tenu_au_chiffre():
+    """Deux niveaux d'exigence, et c'est deliberé : recopier une phrase justifie une
+    ANALYSE, jamais une prise de position. Ceux qui engagent le risque citent un nombre."""
+    from desk import preuves as P
+    p = "Un titre note que gold prices rise as weaker dollar, softer US data boost rate-cut hopes"
+    assert not P.sourcee(p, _faits_titres())          # defaut = chiffres seulement

@@ -38,7 +38,9 @@ TOLERANCE = 0.01
 
 #: un nombre « banal » ne prouve rien : il se retrouve dans n'importe quel dossier. On
 #: n'accepte comme citation qu'un nombre PRECIS : soit decimal, soit >= 10.
-_NOMBRE = re.compile(r"[-+]?\d{1,3}(?:[   ]?\d{3})*(?:[.,]\d+)?")
+_NOMBRE = re.compile(
+    r"[-+]?\d{1,3}(?:[  ,]\d{3})+(?:\.\d+)?"      # 4,402.35 | 1 234 567
+    r"|[-+]?\d+(?:[.,]\d+)?")                          # 4402.35 | 1,085 | 2451
 _DATE_ISO = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 #: cles du dossier qui ne sont PAS des observations de marche : les citer ne prouve rien
@@ -83,9 +85,7 @@ def _collecte(obj: Any, valeurs: list[float], morceaux: list[str], profondeur: i
         morceaux.append(obj)
         # un dossier serialise contient des nombres dans des chaines ("1.0850", "62.4%")
         for m in _NOMBRE.finditer(obj):
-            v = _valeur(m.group(0))
-            if v is not None:
-                valeurs.append(v)
+            valeurs.extend(_valeurs(m.group(0)))
         return
     if isinstance(obj, dict):
         for cle, val in obj.items():
@@ -112,15 +112,47 @@ def faits(*dossiers: Any) -> Faits:
     return Faits(valeurs, " ".join(morceaux))
 
 
-def _valeur(token: str) -> float | None:
-    t = token.replace(" ", "").replace(" ", "").replace(",", ".")
-    # "1.085.50" (separateur de milliers) : on ne devine pas, on jette
-    if t.count(".") > 1:
-        return None
-    try:
-        return float(t)
-    except ValueError:
-        return None
+def _valeurs(token: str) -> list[float]:
+    """Lectures POSSIBLES d'un jeton, car « 1,085 » est ambigu : 1085 en notation
+    anglaise, 1.085 en notation francaise. Le filtre tranche en acceptant la citation
+    si l'UNE des lectures existe dans le dossier — se tromper en acceptant coute une
+    citation fortuite ; se tromper en rejetant fait taire un analyste qui avait raison.
+    """
+    t = token.replace(" ", "").replace(" ", "")
+    if not t or t in ("+", "-"):
+        return []
+    virgule, point = "," in t, "." in t
+    out: list[float] = []
+
+    def _f(x: str):
+        try:
+            out.append(float(x))
+        except ValueError:
+            pass
+
+    if virgule and point:
+        # le SEPARATEUR DECIMAL est le dernier des deux ; l'autre groupe les milliers
+        if t.rfind(",") > t.rfind("."):
+            _f(t.replace(".", "").replace(",", "."))
+        else:
+            _f(t.replace(",", ""))
+    elif virgule:
+        _f(t.replace(",", ""))                      # anglais : 4,402 -> 4402
+        if t.count(",") == 1:
+            _f(t.replace(",", "."))                 # francais : 1,085 -> 1.085
+    elif point:
+        _f(t)                                       # decimal
+        if t.count(".") == 1 and len(t.split(".")[1]) == 3:
+            _f(t.replace(".", ""))                  # 4.402 pourrait etre 4402
+    else:
+        _f(t)
+    # dedoublonne en gardant l'ordre
+    vues, uniques = set(), []
+    for v in out:
+        if v not in vues:
+            vues.add(v)
+            uniques.append(v)
+    return uniques
 
 
 def _precis(token: str, valeur: float) -> bool:
@@ -140,10 +172,7 @@ def citations(texte: str, f: Faits) -> list[str]:
             trouvees.append(m.group(0))
     for m in _NOMBRE.finditer(texte):
         token = m.group(0)
-        v = _valeur(token)
-        if v is None or not _precis(token, v):
-            continue
-        if f.contient(v):
+        if any(_precis(token, v) and f.contient(v) for v in _valeurs(token)):
             trouvees.append(token)
     # dedoublonne en gardant l'ordre
     vues, out = set(), []
@@ -154,15 +183,52 @@ def citations(texte: str, f: Faits) -> list[str]:
     return out
 
 
-def sourcee(texte: str, f: Faits, minimum: int = 1) -> bool:
-    """L'affirmation cite-t-elle au moins `minimum` donnee(s) du dossier ?"""
-    return len(citations(texte, f)) >= max(1, minimum)
+#: nombre de mots consecutifs qu'une affirmation doit reprendre TELS QUELS du dossier
+#: pour valoir citation textuelle. Six mots ne s'inventent pas : c'est un acte de copie.
+_MOTS_VERBATIM = 6
 
 
-def filtrer(items: Iterable[str], f: Faits) -> tuple[list[str], list[str]]:
+def _normalise(texte: str) -> str:
+    return " ".join((texte or "").lower().split())
+
+
+def citation_texte(texte: str, f: Faits) -> str:
+    """Le plus long extrait du texte repris VERBATIM du dossier, "" si aucun.
+
+    Certains analystes n'ont pas de chiffres a citer : l'analyste ACTUALITE travaille sur
+    des titres, l'analyste SENTIMENT sur des formulations. Leur imposer un nombre les
+    condamnait a etre neutralises a CHAQUE cycle, quel que soit leur travail — le filtre
+    ne mesurait plus leur rigueur, il mesurait la nature de leur matiere. Reprendre six
+    mots consecutifs du dossier reste un acte de sourcage verifiable, et cela n'ouvre
+    aucune porte a l'invention."""
+    if not texte or not (f.texte or ""):
+        return ""
+    aiguille, meule = _normalise(texte), _normalise(f.texte)
+    mots = aiguille.split()
+    for taille in range(len(mots), _MOTS_VERBATIM - 1, -1):
+        for i in range(len(mots) - taille + 1):
+            extrait = " ".join(mots[i:i + taille])
+            if extrait in meule:
+                return extrait
+    return ""
+
+
+def sourcee(texte: str, f: Faits, minimum: int = 1, texte_ok: bool = False) -> bool:
+    """L'affirmation cite-t-elle au moins `minimum` donnee(s) du dossier ?
+
+    `texte_ok` autorise EN PLUS la citation verbatim (voir `citation_texte`). Il est
+    reserve aux analystes : le Trader et le juge, eux, engagent le risque et restent
+    tenus au chiffre — une phrase recopiee ne justifie pas d'ouvrir une position."""
+    if len(citations(texte, f)) >= max(1, minimum):
+        return True
+    return bool(texte_ok and minimum == 1 and citation_texte(texte, f))
+
+
+def filtrer(items: Iterable[str], f: Faits,
+            texte_ok: bool = False) -> tuple[list[str], list[str]]:
     """(sourcees, speculations) — l'ordre d'origine est conserve dans chaque liste."""
     gardees, rejetees = [], []
     for item in items or []:
         texte = str(item)
-        (gardees if sourcee(texte, f) else rejetees).append(texte)
+        (gardees if sourcee(texte, f, texte_ok=texte_ok) else rejetees).append(texte)
     return gardees, rejetees

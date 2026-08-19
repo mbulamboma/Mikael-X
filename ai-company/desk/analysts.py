@@ -169,7 +169,11 @@ class Analyste(DeskAgent):
                   if isinstance(p, (str, int, float))][:5]
         ecartes: list[str] = []
         if dossier is not None and self.cfg.desk.exiger_preuves:
-            points, ecartes = P.filtrer(points, P.faits(dossier, *extra_sources))
+            # texte_ok : l'ACTUALITE et le SENTIMENT travaillent sur des titres et des
+            # formulations, pas sur des nombres. Exiger un chiffre les neutralisait a
+            # chaque cycle quelle que soit la qualite de leur travail.
+            points, ecartes = P.filtrer(points, P.faits(dossier, *extra_sources),
+                                        texte_ok=True)
             if not points:
                 biais, confiance = "neutre", 0.0
         brief = {"analyste": self.title, "biais": biais, "confiance": round(confiance, 2),

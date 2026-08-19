@@ -538,3 +538,29 @@ la produirait un biais rigoureusement contraire au marche.
 Au passage, les series FRED sont desormais tirees EN PARALLELE (`_fred_lot`) : 14 series en
 sequence coutaient ~25 s a chaque reconstruction du snapshot, sur le chemin critique d'un
 cycle.
+
+**Pourquoi les analystes ne faisaient pas leur travail (2026-08-19).** Les logs montraient
+« N affirmation(s) sans preuve ecartee(s) — brief neutralise » a chaque cycle. Ce n'etait
+ni le modele ni le prompt : c'etait le filtre `desk/preuves.py`, pour deux raisons
+independantes.
+
+1. **La regex des nombres plafonnait la partie entiere a trois chiffres.** `4402.35` se
+   decoupait en `440` + `2.35`, `2451` en `245` + `1`. Aucun de ces morceaux ne
+   correspondait au dossier, donc toute citation etait rejetee. Invisible sur EURUSD
+   (`1.0850` passe), devastateur sur l'OR qui cote au-dessus de 4000 : l'analyste
+   TECHNIQUE ne pouvait citer aucun niveau. La regex a deux branches (milliers groupes /
+   nombre simple) et `_valeurs()` rend les lectures possibles d'un jeton ambigu — « 1,085 »
+   vaut 1085 en anglais et 1.085 en francais, on accepte si l'une des deux existe dans le
+   dossier : une citation fortuite coute moins cher qu'un analyste baillonne.
+
+2. **Un analyste sans chiffres ne pouvait rien sourcer.** L'ACTUALITE travaille sur des
+   titres, le SENTIMENT sur des formulations. Exiger un nombre les neutralisait a chaque
+   cycle quelle que soit la qualite de leur travail : le filtre ne mesurait plus leur
+   rigueur, il mesurait la nature de leur matiere. `citation_texte()` accepte desormais
+   une reprise VERBATIM d'au moins six mots consecutifs du dossier — un acte de copie
+   verifiable, qui ne couvre ni la paraphrase ni l'invention.
+
+Le second point est **opt-in et reserve aux analystes** (`texte_ok=True`). Le Trader, le
+juge et les ouvertures restent tenus au chiffre : recopier une phrase justifie une analyse,
+jamais une prise de position. La regle de securite est intacte — une affirmation non
+sourcee ne peut jamais augmenter le risque.
