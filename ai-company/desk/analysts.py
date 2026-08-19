@@ -334,4 +334,15 @@ class Analystes:
                 out[symbol] = briefs
                 log.info("Briefs %s: %s", symbol,
                          {r: f"{b['biais']}/{b['confiance']}" for r, b in briefs.items()})
+                # DETAIL de chaque analyse dans les logs — surtout le TECHNIQUE (niveaux,
+                # RSI, ATR, structure) : le resume seul biais/confiance ne montrait pas le
+                # travail. On imprime le resume et les points cles cites.
+                for role, b in briefs.items():
+                    resume = str(b.get("resume") or "").strip()
+                    points = [str(p) for p in (b.get("points_cles") or [])][:4]
+                    if resume or points:
+                        detail = " | ".join(points) if points else ""
+                        log.info("  %-11s [%s/%.2f] %s%s", role.upper(), b["biais"],
+                                 b["confiance"], resume[:280],
+                                 ("  << " + detail if detail else ""))
         return out

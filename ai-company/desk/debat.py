@@ -244,6 +244,13 @@ class Debat:
                 continue
             out[symbol] = resultat
             v = resultat["verdict"]
+            # thèses des deux camps AVANT le verdict : on veut voir sur quoi Bull et Bear
+            # tranchent, pas seulement la conclusion du juge.
+            bull, bear = resultat["bull"], resultat["bear"]
+            log.info("  BULL [%.2f] %s", bull["conviction"],
+                     str(bull.get("these") or "").strip()[:220])
+            log.info("  BEAR [%.2f] %s", bear["conviction"],
+                     str(bear.get("these") or "").strip()[:220])
             log.info("Debat %s: %s (conviction %.2f, %d tour(s)) | %s", symbol,
                      v["direction"], v["conviction"], resultat["tours"], v["plan"][:160])
         return out
