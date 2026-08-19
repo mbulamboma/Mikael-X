@@ -34,16 +34,32 @@ except Exception as exc:  # pragma: no cover - dependance optionnelle
     _LC_ERR = exc
 
 try:  # outils optionnels : seuls les analystes tool-capables s'en servent (cf. run_tools)
-    from langchain.agents import AgentExecutor, create_tool_calling_agent
-    from langchain_core.prompts import ChatPromptTemplate
+    # LangChain 1.x : `create_agent` (graphe langgraph) remplace AgentExecutor +
+    # create_tool_calling_agent, supprimes de langchain.agents.
+    from langchain.agents import create_agent
+    from langgraph.errors import GraphRecursionError
     _TOOLS_OK = True
 except Exception:  # pragma: no cover - dependance optionnelle
-    AgentExecutor = create_tool_calling_agent = ChatPromptTemplate = None
+    create_agent = None
+    GraphRecursionError = ()
     _TOOLS_OK = False
 
 from config import AgentConfig
 
 log = logging.getLogger("desk")
+
+
+def _texte_final(messages: list) -> str:
+    """Dernier message d'assistant non vide d'un graphe `create_agent`. '' si aucun."""
+    for m in reversed(messages or []):
+        if getattr(m, "type", "") != "ai":
+            continue
+        c = getattr(m, "content", "")
+        if isinstance(c, list):        # contenu en blocs : on ne garde que le texte
+            c = "".join(b.get("text", "") for b in c if isinstance(b, dict))
+        if isinstance(c, str) and c.strip():
+            return c
+    return ""
 
 
 class DeskUnavailable(RuntimeError):
@@ -174,24 +190,27 @@ class DeskAgent:
         if not self.tools_available():
             raise DeskUnavailable(f"{self.title}: outils indisponibles (modele/dependance).")
         client = _client(self.cfg, self.model_id, self.temperature, self.max_tokens)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "{system}"),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
         t0 = time.perf_counter()
         try:
-            agent = create_tool_calling_agent(client, tools, prompt)
-            executor = AgentExecutor(agent=agent, tools=tools, max_iterations=int(max_iter),
-                                     verbose=False, handle_parsing_errors=True,
-                                     return_intermediate_steps=return_steps)
-            result = executor.invoke({"system": system, "input": human})
-            out = result.get("output") if isinstance(result, dict) else str(result)
-            out = out if isinstance(out, str) else str(out)
+            agent = create_agent(model=client, tools=tools, system_prompt=system)
+            # Un tour = appel du modele + execution de l'outil (2 noeuds du graphe) ;
+            # +2 pour l'entree et la reponse finale.
+            config = {"recursion_limit": 2 * int(max_iter) + 2}
+            etat: dict = {}
+            try:
+                for etape in agent.stream({"messages": [("user", human)]}, config=config,
+                                          stream_mode="values"):
+                    etat = etape
+            except GraphRecursionError:
+                # budget d'outils epuise : on garde ce qui a ete lu plutot que de tout perdre
+                # (l'ancien AgentExecutor s'arretait de meme a `max_iterations`).
+                log.info("%s: budget d'outils atteint (%s tours).", self.title, max_iter)
+            messages = etat.get("messages") or []
+            out = _texte_final(messages)
             # observations des outils : ce que l'agent a REELLEMENT lu (pour que le filtre de
             # preuves reconnaisse comme sourcees les valeurs qu'il vient de chercher).
-            obs = [str(o) for _, o in (result.get("intermediate_steps") or [])] \
-                if isinstance(result, dict) else []
+            obs = [str(getattr(m, "content", "")) for m in messages
+                   if getattr(m, "type", "") == "tool"]
         except Exception as exc:
             trace.record(self.role, self.title, self.model_id, system, human,
                          (time.perf_counter() - t0) * 1000, error=f"tools: {exc}")

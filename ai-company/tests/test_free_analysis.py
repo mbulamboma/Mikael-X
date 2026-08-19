@@ -15,6 +15,13 @@ from data import chart, indicators
 from brain import tools as T
 
 
+def appel(outil, **kw):
+    """Appelle un outil LangChain. Depuis LangChain 1.x un `@tool` est un StructuredTool
+    qui n'est plus directement appelable : il faut passer par `.invoke({...})`. Le code de
+    production, lui, appelle les fonctions privees (`_plan_open`...), pas les outils."""
+    return outil.invoke(kw)
+
+
 def _df(n: int = 300, seed: int = 7) -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     close = 1.10 + np.cumsum(rng.normal(0.0002, 0.002, n))
@@ -114,26 +121,26 @@ def test_outils_libres_utilisent_le_provider_live():
     T.bind_context({}, {}, {}, [], "", {})
     T.bind_live(p)
 
-    univers = json.loads(T.list_symbols(query="AUD"))
+    univers = json.loads(appel(T.list_symbols, query="AUD"))
     assert univers["symboles"][0]["symbol"] == "AUDNZD"
 
     # symbole hors watchlist -> charge a la demande
-    snap = json.loads(T.get_market(symbol="AUDNZD", timeframe="H4"))
+    snap = json.loads(appel(T.get_market, symbol="AUDNZD", timeframe="H4"))
     assert snap["symbol"] == "AUDNZD"
 
-    ch = json.loads(T.get_chart(symbol="AUDNZD", timeframes="D1,H4,H1", candles=6))
+    ch = json.loads(appel(T.get_chart, symbol="AUDNZD", timeframes="D1,H4,H1", candles=6))
     assert ch["timeframe_principal"] == "H4" and len(ch["last_candles"]) == 6
     # sans timeframes -> profil par defaut du bot (l'orchestrateur tranche)
-    assert json.loads(T.get_chart(symbol="AUDNZD"))["timeframe_principal"] == "D1"
+    assert json.loads(appel(T.get_chart, symbol="AUDNZD"))["timeframe_principal"] == "D1"
     assert p.calls[-1][2] == ()
 
-    ind = json.loads(T.compute_indicator(symbol="AUDNZD", indicator="adx",
+    ind = json.loads(appel(T.compute_indicator, symbol="AUDNZD", indicator="adx",
                                          timeframe="H4", period=14))
     assert ind["indicator"] == "adx" and ind["timeframe"] == "H4"
 
-    assert "RBA" in T.search_news(query="RBA decision", hours=24)
-    assert "CPI" in T.get_macro_events(hours=48)
-    assert "AUD" in T.get_news(symbol="AUDNZD")
+    assert "RBA" in appel(T.search_news, query="RBA decision", hours=24)
+    assert "CPI" in appel(T.get_macro_events, hours=48)
+    assert "AUD" in appel(T.get_news, symbol="AUDNZD")
 
     kinds = [c[0] for c in p.calls]
     assert kinds == ["symbols", "market", "chart", "chart", "indicator", "news_search",
@@ -143,10 +150,10 @@ def test_outils_libres_utilisent_le_provider_live():
 def test_outils_degradent_sans_provider():
     T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, {}, [], "", {})
     T.bind_live(None)
-    assert "error" in json.loads(T.list_symbols())
-    assert json.loads(T.get_market(symbol="EURUSD"))["symbol"] == "EURUSD"   # cache du cycle
-    assert "error" in json.loads(T.get_chart(symbol="AUDNZD"))
-    assert "indisponible" in T.search_news(query="gold")
+    assert "error" in json.loads(appel(T.list_symbols))
+    assert json.loads(appel(T.get_market, symbol="EURUSD"))["symbol"] == "EURUSD"   # cache du cycle
+    assert "error" in json.loads(appel(T.get_chart, symbol="AUDNZD"))
+    assert "indisponible" in appel(T.search_news, query="gold")
 
 
 def test_news_construit_a_la_demande_un_symbole_hors_watchlist():
@@ -310,20 +317,20 @@ def test_outils_web_passent_par_le_provider():
     p = P()
     T.bind_context({}, {}, {}, [], "", {})
     T.bind_live(p)
-    assert "FOMC minutes" in T.web_search(query="FOMC minutes", limit=3)
-    assert "maintient" in T.web_read(url="https://fed.gov/x")
-    assert "EURUSD" in T.get_retail_sentiment(symbol="EURUSD")
-    assert "3.1" in T.get_fred_series(series_id="CPIAUCSL")
+    assert "FOMC minutes" in appel(T.web_search, query="FOMC minutes", limit=3)
+    assert "maintient" in appel(T.web_read, url="https://fed.gov/x")
+    assert "EURUSD" in appel(T.get_retail_sentiment, symbol="EURUSD")
+    assert "3.1" in appel(T.get_fred_series, series_id="CPIAUCSL")
     assert [c[0] for c in p.calls] == ["search", "read", "sentiment", "fred"]
 
     T.bind_live(None)
-    assert "indisponible" in T.web_search(query="x")
-    assert "indisponible" in T.web_read(url="https://fed.gov")
-    assert "indisponible" in T.get_fred_series(series_id="UNRATE")
+    assert "indisponible" in appel(T.web_search, query="x")
+    assert "indisponible" in appel(T.web_read, url="https://fed.gov")
+    assert "indisponible" in appel(T.get_fred_series, series_id="UNRATE")
 
 
 def test_plan_trail_porte_le_timeframe_choisi():
     T.bind_context({}, {}, {}, [], "", {})
-    T.plan_trail(ticket=11, atr_mult=2.5, activate_r=1.0, timeframe="h4")
+    appel(T.plan_trail, ticket=11, atr_mult=2.5, activate_r=1.0, timeframe="h4")
     a = T.pop_actions()[0]
     assert a["type"] == "trail" and a["atr_mult"] == 2.5 and a["timeframe"] == "H4"

@@ -17,15 +17,14 @@ import logging
 import re
 
 try:
-    from langchain.agents import AgentExecutor, create_tool_calling_agent
+    # LangChain 1.x : `create_agent` (graphe langgraph) remplace AgentExecutor +
+    # create_tool_calling_agent, supprimes de langchain.agents.
+    from langchain.agents import create_agent
     from langchain_aws import ChatBedrockConverse
-    from langchain_core.prompts import ChatPromptTemplate
     _LANGCHAIN_OK = True
 except Exception as exc:  # pragma: no cover - optional dependency fallback
-    AgentExecutor = None
-    create_tool_calling_agent = None
+    create_agent = None
     ChatBedrockConverse = None
-    ChatPromptTemplate = None
     _LANGCHAIN_OK = False
     _LANGCHAIN_ERROR = exc
 
@@ -273,7 +272,11 @@ class TraderAgent:
             log.info("Analyse: %s", str(plan["analyse"])[:400])
         return T.apply_plan(plan)
 
-    def _executor(self) -> AgentExecutor | None:
+    def _executor(self):
+        """Graphe d'agent tool-calling (LangChain 1.x). None si la dependance manque.
+
+        Le prompt systeme passe en DONNEE (`system_prompt=`) et non comme gabarit : il
+        contient des accolades (playbooks, exemples JSON) qu'un template interpreterait."""
         if not self.llm or not _LANGCHAIN_OK:
             return None
         f = self.cfg.ftmo
@@ -281,15 +284,7 @@ class TraderAgent:
                                target=f.profit_target_pct, max_daily=f.max_daily_loss_pct,
                                max_total=f.max_total_loss_pct,
                                playbooks=playbooks.as_prompt_block())
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", system),
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}"),
-        ])
-        agent = create_tool_calling_agent(self.llm, T.ALL_TOOLS, prompt)
-        return AgentExecutor(agent=agent, tools=T.ALL_TOOLS,
-                             max_iterations=self.cfg.max_steps,
-                             verbose=False, handle_parsing_errors=True)
+        return create_agent(model=self.llm, tools=T.ALL_TOOLS, system_prompt=system)
 
     def decide(self, account: dict) -> list[dict]:
         """Fait tourner l'agent (gestion du book + recherche d'entrees) et renvoie la
@@ -308,10 +303,14 @@ class TraderAgent:
             if self.mode == "json":
                 actions = self._decide_json(account)
             else:
+                # `max_steps` = nombre d'appels d'outils ; un tour consomme 2 noeuds du
+                # graphe, +2 pour l'entree et la reponse finale.
                 self._executor().invoke(
-                    {"input": "Gere ton portefeuille : revois d'abord tes positions ouvertes "
-                              "(securiser/cloturer/ajuster), puis cherche des opportunites. "
-                              "Emets les actions necessaires."})
+                    {"messages": [("user",
+                                   "Gere ton portefeuille : revois d'abord tes positions ouvertes "
+                                   "(securiser/cloturer/ajuster), puis cherche des opportunites. "
+                                   "Emets les actions necessaires.")]},
+                    config={"recursion_limit": 2 * int(self.cfg.max_steps) + 2})
                 actions = T.pop_actions()
         except Exception as exc:
             if self.mode != "json" and self.cfg.bedrock.tool_mode != "tools":

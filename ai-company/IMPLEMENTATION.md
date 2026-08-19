@@ -435,3 +435,65 @@ seule. Un `systemctl stop` / `docker stop` suffit à arrêter proprement : ne pa
 `kill -9`, qui ne laisse ni le temps d'envoyer les alertes ni de replier le WAL.
 
 ---
+
+## 11. Sortie des dépendances MT5 hors exécution (2026-08-19)
+
+Deux CSV nourrissaient la couche news : `calendar_history.csv` (écrit par un indicateur
+`ExportCalendar.mq5` chargé sur un graphique) et `macro_features.csv` (écrit par un service
+horaire `tools/macro_service.py`, qui traînait `torch` + `transformers` pour FinBERT).
+
+**Pourquoi c'était à jeter.** L'audit du 19/08 a trouvé les deux fichiers périmés — 36 et
+34 jours. Or `_calendar()` préférait le CSV **dès qu'il existait**, sans regarder sa date :
+`calendar_ok` restait à `True`, aucun événement à venir n'était trouvé, et le black-out news
+ne bloquait plus rien **en silence**. Le même jour, le calendrier web voyait 16 événements,
+dont un CPI britannique à fort impact dans les deux heures. Un garde-fou FTMO qui ment sur
+son propre état est pire que pas de garde-fou.
+
+**Ce qui remplace.**
+
+| Avant | Après |
+|---|---|
+| `calendar_history.csv` (indicateur MT5) | `data/calendar_web.py` — flux faireconomy, miroir ForexFactory : **la source de la règle news FTMO** |
+| `macro_features.csv` (service + FinBERT) | `data/macro_web.py` — momentum des taux FRED par devise + surprises, calculé dans le cycle |
+
+`tools/` est supprimé en entier. Plus aucun fichier local dans le chemin de décision : ce
+qui n'existe pas ne peut pas périmer.
+
+**Le biais macro, honnêtement.** Le socle est le **momentum des taux** sur ~90 jours, une
+série FRED par devise (`NewsFeed.FRED_TAUX`) : quotidiennes et fraîches pour USD (DGS2),
+EUR (ECBDFR) et GBP (IUDSOIA) ; mensuelles OCDE pour les cinq autres, avec ~2 mois de
+retard — d'où le champ `age_jours` exposé au LLM et la `fiabilite` qui tombe à « faible »
+au-delà de 45 jours. Le calcul de **surprise** (actual vs forecast, pondéré par
+l'importance, signe inversé pour le chômage) est implémenté et testé mais vaut 0
+aujourd'hui : le flux faireconomy ne publie que `forecast` et `previous`, et les
+calendriers qui donnent l'`actual` sont payants (Finnhub et EODHD répondent 403 sur nos
+clés ; le compte guest de Trading Economics est fermé). Il s'allumera seul le jour où une
+source d'`actual` sera branchée. `data/macro_web.py` reste une **fonction pure** — tout
+l'accès réseau vit dans `news.py` — ce qui rend les 13 tests hors-ligne.
+
+**Sources retirées.** Google Custom Search (`data/web.py` : DuckDuckGo devient le seul
+moteur, plus aucune clé) et Reddit (`data/sources.py` : le sentiment social par lexique sur
+un JSON public était le maillon le moins fiable de la chaîne).
+
+**Modèle.** Bascule sur **Nova 2 Lite** (`us.amazon.nova-2-lite-v1:0`). Piège vérifié :
+`amazon.nova-2-lite-v1:0` sans le préfixe `us.` est refusé par Bedrock
+(`ValidationException`) — c'est un profil d'inférence, pas un modèle. Nova 2 Lite **sait
+appeler des outils** (vérifié : `stopReason=tool_use`), donc `BEDROCK_TOOL_MODE=auto` prend
+la voie tool calling et `DESK_ANALYSTES_OUTILS=1` devient possible — il reste à `0` tant
+que la mesure en mode ombre n'a pas tourné. `us.amazon.nova-pro-v1:0` est disponible sur le
+compte si l'on veut un modèle plus profond pour les rôles lourds (`DESK_MODEL_FORT`) ;
+Nova 2 Pro et Nova Premier ne le sont pas.
+
+**LangChain 1.x (2026-08-19).** Les dependances n'etaient installees sur aucun Python de la
+machine : `ChatBedrockConverse` manquait, donc le desk tombait en degrade -> SafePilot a
+chaque cycle, sans jamais decider. Installation faite — et `pip` sert desormais **LangChain
+1.x**, ou `AgentExecutor` et `create_tool_calling_agent` **n'existent plus**. Comme les deux
+imports etaient sous garde (`_TOOLS_OK`), la voie tool calling se serait desactivee en
+silence : precisement ce que le passage a Nova venait de debloquer. `desk/base.py` et
+`brain/agent.py` sont migres vers `create_agent` (graphe langgraph), le budget d'outils
+passe par `recursion_limit` (2 x max_iter + 2) et `GraphRecursionError` est rattrape pour
+garder ce qui a deja ete lu, comme le faisait `max_iterations`. Autre rupture 1.x : un
+`@tool` est un `StructuredTool` qui ne s'appelle plus directement (`.invoke({...})`) — sans
+effet en production, qui passe par les fonctions privees, mais les tests sont adaptes.
+Verifie en reel sur Nova 2 Lite : appel simple OK, et boucle d'outils complete (l'agent
+appelle l'outil, l'observation revient dans `intermediate_steps`).

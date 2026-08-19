@@ -10,18 +10,25 @@ if str(ROOT) not in sys.path:
 from store import Store
 from brain.memory import Memory
 from brain import tools as T
+
+
+def appel(outil, **kw):
+    """Appelle un outil LangChain. Depuis LangChain 1.x un `@tool` est un StructuredTool
+    qui n'est plus directement appelable : il faut passer par `.invoke({...})`. Le code de
+    production, lui, appelle les fonctions privees (`_plan_open`...), pas les outils."""
+    return outil.invoke(kw)
 from risk.ftmo import FTMOEngine, AccountState, TradeProposal
 
 
 def test_plan_open_rejects_incoherent_and_accepts_valid():
     T.bind_context({}, {}, {}, [], "", {})
     # buy avec sl == entry -> incoherent, ne doit PAS creer d'action
-    T.plan_open(strategy="trend_follow", symbol="EURUSD", direction="buy",
+    appel(T.plan_open, strategy="trend_follow", symbol="EURUSD", direction="buy",
                 entry=1.0, sl=1.0, tp=1.2, confidence=0.8, rationale="")
     assert T.pop_actions() == []
     # setup valide buy (sl < entry < tp) -> une action open
     T.bind_context({}, {}, {}, [], "", {})
-    T.plan_open(strategy="trend_follow", symbol="EURUSD", direction="buy",
+    appel(T.plan_open, strategy="trend_follow", symbol="EURUSD", direction="buy",
                 entry=1.10, sl=1.09, tp=1.13, confidence=0.7, rationale="ok")
     actions = T.pop_actions()
     assert len(actions) == 1 and actions[0]["type"] == "open"
@@ -30,8 +37,8 @@ def test_plan_open_rejects_incoherent_and_accepts_valid():
 
 def test_plan_close_and_modify_collected():
     T.bind_context({}, {}, {}, [], "", {})
-    T.plan_close(ticket=42, fraction=0.5, reason="prise partielle")
-    T.plan_modify(ticket=42, sl=1.10, tp=0.0, reason="break-even")
+    appel(T.plan_close, ticket=42, fraction=0.5, reason="prise partielle")
+    appel(T.plan_modify, ticket=42, sl=1.10, tp=0.0, reason="break-even")
     actions = T.pop_actions()
     kinds = sorted(a["type"] for a in actions)
     assert kinds == ["close", "modify"]
