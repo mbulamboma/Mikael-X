@@ -196,6 +196,10 @@ class NewsConfig:
     mt5_files: str = field(default_factory=lambda: os.environ.get("MT5_FILES", ""))
     fred_key: str = field(default_factory=lambda: _s("FRED_API"))
     use_gdelt: bool = field(default_factory=lambda: os.environ.get("NEWS_GDELT", "1") == "1")
+    # Calendrier WEB (faireconomy/ForexFactory) : remplace l'export MT5 ExportCalendar.mq5.
+    # Meme donnee que la regle news FTMO. Utilise quand aucun calendar_history.csv n'existe.
+    use_web_calendar: bool = field(default_factory=lambda:
+                                   os.environ.get("NEWS_WEB_CALENDAR", "1") == "1")
     # Fenetre "black-out" : pas de NOUVELLE entree si un event a fort impact touche
     # une devise du symbole dans +/- ces minutes (regle FTMO : 60 min avant news).
     blackout_min: int = _i("NEWS_BLACKOUT_MIN", 60)
@@ -265,6 +269,10 @@ class SourcesConfig:
     # Cles API (paliers gratuits) : activent news/social/fondamentaux quand renseignees.
     finnhub_key: str = field(default_factory=lambda: _s("FINNHUB_API_KEY"))
     eodhd_key: str = field(default_factory=lambda: _s("EODHD_API_KEY"))
+    # FXSSI : sentiment retail long/short SANS compte (alternative a myfxbook). Best-effort
+    # (page publique) et fail-closed. Sert de repli quand myfxbook n'est pas configure.
+    fxssi_enabled: bool = field(default_factory=lambda:
+                                os.environ.get("SOURCES_FXSSI", "0") == "1")
     # Fusion des sources dans les dossiers des analystes (Fondamental/Actualite).
     inject_fundamentals: bool = field(default_factory=lambda:
                                       os.environ.get("SOURCES_FUNDAMENTALS", "1") == "1")

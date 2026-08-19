@@ -184,7 +184,15 @@ class Orchestrator:
         return self.web.multiple_read(urls, max_chars)
 
     def retail_sentiment(self, symbol: str = "") -> dict:
-        return self.web.retail_sentiment(symbol)
+        """Sentiment retail : myfxbook (si identifiants) EN PRIORITE, sinon repli FXSSI
+        (sans compte). L'analyste Sentiment garde ainsi un signal de positionnement meme
+        sans MYFXBOOK_EMAIL/PASSWORD."""
+        r = self.web.retail_sentiment(symbol)
+        if r and not r.get("error") and any(v is not None for k, v in r.items()
+                                            if k not in ("symbol", "source", "error")):
+            return r
+        alt = self.sources.retail_sentiment(symbol)
+        return alt or r
 
     # ---- sources pluggables (data/sources.py) : Social / News / Fondamentaux ----
     def social_sentiment(self, symbol: str = "") -> dict:

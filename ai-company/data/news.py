@@ -104,6 +104,12 @@ class NewsFeed:
         self.cfg = cfg
         self.store = store or default_store()
         self.files = _resolve_mt5_files(cfg) if cfg.enabled else None
+        # Calendrier WEB (faireconomy/ForexFactory) : remplace l'export MT5 supprime. Utilise
+        # quand aucun calendar_history.csv n'est present. Meme donnee que la regle news FTMO.
+        self._web_cal = None
+        if cfg.enabled and getattr(cfg, "use_web_calendar", True):
+            from data.calendar_web import WebCalendar
+            self._web_cal = WebCalendar()
         # False des qu'un cycle constate l'absence de calendrier -> le black-out ne
         # protege plus rien (l'orchestrateur peut alors interdire les entrees).
         self.calendar_ok = True
@@ -226,16 +232,22 @@ class NewsFeed:
     def _calendar(self, now: datetime) -> tuple[list, list]:
         recent: list[dict] = []
         upcoming: list[dict] = []
-        if self.files is None:
-            return recent, upcoming
+        # 1) CSV MT5 s'il existe encore (compat) ; 2) sinon calendrier WEB (faireconomy).
         path = self.files / "calendar_history.csv" if self.files else None
         if path is None or not path.exists():
-            # SILENCE = DANGER : sans calendrier, le black-out news est INACTIF et
-            # l'agent croirait etre protege. On le crie fort a chaque cycle.
-            log.error("CALENDRIER ECONOMIQUE ABSENT (%s) — AUCUN BLACK-OUT NEWS ACTIF. "
-                      "Re-exporter ExportCalendar.mq5 vers MQL5\\Files, ou mettre "
-                      "NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.",
-                      path or "dossier MQL5\\Files introuvable")
+            if self._web_cal is not None:
+                r, u = self._web_calendar(now)
+                # le web fait autorite seulement s'il a REELLEMENT rendu des evenements :
+                # une source vide ne doit pas faire croire a une protection active.
+                self.calendar_ok = bool(r or u)
+                if not self.calendar_ok:
+                    log.error("CALENDRIER WEB VIDE — AUCUN BLACK-OUT NEWS ACTIF ce cycle. "
+                              "Mettre NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.")
+                return r, u
+            # ni CSV ni calendrier web : danger, on le crie fort.
+            log.error("CALENDRIER ECONOMIQUE ABSENT — AUCUN BLACK-OUT NEWS ACTIF. "
+                      "Activer le calendrier web (NEWS_WEB_CALENDAR=1) ou mettre "
+                      "NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.")
             self.calendar_ok = False
             return recent, upcoming
         self.calendar_ok = True
@@ -282,6 +294,15 @@ class NewsFeed:
         recent.sort(key=lambda e: e["when"], reverse=True)
         upcoming.sort(key=lambda e: e["hours_until"])
         return recent, upcoming
+
+    def _web_calendar(self, now: datetime) -> tuple[list, list]:
+        """Calendrier web (faireconomy), meme sortie que le CSV. Fail-closed : ([],[]) si panne."""
+        try:
+            return self._web_cal.events(now, self.cfg.recent_hours,
+                                        self.cfg.upcoming_hours, self.cfg.min_importance)
+        except Exception as e:                    # une source web ne doit jamais casser un cycle
+            log.warning("calendrier web indisponible (%s).", e)
+            return [], []
 
     # ------------------------------------------------------------- brain macro
     def _macro_features(self) -> dict:

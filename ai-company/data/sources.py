@@ -271,6 +271,49 @@ class EODHDSource(Source):
         return out
 
 
+# --------------------------------------------------------------------------- FXSSI (libre)
+class FXSSISource(Source):
+    """SENTIMENT RETAIL positionnel (long/short %) — l'alternative a myfxbook, SANS compte.
+
+    myfxbook exige des identifiants ; Dukascopy et la page myfxbook publique repondent 403.
+    FXSSI expose le ratio acheteurs/vendeurs par symbole sur une page publique (dont XAUUSD).
+    On extrait le SEUL chiffre utile (part longue) par un regex cible sur le symbole — pas de
+    scrap massif. Best-effort et FAIL-CLOSED : si la page change ou tombe, on rend {}.
+
+    C'est un signal de POSITIONNEMENT (usage contrarien), pas une opinion : exactement ce que
+    l'analyste Sentiment attend en `sentiment_retail`."""
+    name = "fxssi"
+    URL = "https://fxssi.com/tools/current-ratio"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.cfg, "fxssi_enabled", False))
+
+    def retail_sentiment(self, symbol: str) -> dict:
+        if not self.enabled:
+            return {}
+        sym = (symbol or "").upper()
+        try:
+            html = self._get(self.URL)
+        except Exception as e:
+            log.info("fxssi indisponible (%s).", e)
+            return {}
+        # <div class="symbol">XAUUSD</div> ... <div class="ratio-bar-left" ... width: 65%
+        import re
+        m = re.search(r'class="symbol">\s*' + re.escape(sym) +
+                      r'\s*</div>.*?ratio-bar-left"[^>]*width:\s*(\d+(?:\.\d+)?)%',
+                      html, re.S)
+        if not m:
+            return {}
+        longs = float(m.group(1))
+        shorts = round(100.0 - longs, 1)
+        return {"symbol": sym, "long_pct": round(longs, 1), "short_pct": shorts,
+                # biais net contrarien : quand la foule est massivement longue, le risque est
+                # du cote long. On expose le chiffre, l'analyste (contrarien) l'interprete.
+                "foule_nette": round((longs - shorts) / 100.0, 2),
+                "source": "fxssi (retail, best-effort)"}
+
+
 # --------------------------------------------------------------------------- agregateur
 class Sources:
     """Facade : construit les adaptateurs actifs et fusionne leurs sorties par categorie.
@@ -281,10 +324,11 @@ class Sources:
         self._social = [RedditSource(cfg), FinnhubSource(cfg)]
         self._news = [RSSNewsSource(cfg), FinnhubSource(cfg), EODHDSource(cfg)]
         self._fond = [FinnhubSource(cfg)]
+        self._retail = [FXSSISource(cfg)]
 
     def actives(self) -> list[str]:
         vus, out = set(), []
-        for s in self._social + self._news + self._fond:
+        for s in self._social + self._news + self._fond + self._retail:
             if s.enabled and s.name not in vus:
                 vus.add(s.name)
                 out.append(s.name)
@@ -320,6 +364,18 @@ class Sources:
                     return f
             except Exception as e:
                 log.info("%s fondamentaux en echec (%s).", s.name, e)
+        return {}
+
+    def retail_sentiment(self, symbol: str) -> dict:
+        """Positionnement retail long/short (FXSSI) — alternative a myfxbook, sans compte.
+        {} si aucune source active ou si le symbole est absent (fail-closed)."""
+        for s in self._retail:
+            try:
+                r = s.retail_sentiment(symbol)
+                if r:
+                    return r
+            except Exception as e:
+                log.info("%s retail en echec (%s).", s.name, e)
         return {}
 
 
