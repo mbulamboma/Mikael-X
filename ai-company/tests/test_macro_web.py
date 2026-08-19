@@ -113,3 +113,54 @@ def test_donnees_pourries_ne_levent_jamais():
     assert macro_bias([{"currency": "EUR"}], {}, NOW) == {}
     assert macro_bias([{"currency": "EUR", "actual": "x", "forecast": None,
                         "when": "pas une date"}], {}, NOW) == {}
+
+
+# ------------------------------------------------------------------ calendrier : cache & 429
+class _Reponse:
+    """Reponse HTTP minimale (le vrai flux repond du HTML en 429)."""
+    def __init__(self, text, status=200, ctype="application/json"):
+        self.text, self.status_code, self.headers = text, status, {"Content-Type": ctype}
+
+    def json(self):
+        import json as _j
+        return _j.loads(self.text)
+
+
+def _calendrier(monkeypatch, reponses):
+    """WebCalendar dont chaque appel HTTP consomme la reponse suivante de `reponses`."""
+    from data import calendar_web as C
+    appels = {"n": 0}
+
+    def faux_get(url, **kw):
+        r = reponses[min(appels["n"], len(reponses) - 1)]
+        appels["n"] += 1
+        return r
+    monkeypatch.setattr(C.requests, "get", faux_get)
+    return C.WebCalendar(), appels
+
+
+def test_calendrier_ne_retape_pas_le_flux_dans_la_fenetre_de_cache(monkeypatch):
+    """get_macro_events est un OUTIL : sans cache, les analystes martelent le flux
+    jusqu'au HTTP 429 — et le black-out news tombe pour cause de gourmandise."""
+    payload = '[{"title": "CPI", "country": "USD", "date": "2026-08-19T12:30:00+00:00", "impact": "High"}]'
+    cal, appels = _calendrier(monkeypatch, [_Reponse(payload)])
+    for _ in range(5):
+        cal._fetch()
+    assert appels["n"] == 1
+
+
+def test_calendrier_rejoue_le_cache_sur_429(monkeypatch):
+    payload = '[{"title": "CPI", "country": "USD", "date": "2026-08-19T12:30:00+00:00", "impact": "High"}]'
+    cal, _ = _calendrier(monkeypatch, [_Reponse(payload), _Reponse("<html>429</html>", 429, "text/html")])
+    assert len(cal._fetch()) == 1
+    cal.cache_min = 0                      # force la re-interrogation -> tombe sur le 429
+    assert len(cal._fetch()) == 1          # le dernier bon jeu protege encore
+
+
+def test_calendrier_perime_ne_protege_plus_et_rend_vide(monkeypatch):
+    payload = '[{"title": "CPI", "country": "USD", "date": "2026-08-19T12:30:00+00:00", "impact": "High"}]'
+    cal, _ = _calendrier(monkeypatch, [_Reponse(payload), _Reponse("<html>429</html>", 429, "text/html")])
+    cal._fetch()
+    cal.cache_min = 0
+    cal.peremption_min = 0                 # cache trop vieux : ce n'est plus une protection
+    assert cal._fetch() == []              # -> calendar_ok=False -> log ERROR dans news.py

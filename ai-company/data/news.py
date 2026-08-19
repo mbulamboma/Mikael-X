@@ -63,7 +63,10 @@ class NewsFeed:
         self._web_cal = None
         if cfg.enabled:
             from data.calendar_web import WebCalendar
-            self._web_cal = WebCalendar()
+            # Le TTL du cache calendrier suit NEWS_CACHE_MIN : `get_macro_events`
+            # court-circuite le cache de snapshot et taperait sinon le flux a
+            # chaque appel d'outil (-> HTTP 429 -> black-out muet).
+            self._web_cal = WebCalendar(cache_min=cfg.cache_min)
         # False des qu'un cycle constate l'absence de calendrier -> le black-out ne
         # protege plus rien (l'orchestrateur peut alors interdire les entrees).
         self.calendar_ok = True

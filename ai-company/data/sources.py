@@ -32,9 +32,10 @@ from __future__ import annotations
 
 import json
 import logging
-import urllib.request
 import xml.etree.ElementTree as ET
 from typing import Any, Optional
+
+import requests
 
 from data.sanitize import clean_snippet
 
@@ -93,14 +94,20 @@ class Source:
         return False
 
     def _get(self, url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> Any:
-        """GET JSON (ou texte brut si `raw`). Rend None a la moindre anomalie (fail-closed)."""
-        if params:
-            from urllib.parse import urlencode
-            url = f"{url}?{urlencode(params)}"
-        req = urllib.request.Request(url, headers={"User-Agent": _UA, **(headers or {})})
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:   # nosec - URLs constantes
-            data = resp.read().decode("utf-8", "replace")
-        return data
+        """GET texte brut. Leve en cas d'anomalie ; `_get_json` transforme en trou.
+
+        `requests` et NON `urllib.request` : urllib s'appuie sur le magasin de
+        certificats du systeme, qui manque sur beaucoup de VPS Windows fraichement
+        installes -> CERTIFICATE_VERIFY_FAILED sur CHAQUE source, alors que le reste
+        du projet (Bedrock, FRED, calendrier, web) passait deja par requests et son
+        bundle certifi. Une source qui tombe pour une raison d'installation est le
+        pire des trous : silencieuse et totale.
+        """
+        r = requests.get(url, params=params or None,
+                         headers={"User-Agent": _UA, **(headers or {})},
+                         timeout=_TIMEOUT)
+        r.raise_for_status()
+        return r.text
 
     def _get_json(self, url: str, params: Optional[dict] = None,
                   headers: Optional[dict] = None) -> Any:
