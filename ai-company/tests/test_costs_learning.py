@@ -98,6 +98,27 @@ def test_override_spread_par_symbole_prioritaire(monkeypatch):
     assert e.max_spread_pips_for("XAUUSD") == 95.0   # override par symbole prioritaire
 
 
+def test_slippage_et_commission_par_actif(monkeypatch):
+    from config import ExecutionConfig
+    for v in ("AGENT_SLIPPAGE_PIPS", "AGENT_SLIPPAGE_PIPS_METAL",
+              "AGENT_COMMISSION_PER_LOT", "AGENT_COMMISSION_PER_LOT_METAL"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("AGENT_SLIPPAGE_PIPS", "1.0")     # base FX
+    monkeypatch.setenv("AGENT_COMMISSION_PER_LOT", "7")  # base FX
+    e = ExecutionConfig()
+    # FX garde la base ; l'or prend le defaut de classe (15 pips, 0 commission).
+    assert e.slippage_pips_for("EURUSD") == 1.0 and e.slippage_pips_for("XAUUSD") == 15.0
+    assert e.commission_per_lot_for("EURUSD") == 7.0 and e.commission_per_lot_for("XAUUSD") == 0.0
+
+
+def test_le_slippage_or_ne_penalise_pas_le_fx(monkeypatch):
+    # Regression : une valeur unique (15 pips, calibree or) gonflait le cout FX.
+    from config import ExecutionConfig
+    monkeypatch.setenv("AGENT_SLIPPAGE_PIPS", "1.0")
+    e = ExecutionConfig()
+    assert e.slippage_pips_for("EURUSD") < e.slippage_pips_for("XAUUSD")
+
+
 def test_veto_rr_net_insuffisant():
     # 50 pips de stop pour 55 de cible : brut 1.1, mais les frais tuent l'esperance
     d = _engine().validate(_prop(tp=1.1055), _acc(), **SPEC, costs=_costs())

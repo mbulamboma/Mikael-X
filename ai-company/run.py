@@ -268,10 +268,10 @@ class Orchestrator:
             "spread_pips": spread,
             "spread_cout": round(spread * pipv * lot, 2),
             "spread_pct_atr": round(spread / atr_pips * 100, 1) if atr_pips else None,
-            "commission_aller_retour": round(e.commission_per_lot * lot, 2),
-            "slippage_provision_pips": e.slippage_pips,
-            "cout_total_estime": round(((spread + 2 * e.slippage_pips) * pipv
-                                        + e.commission_per_lot) * lot, 2),
+            "commission_aller_retour": round(e.commission_per_lot_for(symbol) * lot, 2),
+            "slippage_provision_pips": e.slippage_pips_for(symbol),
+            "cout_total_estime": round(((spread + 2 * e.slippage_pips_for(symbol)) * pipv
+                                        + e.commission_per_lot_for(symbol)) * lot, 2),
             "swap_par_nuit_par_lot": swap,
             "swap_3x_le": spec.get("swap_rollover3days"),
             "stop_minimum_broker_pips": spec.get("stops_level_pips", 0.0),
@@ -300,8 +300,8 @@ class Orchestrator:
         marge_1lot = self.broker.margin_required(symbol, 1.0, direction) or 0.0
         return TradeCosts(
             spread_pips=spec.get("spread_pips", 0.0),
-            slippage_pips=e.slippage_pips,
-            commission_per_lot=e.commission_per_lot,
+            slippage_pips=e.slippage_pips_for(symbol),
+            commission_per_lot=e.commission_per_lot_for(symbol),
             stops_level_pips=spec.get("stops_level_pips", 0.0),
             swap_per_lot_per_night=spec.get("swap_long" if direction == "buy" else "swap_short", 0.0),
             atr_pips=self._atr_pips(symbol, spec),

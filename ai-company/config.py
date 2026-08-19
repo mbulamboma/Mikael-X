@@ -94,6 +94,35 @@ def _asset_class(symbol: str) -> str:
 #: par `AGENT_MAX_SPREAD_PIPS_<SYMBOLE>` (prioritaire).
 _SPREAD_CAP_DEFAULTS = {"metal": 80.0, "energy": 30.0, "index": 300.0, "crypto": 5000.0}
 
+#: SLIPPAGE provisionne (en pips, convention du broker) par classe d'actif. 1 pip ne vaut
+#: pas la meme chose partout : 15 pips = 0.15 $ sur l'or (raisonnable) mais 15 VRAIS pips sur
+#: EURUSD (absurde). La base FX vient de `AGENT_SLIPPAGE_PIPS` ; les autres classes ci-dessous.
+_SLIPPAGE_DEFAULTS = {"metal": 15.0, "energy": 3.0, "index": 3.0, "crypto": 50.0}
+
+#: COMMISSION aller-retour (devise du compte) par classe d'actif. FTMO commissionne le FX
+#: (~7 $/lot A/R) ; indices/energie/crypto sont typiquement sans commission (cout dans le
+#: spread). Metaux : 0 par defaut mais A VERIFIER selon le compte FTMO. Base FX =
+#: `AGENT_COMMISSION_PER_LOT` ; surcharge `AGENT_COMMISSION_PER_LOT_<CLASSE|SYMBOLE>`.
+_COMMISSION_DEFAULTS = {"metal": 0.0, "energy": 0.0, "index": 0.0, "crypto": 0.0}
+
+
+def _resolve_per_asset(symbol: str, env_prefix: str, fx_value: float,
+                       class_defaults: dict[str, float]) -> float:
+    """Resout un cout PAR ACTIF. Priorite : override par symbole
+    (`<PREFIX>_XAUUSD`) > override/defaut par classe (`<PREFIX>_METAL`) > valeur FX de base.
+    Un seul mecanisme partage par le spread, le slippage et la commission — leur nature
+    (FX serre vs matiere premiere large) est la meme probleme."""
+    override = os.environ.get(f"{env_prefix}_{symbol.upper()}", "").strip()
+    if override:
+        try:
+            return float(override)
+        except ValueError:
+            pass
+    cls = _asset_class(symbol)
+    if cls == "fx":
+        return fx_value
+    return _f(f"{env_prefix}_{cls.upper()}", class_defaults.get(cls, fx_value))
+
 
 @dataclass(frozen=True)
 class FTMOConfig:
@@ -190,22 +219,23 @@ class ExecutionConfig:
     max_entry_drift_atr: float = _f("AGENT_MAX_ENTRY_DRIFT_ATR", 0.5)
 
     def max_spread_pips_for(self, symbol: str) -> float:
-        """Plafond ABSOLU de spread applicable a CE symbole. Priorite :
-        override par symbole (`AGENT_MAX_SPREAD_PIPS_XAUUSD=...`) > override/defaut par
-        classe d'actif (`AGENT_MAX_SPREAD_PIPS_METAL=...`) > plafond FX de base.
-        Sans cette resolution, le plafond FX (~3 pips) veto TOUT trade sur l'or, les
-        indices ou le crypto, dont le spread naturel se compte en dizaines de pips."""
-        override = os.environ.get(f"AGENT_MAX_SPREAD_PIPS_{symbol.upper()}", "").strip()
-        if override:
-            try:
-                return float(override)
-            except ValueError:
-                pass
-        cls = _asset_class(symbol)
-        if cls == "fx":
-            return self.max_spread_pips
-        return _f(f"AGENT_MAX_SPREAD_PIPS_{cls.upper()}",
-                  _SPREAD_CAP_DEFAULTS.get(cls, self.max_spread_pips))
+        """Plafond ABSOLU de spread applicable a CE symbole (FX serre, or/indices larges).
+        Sans cette resolution, le plafond FX (~3 pips) veto TOUT trade sur l'or, les indices
+        ou le crypto, dont le spread naturel se compte en dizaines de pips."""
+        return _resolve_per_asset(symbol, "AGENT_MAX_SPREAD_PIPS",
+                                  self.max_spread_pips, _SPREAD_CAP_DEFAULTS)
+
+    def slippage_pips_for(self, symbol: str) -> float:
+        """Slippage provisionne pour CE symbole. Une valeur unique ment : 15 pips convient a
+        l'or (0.15 $) mais gonfle absurdement le cout d'une paire FX (15 vrais pips)."""
+        return _resolve_per_asset(symbol, "AGENT_SLIPPAGE_PIPS",
+                                  self.slippage_pips, _SLIPPAGE_DEFAULTS)
+
+    def commission_per_lot_for(self, symbol: str) -> float:
+        """Commission aller-retour pour CE symbole. FTMO facture le FX ; sous-estimer ce cout
+        (commission 0) sur-dimensionne les paires FX — l'inverse de ce qu'on veut en challenge."""
+        return _resolve_per_asset(symbol, "AGENT_COMMISSION_PER_LOT",
+                                  self.commission_per_lot, _COMMISSION_DEFAULTS)
 
 
 @dataclass(frozen=True)
