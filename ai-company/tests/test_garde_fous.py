@@ -283,3 +283,39 @@ def test_dossier_de_contexte_complet_pour_le_mode_sans_outils():
         assert attendu in d
     assert "LECON" not in d                     # le dossier ne contient que des faits
     assert "gains rendus" in d and "trend_up" in d
+
+
+# ------------------------------------------------ echec par INACTIVITE (pas que le drawdown)
+from run import _alertes_ftmo
+
+
+def _info(**kw):
+    base = dict(objectif_atteint=False, jours_restants=25, jours_trades_manquants=0,
+                jours_depuis_dernier_trade=0, limite_inactivite_jours=30)
+    base.update(kw)
+    return base
+
+
+def test_aucune_alerte_quand_minimum_tenu_et_compte_actif():
+    assert _alertes_ftmo(_info(jours_trades_manquants=0, jours_depuis_dernier_trade=1)) == []
+
+
+def test_alerte_critique_minimum_jours_hors_datteinte():
+    a = _alertes_ftmo(_info(jours_restants=3, jours_trades_manquants=4))
+    assert a and a[0].startswith("CRITIQUE")
+
+
+def test_alerte_risque_minimum_jours_serre():
+    a = _alertes_ftmo(_info(jours_restants=5, jours_trades_manquants=4))
+    assert a and a[0].startswith("RISQUE") and "jours de trading" in a[0]
+
+
+def test_alerte_inactivite_proche_limite():
+    a = _alertes_ftmo(_info(jours_depuis_dernier_trade=27, limite_inactivite_jours=30))
+    assert any("inactif" in x for x in a)
+
+
+def test_objectif_atteint_ne_declenche_pas_lalerte_jours():
+    # objectif fait : on n'exige plus de forcer des jours de trading supplementaires.
+    assert _alertes_ftmo(_info(objectif_atteint=True, jours_restants=1,
+                               jours_trades_manquants=4)) == []

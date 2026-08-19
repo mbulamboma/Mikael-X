@@ -75,6 +75,29 @@ def test_veto_stop_plus_proche_que_le_minimum_broker():
     assert not d.approved and "Stop trop proche" in d.reasons[0]
 
 
+# ------------------------------------------------ plafond de spread par classe d'actif
+def test_plafond_spread_par_classe_dactif(monkeypatch):
+    from config import ExecutionConfig
+    for v in ("AGENT_MAX_SPREAD_PIPS", "AGENT_MAX_SPREAD_PIPS_METAL",
+              "AGENT_MAX_SPREAD_PIPS_XAUUSD"):
+        monkeypatch.delenv(v, raising=False)
+    e = ExecutionConfig()
+    # FX garde le plafond serre ; l'or n'est plus banni par un plafond FX (bug d'origine).
+    assert e.max_spread_pips_for("EURUSD") == e.max_spread_pips
+    assert e.max_spread_pips_for("XAUUSD") == 80.0
+    assert e.max_spread_pips_for("US30") == 300.0
+    assert e.max_spread_pips_for("BTCUSD") == 5000.0
+
+
+def test_override_spread_par_symbole_prioritaire(monkeypatch):
+    from config import ExecutionConfig
+    monkeypatch.setenv("AGENT_MAX_SPREAD_PIPS_METAL", "70")
+    monkeypatch.setenv("AGENT_MAX_SPREAD_PIPS_XAUUSD", "95")
+    e = ExecutionConfig()
+    assert e.max_spread_pips_for("XAGUSD") == 70.0   # defaut de classe surcharge
+    assert e.max_spread_pips_for("XAUUSD") == 95.0   # override par symbole prioritaire
+
+
 def test_veto_rr_net_insuffisant():
     # 50 pips de stop pour 55 de cible : brut 1.1, mais les frais tuent l'esperance
     d = _engine().validate(_prop(tp=1.1055), _acc(), **SPEC, costs=_costs())

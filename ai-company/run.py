@@ -75,6 +75,32 @@ def _today_key(now: datetime | None = None) -> str:
     return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
 
 
+def _alertes_ftmo(info: dict) -> list[str]:
+    """Traduit les chiffres FTMO d'un `_phase_info` en alertes lisibles pour le Gerant.
+
+    L'echec par INACTIVITE est distinct du drawdown et se joue TOT : il faut du temps pour
+    placer les jours de trading manquants (un par jour civil au mieux), et FTMO clot un
+    compte reste inactif trop longtemps. On previent donc avant que ce soit irrattrapable."""
+    alertes: list[str] = []
+    restants = info.get("jours_restants", 0)
+    manquants = info.get("jours_trades_manquants", 0)
+    inactif = info.get("jours_depuis_dernier_trade", 0)
+    limite = info.get("limite_inactivite_jours", 0)
+    if manquants > 0 and not info.get("objectif_atteint"):
+        # Il faut au moins `manquants` journees civiles distinctes pour valider le minimum.
+        marge = restants - manquants
+        if marge <= 0:
+            alertes.append(f"CRITIQUE: minimum de jours de trading hors d'atteinte "
+                           f"({manquants} a placer, {restants} jour(s) restant(s)).")
+        elif marge <= 3:
+            alertes.append(f"RISQUE: minimum de jours de trading serre ({manquants} a "
+                           f"placer en {restants} jour(s)) — ne plus rester sur la touche.")
+    if limite > 0 and inactif >= max(1, limite - 5):
+        alertes.append(f"RISQUE: compte inactif depuis {inactif} jour(s) "
+                       f"(limite FTMO {limite}) — placer un trade de qualite bientot.")
+    return alertes
+
+
 def _position_risk(pos: dict, spec: dict) -> float:
     if not pos.get("sl"):
         return 0.0
@@ -281,7 +307,7 @@ class Orchestrator:
             atr_pips=self._atr_pips(symbol, spec),
             free_margin=acct.get("free_margin", 0.0),
             margin_required_per_lot=marge_1lot,
-            max_spread_pips=e.max_spread_pips,
+            max_spread_pips=e.max_spread_pips_for(symbol),
             max_spread_atr_ratio=e.max_spread_atr_ratio,
             max_margin_pct_of_free=e.max_margin_pct_of_free,
             max_risk_per_currency_pct=e.max_risk_per_currency_pct)
@@ -373,24 +399,44 @@ class Orchestrator:
         return s
 
     def _phase_info(self, s: dict, total_pnl_pct: float) -> dict:
-        """Contexte de l'etape : objectif, ecart, jours ecoules/restants, jours de trading."""
+        """Contexte de l'etape : objectif, ecart, jours ecoules/restants, jours de trading,
+        et surtout le RISQUE D'ECHEC PAR INACTIVITE — distinct du drawdown. FTMO se rate
+        aussi en NE tradant PAS : minimum de jours de trading non tenu quand la fenetre se
+        referme, ou compte laisse inactif au-dela de la limite. On calcule ces signaux ici
+        pour que le Gerant les lise en clair au lieu d'avoir a faire l'arithmetique."""
         c = self.cfg.ftmo
+        today = datetime.now(timezone.utc).date()
         try:
             d0 = datetime.fromisoformat(str(s.get("phase_start"))).date()
         except (TypeError, ValueError):
-            d0 = datetime.now(timezone.utc).date()
-        elapsed = (datetime.now(timezone.utc).date() - d0).days
+            d0 = today
+        elapsed = (today - d0).days
+        restants = max(0, c.phase_days - elapsed)
+        jours = sorted(set(s.get("trading_days", [])))
+        jours_trades = len(jours)
+        manquants = max(0, c.min_trading_days - jours_trades)
+        # Inactivite : jours depuis le DERNIER trade (ou depuis le debut de l'etape si aucun).
+        try:
+            dernier = datetime.fromisoformat(jours[-1]).date() if jours else d0
+        except (TypeError, ValueError):
+            dernier = d0
+        inactif = max(0, (today - dernier).days)
         target = c.profit_target_pct
-        return {
+        info = {
             "etape": c.phase,
             "objectif_etape_pct": target,
             "reste_avant_objectif_pct": round(target - total_pnl_pct, 2),
             "objectif_atteint": total_pnl_pct >= target,
             "jours_ecoules": elapsed,
-            "jours_restants": max(0, c.phase_days - elapsed),
-            "jours_trades": len(set(s.get("trading_days", []))),
+            "jours_restants": restants,
+            "jours_trades": jours_trades,
             "jours_trades_min": c.min_trading_days,
+            "jours_trades_manquants": manquants,
+            "jours_depuis_dernier_trade": inactif,
+            "limite_inactivite_jours": c.inactivity_limit_days,
         }
+        info["alertes_ftmo"] = _alertes_ftmo(info)
+        return info
 
     def _account_state(self, account: dict, positions: list, s: dict) -> AccountState:
         """`positions` inclut les positions d'AUTRES EA : elles pesent sur l'equity donc
@@ -1057,6 +1103,8 @@ class Orchestrator:
                  summary["reste_avant_objectif_pct"], summary["perte_jour_pct"],
                  summary["jours_ecoules"], self.cfg.ftmo.phase_days,
                  summary["jours_trades"], summary["jours_trades_min"], acc.open_positions)
+        for alerte in summary.get("alertes_ftmo", []):
+            log.warning("FTMO | %s", alerte)
 
         # Le garde-fou FTMO bloque les OUVERTURES, mais l'agent doit toujours pouvoir
         # GERER (cloturer/securiser) ses positions ouvertes.

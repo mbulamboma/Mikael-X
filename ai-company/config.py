@@ -68,6 +68,33 @@ def _i(name: str, default: int) -> int:
         return default
 
 
+def _asset_class(symbol: str) -> str:
+    """Classe d'actif deduite du symbole. Sert a calibrer le plafond ABSOLU de spread :
+    un plafond FX (~3 pips) n'a aucun sens sur l'or (spread naturel 20-50 pips), les
+    indices ou le crypto. Heuristique volontairement simple ; le defaut est `fx` (le
+    plafond le plus serre) et tout se surcharge par variable d'environnement."""
+    s = symbol.upper()
+    if any(k in s for k in ("XAU", "XAG", "XPT", "XPD", "GOLD", "SILVER")):
+        return "metal"
+    if any(k in s for k in ("XTI", "XBR", "WTI", "BRENT", "OIL", "NGAS", "NATGAS")):
+        return "energy"
+    if any(k in s for k in ("BTC", "ETH", "XRP", "LTC", "DOGE", "SOL", "BCH", "ADA")):
+        return "crypto"
+    if any(k in s for k in ("US30", "US500", "SPX", "NAS", "NDX", "USTEC", "GER", "DAX",
+                            "DE40", "UK100", "FTSE", "JP225", "NIK", "US2000", "WALL",
+                            "EU50", "STOXX", "AUS200", "HK50", "FRA40", "ESP35")):
+        return "index"
+    return "fx"
+
+
+#: Plafond ABSOLU de spread (en pips, convention du broker) par classe d'actif. C'est un
+#: garde-fou de securite (spread anormal / broker qui elargit), PAS le garde-fou economique :
+#: ce dernier est relatif a l'ATR (`max_spread_atr_ratio`) et vaut pour tous les actifs.
+#: Chaque classe est surchargeable par `AGENT_MAX_SPREAD_PIPS_<CLASSE>`, et chaque symbole
+#: par `AGENT_MAX_SPREAD_PIPS_<SYMBOLE>` (prioritaire).
+_SPREAD_CAP_DEFAULTS = {"metal": 80.0, "energy": 30.0, "index": 300.0, "crypto": 5000.0}
+
+
 @dataclass(frozen=True)
 class FTMOConfig:
     """Chassis FTMO 2 etapes. Pourcentages sur le SOLDE INITIAL (perte max) et sur
@@ -85,6 +112,10 @@ class FTMOConfig:
     max_total_loss_pct: float = _f("FTMO_MAX_TOTAL_LOSS_PCT", 10.0) # -10 % total = fail
     phase_days: int = _i("FTMO_PHASE_DAYS", 30)
     min_trading_days: int = _i("FTMO_MIN_TRADING_DAYS", 4)
+    # FTMO clot un compte reste INACTIF (aucun trade) trop longtemps. C'est un mode d'echec
+    # a part entiere, distinct du drawdown : un compte qu'on ne trade jamais est perdu, pas
+    # preserve. On previent bien avant la limite (cf. `_phase_info` -> alerte d'inactivite).
+    inactivity_limit_days: int = _i("FTMO_INACTIVITY_LIMIT_DAYS", 30)
     phase_start: str = field(default_factory=lambda: os.environ.get("FTMO_PHASE_START", ""))
 
     # Garde-fous de l'AGENT (plus stricts que FTMO)
@@ -117,7 +148,11 @@ class ExecutionConfig:
     commission_per_lot: float = _f("AGENT_COMMISSION_PER_LOT", 7.0)
     # slippage suppose a l'entree ET a la sortie (en pips), marge de securite du sizing
     slippage_pips: float = _f("AGENT_SLIPPAGE_PIPS", 1.0)
-    # spread max tolere pour ENTRER (absolu et en fraction de l'ATR du timeframe)
+    # spread max tolere pour ENTRER (absolu et en fraction de l'ATR du timeframe).
+    # `max_spread_pips` est le plafond ABSOLU des paires FX ; l'or, les indices, l'energie
+    # et le crypto ont un spread naturel bien plus large et sont resolus par classe d'actif
+    # (cf. `max_spread_pips_for`). Le vrai garde-fou economique reste `max_spread_atr_ratio`,
+    # relatif a l'ATR donc valable pour TOUS les actifs.
     max_spread_pips: float = _f("AGENT_MAX_SPREAD_PIPS", 3.0)
     max_spread_atr_ratio: float = _f("AGENT_MAX_SPREAD_ATR", 0.12)
     # deviation acceptee a l'envoi de l'ordre (points) + nb de tentatives sur requote
@@ -153,6 +188,24 @@ class ExecutionConfig:
     entry_reprice: bool = field(default_factory=lambda:
                                 os.environ.get("AGENT_ENTRY_REPRICE", "1") == "1")
     max_entry_drift_atr: float = _f("AGENT_MAX_ENTRY_DRIFT_ATR", 0.5)
+
+    def max_spread_pips_for(self, symbol: str) -> float:
+        """Plafond ABSOLU de spread applicable a CE symbole. Priorite :
+        override par symbole (`AGENT_MAX_SPREAD_PIPS_XAUUSD=...`) > override/defaut par
+        classe d'actif (`AGENT_MAX_SPREAD_PIPS_METAL=...`) > plafond FX de base.
+        Sans cette resolution, le plafond FX (~3 pips) veto TOUT trade sur l'or, les
+        indices ou le crypto, dont le spread naturel se compte en dizaines de pips."""
+        override = os.environ.get(f"AGENT_MAX_SPREAD_PIPS_{symbol.upper()}", "").strip()
+        if override:
+            try:
+                return float(override)
+            except ValueError:
+                pass
+        cls = _asset_class(symbol)
+        if cls == "fx":
+            return self.max_spread_pips
+        return _f(f"AGENT_MAX_SPREAD_PIPS_{cls.upper()}",
+                  _SPREAD_CAP_DEFAULTS.get(cls, self.max_spread_pips))
 
 
 @dataclass(frozen=True)

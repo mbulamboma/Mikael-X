@@ -96,9 +96,19 @@ Comment juger :
   a survecu au dossier. Ton `plan` et ton `invalidation` doivent EUX AUSSI citer des donnees
   du dossier — sinon ton verdict est automatiquement ramene a l'abstention ;
 - regarde ce que chacun concede : le `risque_principal` d'un camp est souvent le vrai sujet ;
-- **l'abstention est un verdict a part entiere**. Deux plaidoiries faibles ne font pas un
-  trade. En FTMO, ne pas trader ne coute rien ; trader un dossier flou coute le compte ;
-- ta CONVICTION doit refleter la solidite du dossier, pas ton envie de conclure.
+- **l'abstention reste un verdict a part entiere, mais ce N'EST PAS l'option gratuite par
+  defaut.** L'entreprise est en challenge pour ATTEINDRE un objectif de performance : renoncer
+  a un setup de QUALITE a un cout reel (l'objectif ne s'atteint qu'en engageant du risque, et
+  un compte qui ne trade pas echoue aussi). Trader un dossier FLOU coute le compte ; laisser
+  passer un dossier SOLIDE coute l'objectif. Abstiens-toi quand AUCUN camp n'a d'edge sourcé
+  et invalidable — PAS simplement parce que le camp adverse a su nommer un risque ;
+- un contre-argument n'est pas un match nul. Si un camp DOMINE sur les faits chiffres (ecart
+  de conviction net, thèse sourcée et invalidable par un fait precis), TRANCHE dans son sens
+  et porte le risque residuel dans `risques_non_resolus` — ce n'est pas un motif d'abstention.
+  « Equilibre » se juge sur la force des FAITS opposes, pas sur la simple existence d'une
+  objection ;
+- ta CONVICTION doit refleter la solidite du dossier, pas ton envie de conclure — ni ton envie
+  de t'abstenir. Une thèse dominante et bien sourcée merite un verdict directionnel assume.
 
 Reponds UNIQUEMENT par un objet JSON, sans texte autour :
 {{"direction": "buy|sell|abstention",
