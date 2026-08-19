@@ -97,6 +97,33 @@ def test_news_injection_est_retiree(monkeypatch):
     assert not any("ignore" in t.lower() for t in titres)
 
 
+# ------------------------------------------------------------------ score d'actualite chiffre
+def test_score_news_agrege_les_titres():
+    items = [{"title": "Gold rally extends as USD falls"},   # rally -> bull
+             {"title": "Bullion breakout above resistance"},  # breakout -> bull
+             {"title": "Gold dump after hot CPI"},            # dump -> bear
+             {"title": "Gold steadies near 4,350"}]           # aucun signe -> neutre
+    agg = S.score_news(items)
+    assert agg["titres"] == 4
+    assert agg["haussiers"] == 2 and agg["baissiers"] == 1 and agg["neutres"] == 1
+    assert agg["score"] == round((2 - 1) / 4, 2)              # +0.25
+
+
+def test_score_news_vide_est_ferme():
+    assert S.score_news([]) == {}
+    assert S.score_news(None) == {}
+
+
+def test_score_actualite_est_un_chiffre_citable():
+    """Le score doit etre un DECIMAL que le filtre de preuves reconnait comme donnee du
+    dossier — c'est toute la raison d'etre de la mesure : rendre l'ACTUALITE sourcable."""
+    from desk import preuves as P
+    agg = S.score_news([{"title": "Gold rally"}, {"title": "Gold dump"},
+                        {"title": "Gold rally again"}])
+    f = P.faits({"score_actualite": agg})
+    assert f.contient(agg["score"])                           # le score est bien un fait
+
+
 # ------------------------------------------------------------------ agregateur fail-closed
 def test_agregateur_reste_fail_closed_si_une_source_casse(monkeypatch):
     """Une source qui leve ne doit jamais casser un cycle : l'agregateur l'ignore."""
@@ -136,3 +163,5 @@ def test_actualite_ingere_les_news_sources_si_actif():
     cfg = replace(cfg, sources=replace(cfg.sources, inject_news=True))
     d = AnalysteActualite(cfg).dossier("EURUSD", {"news": {}}, _Live(), {})
     assert d.get("news_sources") == [{"title": "EURUSD up", "source": "rss"}]
+    # le dossier expose AUSSI l'agregat chiffre, calcule sur ces memes titres ("up" -> bull)
+    assert d.get("score_actualite", {}).get("score") == 1.0

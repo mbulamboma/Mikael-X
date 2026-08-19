@@ -182,9 +182,13 @@ class Analyste(DeskAgent):
                  "invalidation": str(data.get("invalidation") or "").strip()[:300]}
         if ecartes:
             brief["ecartes_sans_preuve"] = ecartes[:5]
-            log.info("Analyste %s: %d affirmation(s) sans preuve ecartee(s)%s.",
+            # On loggue la 1re affirmation rejetee, pas seulement leur nombre : un compte
+            # (« 3 ecartee(s) ») ne dit pas POURQUOI le brief s'est vide. Le texte rejete
+            # rend le diagnostic lisible dans le log — un cycle au lieu d'une lecture de code.
+            log.info("Analyste %s: %d affirmation(s) sans preuve ecartee(s)%s — 1re: %r",
                      self.title, len(ecartes),
-                     " — brief neutralise" if not points else "")
+                     " — brief neutralise" if not points else "",
+                     ecartes[0][:160])
         return brief
 
 
@@ -269,6 +273,13 @@ class AnalysteActualite(Analyste):
             extra = _safe(lambda: live.news_extra(symbol, 6), "news supplementaires")
             if extra:
                 d["news_sources"] = extra
+                # AGREGAT CHIFFRE des memes titres (cf. data/sources.score_news) : le seul
+                # nombre qui decrit l'actualite elle-meme, donc le seul que cet analyste
+                # puisse enfin SOURCER. Calcule sur la liste deja en main, sans 2e appel.
+                from data.sources import score_news
+                score = score_news(extra)
+                if score:
+                    d["score_actualite"] = score
         return d
 
 

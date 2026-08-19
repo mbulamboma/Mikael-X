@@ -125,6 +125,33 @@ def _classe_texte(texte: str) -> Optional[str]:
     return "bull" if b > s else "bear"
 
 
+def score_news(items: list[dict]) -> dict:
+    """LE SEUL CHIFFRE qui decrit l'actualite ELLE-MEME — pas le biais macro du Fondamental
+    ni les echeances du calendrier. Sans lui, l'analyste ACTUALITE ne pouvait citer que le
+    travail d'un autre : il n'avait aucune donnee propre a mettre sous une affirmation, donc
+    le filtre de preuves le neutralisait quelle que soit la qualite de sa lecture.
+
+    Chaque titre deja recupere (`news_extra`) est classe par le MEME lexique grossier que le
+    sentiment social (`_classe_texte`) — assume comme tel, heuristique et non un modele. Le
+    `score` est la part nette directionnelle des titres, dans [-1, +1] :
+    (haussiers - baissiers) / titres. C'est ce nombre, present dans le dossier, que
+    l'analyste peut enfin sourcer.
+
+    PUR et DETERMINISTE (aucun reseau ici : on agrege une liste deja en main) -> testable
+    hors-ligne. {} si aucun titre (fail-closed, comme le reste de la couche)."""
+    items = items or []
+    if not items:
+        return {}
+    signes = [_classe_texte(it.get("title", "")) for it in items]
+    haussiers = signes.count("bull")
+    baissiers = signes.count("bear")
+    n = len(items)
+    return {"titres": n, "haussiers": haussiers, "baissiers": baissiers,
+            "neutres": n - haussiers - baissiers,
+            "score": round((haussiers - baissiers) / n, 2),
+            "methode": "heuristique lexicale (grossiere)"}
+
+
 # --------------------------------------------------------------------------- RSS (libre)
 class RSSNewsSource(Source):
     """News via n'importe quel flux RSS/Atom (Reuters, banques centrales, medias). Parse
