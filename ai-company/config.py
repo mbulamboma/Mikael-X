@@ -376,6 +376,30 @@ class DeskConfig:
     vigie_giveback_r: float = _f("DESK_VIGIE_GIVEBACK_R", 1.0) # MFE atteint -> "gains rendus"
     vigie_min_minutes: int = _i("DESK_VIGIE_MIN_MINUTES", 30)  # anti-spam par ticket
 
+    # TRACING PAS-A-PAS (cf. desk/trace.py) : chaque appel LLM du desk est journalise
+    # (rol, modele, latence, taille, ok/erreur) dans state/traces/<cycle>.jsonl. C'est la
+    # debuggabilite qu'un graphe LangGraph offrirait, sans en adopter le framework.
+    trace_enabled: bool = field(default_factory=lambda: os.environ.get("DESK_TRACE", "1") == "1")
+    # CHECKPOINT DE CYCLE : les artefacts d'un cycle (mandat, briefs, debat) sont persistes ;
+    # un redemarrage DANS le meme cycle reutilise les etapes deja faites au lieu de tout
+    # refaire (et de repayer les appels LLM). 0 = pas de reprise.
+    checkpoint_enabled: bool = field(default_factory=lambda: os.environ.get("DESK_CHECKPOINT", "1") == "1")
+    # ANALYSTES TOOL-CAPABLES (cf. desk/analysts.py) : quand le modele sait appeler des outils
+    # (Claude, Nova...), chaque analyste peut aller CHERCHER une donnee non pre-chargee via un
+    # sous-ensemble d'outils LECTURE SEULE propre a son metier, avant de rendre son brief.
+    # Repli automatique sur le dossier pre-charge si le modele ne sait pas (DeepSeek) ou echoue.
+    analystes_outils: bool = field(default_factory=lambda: os.environ.get("DESK_ANALYSTES_OUTILS", "0") == "1")
+    analystes_outils_max_iter: int = _i("DESK_ANALYSTES_OUTILS_ITER", 3)
+    # REFLEXION HYBRIDE (cf. desk/reflexion.py) : a la cloture, une note QUALITATIVE bornee et
+    # SOURCEE (contrainte de citer les faits du trade) complete les stats calculees ; les
+    # reflexions des cas passes les plus SIMILAIRES sont ensuite injectees au Trader.
+    reflexion_enabled: bool = field(default_factory=lambda: os.environ.get("DESK_REFLEXION", "1") == "1")
+    reflexion_k: int = _i("DESK_REFLEXION_K", 3)
+    # SENTIMENT SOCIAL (cf. desk/social.py) : source optionnelle (StockTwits/Reddit...) pour
+    # l'analyste Sentiment. DESACTIVE par defaut : c'est du texte NON FIABLE (surface
+    # d'injection de prompt). Quand active, il est ASSAINI et reduit a des agregats chiffres.
+    sentiment_social: bool = field(default_factory=lambda: os.environ.get("DESK_SENTIMENT_SOCIAL", "0") == "1")
+
     # MODELES A DEUX VITESSES (optionnel). Trois niveaux, du plus general au plus precis :
     #   1. `BEDROCK_MODEL_ID`  — le modele partage, defaut de tout le monde ;
     #   2. `DESK_MODEL_RAPIDE` / `DESK_MODEL_FORT` — par CLASSE de role : rapide pour ceux

@@ -19,7 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Any
+
+from desk import trace
 
 try:
     from langchain_aws import ChatBedrockConverse
@@ -29,6 +32,14 @@ except Exception as exc:  # pragma: no cover - dependance optionnelle
     ChatBedrockConverse = None
     _LC_OK = False
     _LC_ERR = exc
+
+try:  # outils optionnels : seuls les analystes tool-capables s'en servent (cf. run_tools)
+    from langchain.agents import AgentExecutor, create_tool_calling_agent
+    from langchain_core.prompts import ChatPromptTemplate
+    _TOOLS_OK = True
+except Exception:  # pragma: no cover - dependance optionnelle
+    AgentExecutor = create_tool_calling_agent = ChatPromptTemplate = None
+    _TOOLS_OK = False
 
 from config import AgentConfig
 
@@ -121,11 +132,17 @@ class DeskAgent:
     # -- appel LLM (messages bruts : le dossier contient du JSON) -----------------
     def _invoke(self, system: str, human: str) -> str:
         client = _client(self.cfg, self.model_id, self.temperature, self.max_tokens)
+        t0 = time.perf_counter()
         try:
             resp = client.invoke([("system", system), ("human", human)])
         except Exception as exc:  # Bedrock down, quota, timeout, credentials...
+            trace.record(self.role, self.title, self.model_id, system, human,
+                         (time.perf_counter() - t0) * 1000, error=str(exc))
             raise DeskUnavailable(f"{self.title}: appel LLM en echec ({exc})") from exc
-        return resp.content if isinstance(resp.content, str) else str(resp.content)
+        out = resp.content if isinstance(resp.content, str) else str(resp.content)
+        trace.record(self.role, self.title, self.model_id, system, human,
+                     (time.perf_counter() - t0) * 1000, output=out)
+        return out
 
     def ask_json(self, system: str, human: str) -> dict:
         """Un tour LLM -> dict. {} si le modele n'a pas rendu de JSON exploitable
@@ -137,3 +154,48 @@ class DeskAgent:
 
     def ask_text(self, system: str, human: str) -> str:
         return self._invoke(system, human).strip()
+
+    # -- appel LLM AVEC OUTILS (boucle ReAct bornee) ------------------------------
+    def tools_available(self) -> bool:
+        """Le tool calling est-il possible ? (dependance presente + modele capable).
+        `create_tool_calling_agent` echouerait a l'execution sur DeepSeek : on le sait
+        d'avance via l'heuristique de la config, ce qui evite un appel rate."""
+        return _TOOLS_OK and _LC_OK and self.cfg.bedrock.supports_tools
+
+    def run_tools(self, system: str, human: str, tools: list, max_iter: int = 3,
+                  return_steps: bool = False):
+        """Fait raisonner l'agent avec un sous-ensemble d'OUTILS lecture seule : il peut
+        aller CHERCHER une donnee non pre-chargee avant de repondre. Rend le texte final
+        (ou, si `return_steps`, le couple (texte, observations_outils)).
+
+        `system`/`human` sont passes comme DONNEES (variables du template), pas comme gabarit :
+        nos prompts contiennent du JSON dont les accolades casseraient un ChatPromptTemplate.
+        Leve DeskUnavailable comme `_invoke` pour que l'appelant applique son repli."""
+        if not self.tools_available():
+            raise DeskUnavailable(f"{self.title}: outils indisponibles (modele/dependance).")
+        client = _client(self.cfg, self.model_id, self.temperature, self.max_tokens)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", "{system}"),
+            ("human", "{input}"),
+            ("placeholder", "{agent_scratchpad}"),
+        ])
+        t0 = time.perf_counter()
+        try:
+            agent = create_tool_calling_agent(client, tools, prompt)
+            executor = AgentExecutor(agent=agent, tools=tools, max_iterations=int(max_iter),
+                                     verbose=False, handle_parsing_errors=True,
+                                     return_intermediate_steps=return_steps)
+            result = executor.invoke({"system": system, "input": human})
+            out = result.get("output") if isinstance(result, dict) else str(result)
+            out = out if isinstance(out, str) else str(out)
+            # observations des outils : ce que l'agent a REELLEMENT lu (pour que le filtre de
+            # preuves reconnaisse comme sourcees les valeurs qu'il vient de chercher).
+            obs = [str(o) for _, o in (result.get("intermediate_steps") or [])] \
+                if isinstance(result, dict) else []
+        except Exception as exc:
+            trace.record(self.role, self.title, self.model_id, system, human,
+                         (time.perf_counter() - t0) * 1000, error=f"tools: {exc}")
+            raise DeskUnavailable(f"{self.title}: boucle d'outils en echec ({exc})") from exc
+        trace.record(self.role, self.title + " (outils)", self.model_id, system, human,
+                     (time.perf_counter() - t0) * 1000, output=out)
+        return (out, obs) if return_steps else out

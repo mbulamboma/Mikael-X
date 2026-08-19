@@ -36,9 +36,26 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Optional
 
+from brain import tools as T
 from desk.base import DeskAgent, DeskUnavailable
 from desk import context as C
 from desk import preuves as P
+from desk import social as SOCIAL
+
+#: outils LECTURE SEULE du catalogue (brain/tools.py) indexes par nom, pour composer un
+#: sous-ensemble par metier. Les outils de PLAN (plan_open/close...) en sont volontairement
+#: exclus : un analyste OBSERVE, il n'agit pas. Sans langchain, `@tool` est un no-op et les
+#: outils restent de simples fonctions (d'ou le repli sur __name__).
+def _nom_outil(t: Any) -> str:
+    return getattr(t, "name", None) or getattr(t, "__name__", "") or ""
+
+
+_TOOLS_BY_NAME = {_nom_outil(t): t for t in T.ALL_TOOLS
+                  if not _nom_outil(t).startswith("plan_")}
+
+
+def _outils(*noms: str) -> list:
+    return [_TOOLS_BY_NAME[n] for n in noms if n in _TOOLS_BY_NAME]
 
 log = logging.getLogger("desk.analystes")
 
@@ -85,6 +102,7 @@ class Analyste(DeskAgent):
     """Base des 4 analystes : meme squelette, un dossier et une mission par metier."""
     model_role = "analyste"        # meme modele pour les 4 ; un `role` distinct par metier
     mission = ""
+    outils: tuple = ()             # sous-ensemble d'outils lecture seule propre au metier
 
     def dossier(self, symbol: str, ctx: dict, live: Any, commun: dict) -> dict:
         raise NotImplementedError
@@ -98,10 +116,38 @@ class Analyste(DeskAgent):
             f"== TON DOSSIER SUR {symbol} ==\n" + C.fmt(dossier),
             "== CONSIGNES DU GERANT ==\n" + (mandate.get("consignes") or "(aucune)"),
         ])
+        # POINT 2 : chemin TOOL-CAPABLE (opt-in + modele capable). L'analyste peut aller
+        # chercher une donnee absente de son dossier pre-charge. Repli integral sur le mode
+        # JSON si les outils echouent : un analyste ne doit jamais disparaitre pour ca.
+        if self.cfg.desk.analystes_outils and self.outils and self.tools_available():
+            try:
+                return self._brief_outils(symbol, system, human, dossier)
+            except DeskUnavailable as e:
+                log.info("Analyste %s: outils indisponibles sur %s (%s) — repli JSON.",
+                         self.title, symbol, e)
         data = self.ask_json(system, human + "\n\nRends UNIQUEMENT ton brief JSON.")
         return self._normalise(data, dossier)
 
-    def _normalise(self, data: dict, dossier: dict | None = None) -> dict:
+    def _brief_outils(self, symbol: str, system: str, human: str, dossier: dict) -> dict:
+        """Brief via boucle d'outils. Les OBSERVATIONS des outils sont ajoutees a la matiere
+        de preuve : une valeur que l'analyste vient de lire compte comme sourcee."""
+        consigne = (human + "\n\nTu peux appeler tes OUTILS pour completer ce dossier avec "
+                    "des donnees manquantes (indicateurs, series macro, news...). Quand tu as "
+                    "ce qu'il te faut, arrete-toi et rends UNIQUEMENT ton brief JSON.")
+        texte, observations = self.run_tools(
+            system, consigne, list(self.outils),
+            max_iter=self.cfg.desk.analystes_outils_max_iter, return_steps=True)
+        data = self._extract(texte)
+        # les observations d'outils deviennent une source de preuve supplementaire
+        return self._normalise(data, dossier, extra_sources=(" ".join(observations),))
+
+    @staticmethod
+    def _extract(texte: str) -> dict:
+        from desk.base import extract_json
+        return extract_json(texte)
+
+    def _normalise(self, data: dict, dossier: dict | None = None,
+                   extra_sources: tuple = ()) -> dict:
         """Un brief mal forme devient un brief NEUTRE : il ne doit ni disparaitre en
         silence, ni faire passer du bruit pour une conviction.
 
@@ -123,7 +169,7 @@ class Analyste(DeskAgent):
                   if isinstance(p, (str, int, float))][:5]
         ecartes: list[str] = []
         if dossier is not None and self.cfg.desk.exiger_preuves:
-            points, ecartes = P.filtrer(points, P.faits(dossier))
+            points, ecartes = P.filtrer(points, P.faits(dossier, *extra_sources))
             if not points:
                 biais, confiance = "neutre", 0.0
         brief = {"analyste": self.title, "biais": biais, "confiance": round(confiance, 2),
@@ -140,6 +186,7 @@ class Analyste(DeskAgent):
 
 class AnalysteTechnique(Analyste):
     role, title = "technique", "TECHNIQUE"
+    outils = tuple(_outils("get_market", "get_chart", "compute_indicator"))
     mission = ("lire la STRUCTURE du graphique : tendance et regime (W1/D1/H4), niveaux "
                "reels (swings, Donchian, plus haut/plus bas), position du prix dans sa "
                "volatilite (ATR), et ou passerait une invalidation propre. Donne des NIVEAUX "
@@ -160,6 +207,7 @@ class AnalysteTechnique(Analyste):
 
 class AnalysteFondamental(Analyste):
     role, title = "fondamental", "FONDAMENTAL"
+    outils = tuple(_outils("get_fred_series", "get_macro_events", "get_trading_costs"))
     mission = ("juger le fond macro-economique des DEUX devises du symbole : ecart de taux "
                "et sa direction, inflation, emploi, trajectoire des banques centrales. Un "
                "differentiel de taux qui s'ecarte porte une paire ; un cycle qui se retourne "
@@ -174,6 +222,7 @@ class AnalysteFondamental(Analyste):
 
 class AnalysteSentiment(Analyste):
     role, title = "sentiment", "SENTIMENT"
+    outils = tuple(_outils("get_retail_sentiment", "get_market"))
     mission = ("evaluer le POSITIONNEMENT et l'humeur du marche, avec un oeil CONTRARIEN : "
                "quand une ecrasante majorite de particuliers est du meme cote, le risque "
                "est de leur cote. Croise avec l'extension du prix. Ne fais pas d'analyse "
@@ -183,11 +232,16 @@ class AnalysteSentiment(Analyste):
         snap = (ctx.get("snapshots") or {}).get(symbol)
         retail = _safe(lambda: live.retail_sentiment(symbol), "sentiment retail") \
             if live is not None else None
-        return {"symbole": symbol, "sentiment_retail": retail, "scan_prix": snap}
+        d = {"symbole": symbol, "sentiment_retail": retail, "scan_prix": snap}
+        # Point 4 : sentiment social OPTIONNEL, assaini et reduit a des agregats chiffres
+        # (cf. desk/social.py). Desactive par defaut — c'est du texte non fiable.
+        d.update(SOCIAL.dossier_fragment(symbol, live, self.cfg.desk.sentiment_social))
+        return d
 
 
 class AnalysteActualite(Analyste):
     role, title = "actualite", "ACTUALITE MONDIALE"
+    outils = tuple(_outils("get_news", "search_news", "get_macro_events"))
     mission = ("reperer ce qui, dans l'actualite et la geopolitique, peut deplacer ce "
                "symbole a l'echelle de quelques jours : annonces a fort impact, decisions "
                "de banques centrales, tensions, flux de refuge. Distingue le BRUIT "

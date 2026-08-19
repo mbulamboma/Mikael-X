@@ -42,6 +42,9 @@ from desk import preuves as P
 from desk import journal as J
 from desk import situation as SIT
 from desk import bilan_roles as BILAN
+from desk import trace
+from desk import reflexion as R
+from desk.checkpoint import Checkpoint, signature as ckpt_sig
 from desk.gerant import Gerant
 from desk.trade_manager import TradeManager
 from desk.trader import Trader
@@ -72,20 +75,43 @@ class TradingDesk:
         self.debat = Debat(cfg)
         self.college_risque = CollegeRisque(cfg)
         self._last_mandate: dict = {}
+        trace.configure(cfg.desk.trace_enabled)
+        self._ckpt: Checkpoint | None = None
 
     # ------------------------------------------------------------------ decision cycle
     def decide(self, summary: dict) -> list[dict]:
+        cycle_id = trace.new_cycle_id()
+        token = trace.start_cycle(cycle_id)
+        try:
+            return self._decide(summary)
+        finally:
+            if self.cfg.desk.trace_enabled:
+                log.info("Trace cycle %s: %s", cycle_id, trace.summary(cycle_id))
+            trace.end_cycle(token)
+
+    def _decide(self, summary: dict) -> list[dict]:
         self.degraded = False
         self.last_error = ""
         ctx = C.read()
         positions = ctx.get("positions") or []
         actions: list[dict] = []
 
-        # 1. GERANT : mandat du cycle (CRITIQUE)
-        try:
-            mandate = self.gerant.mandate(summary, self._revue())
-        except DeskUnavailable as e:
-            return self._degrade(f"Gerant indisponible: {e}")
+        # CHECKPOINT : filet anti-crash indexe sur une signature stable du cycle. Un
+        # redemarrage immediat sur le meme etat reprend les phases deja calculees.
+        acc = (summary.get("account") or {}) if isinstance(summary, dict) else {}
+        self._ckpt = Checkpoint(
+            ckpt_sig(str(summary.get("jour") or summary.get("server_day") or ""),
+                     C.candidate_symbols(ctx), float(acc.get("equity") or 0.0)),
+            enabled=self.cfg.desk.checkpoint_enabled)
+
+        # 1. GERANT : mandat du cycle (CRITIQUE). Repris du checkpoint si un crash a suivi.
+        mandate = self._ckpt.get("mandate")
+        if mandate is None:
+            try:
+                mandate = self.gerant.mandate(summary, self._revue())
+            except DeskUnavailable as e:
+                return self._degrade(f"Gerant indisponible: {e}")
+            self._ckpt.set("mandate", mandate)
         self._last_mandate = mandate
         log.info("Gerant | posture=%s convoquer=%s candidats=%s | %s",
                  mandate.get("posture"), mandate.get("convoquer_desk"),
@@ -108,23 +134,43 @@ class TradingDesk:
             log.info("Desk non convoque : ouvertures bloquees par le gate FTMO (%s).",
                      summary.get("gate_raisons"))
 
+        # cycle abouti : le filet anti-crash n'a plus lieu d'etre.
+        if self._ckpt is not None:
+            self._ckpt.clear()
         return actions
 
     def _research_and_open(self, summary: dict, mandate: dict) -> list[dict]:
         """Chaine de recherche -> ouvertures. NON critique : tout echec ici = 0 ouverture,
         jamais de bascule pilote (le book reste gere par le Trade Manager)."""
         candidats = mandate.get("candidats") or []
+        ckpt = self._ckpt
         try:
             # Phase 2 : 4 analystes independants par candidat. Phase 3 : debat Bull/Bear.
-            briefs: dict = {}
-            if self.cfg.desk.use_analysts:
+            # Chaque phase couteuse est mise sous checkpoint : un crash apres le debat ne
+            # refait pas les 4 analystes x N candidats au redemarrage.
+            briefs: dict = (ckpt.get("briefs") if ckpt else None) or {}
+            if not briefs and self.cfg.desk.use_analysts:
                 briefs = self.analystes.briefs(candidats, mandate)
-            debate: dict = {}
-            if self.cfg.desk.use_debate:
+                if ckpt:
+                    ckpt.set("briefs", briefs)
+            debate: dict = (ckpt.get("debate") if ckpt else None) or {}
+            if not debate and self.cfg.desk.use_debate:
                 debate = self.debat.sur(candidats, briefs, mandate)
+                if ckpt:
+                    ckpt.set("debate", debate)
             situations = self._situations(candidats, debate)
-            memoire = {s: SIT.bloc_prompt(sig, self.mem.closed_trades())
-                       for s, sig in situations.items()}
+            trades = self.mem.closed_trades()
+            reflexions = self.mem.reflexions() if self.cfg.desk.reflexion_enabled else []
+            # MEMOIRE SITUATIONNELLE : cas passes comparables (stats) + (Point 3) la note
+            # QUALITATIVE des reflexions les plus similaires. Les deux sont sourcees.
+            memoire = {}
+            for s, sig in situations.items():
+                bloc = SIT.bloc_prompt(sig, trades)
+                if reflexions:
+                    refl = R.bloc_prompt(sig, reflexions, self.cfg.desk.reflexion_k)
+                    if refl:
+                        bloc = bloc + "\n" + refl
+                memoire[s] = bloc
             opens = self.trader.decide(summary, mandate, briefs, debate, memoire)
             opens = self._appliquer_verdicts(opens, debate)
             opens = self._exiger_preuves(opens, briefs)
@@ -266,6 +312,25 @@ class TradingDesk:
             log.info("Session extraordinaire: %d action(s) hors ticket %s ignoree(s).",
                      len(actions) - len(retenues), ticket)
         return retenues
+
+    # ------------------------------------------------------------------ reflexion a la cloture
+    def reflect_on_close(self, trade: dict) -> dict | None:
+        """POINT 3 (cote ecriture) : a la cloture d'un trade, ecrit une note factuelle bornee
+        et la journalise (kind `reflexion`). Appelee par l'orchestrateur apres `trade_closed`.
+
+        Ne leve jamais et ne bloque jamais la cloture : toute panne LLM retombe sur une note
+        deterministe (cf. desk/reflexion.py). Rend l'enregistrement ecrit, ou None si desactive."""
+        if not self.cfg.desk.reflexion_enabled:
+            return None
+        try:
+            record = R.ecrire(self.cfg, trade)
+            self.mem.log_event("reflexion", record)
+            log.info("Reflexion %s R=%s: %s", trade.get("symbol"), record.get("R"),
+                     (record.get("note") or "")[:160])
+            return record
+        except Exception as e:                   # une note ne doit jamais casser une cloture
+            log.warning("Reflexion non ecrite pour %s (%s).", trade.get("symbol"), e)
+            return None
 
     def _revue(self) -> str:
         """Revue de performance par employe (cf. desk/bilan_roles.py). Le Gerant DIRIGE :

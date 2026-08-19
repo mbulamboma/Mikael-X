@@ -478,6 +478,14 @@ class Orchestrator:
         # alimente des mesures (post-mortem chiffre, scoreboard, revue par employe, cas
         # comparables) qui, elles, sont verifiables et se relisent sans y croire sur parole.
         self._notifier("trade_ferme", trade)
+        # POINT 3 : reflexion hybride a la cloture (note factuelle bornee + sourcee). Present
+        # sur le DESK uniquement ; l'agent solo ne l'expose pas. Ne bloque jamais la cloture.
+        reflect = getattr(self.agent, "reflect_on_close", None)
+        if callable(reflect):
+            try:
+                reflect(trade)
+            except Exception as e:
+                log.warning("Reflexion post-cloture ignoree (%s).", e)
         return R
 
     @staticmethod

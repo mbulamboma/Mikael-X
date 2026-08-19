@@ -32,6 +32,11 @@ class Memory:
     def closed_trades(self) -> list[dict]:
         return self.store.events(kind="trade_closed")
 
+    def reflexions(self) -> list[dict]:
+        """Notes de reflexion post-trade (cf. desk/reflexion.py). Chacune porte la signature
+        de situation du trade, donc se retrouve par proximite comme un trade cloture."""
+        return self.store.events(kind="reflexion")
+
     def stats(self) -> dict:
         cl = self.closed_trades()
         if not cl:
