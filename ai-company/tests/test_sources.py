@@ -79,6 +79,32 @@ def test_rss_filtre_par_symbole(monkeypatch):
     assert any("EURUSD" in t for t in titres) and not any("Tesla" in t for t in titres)
 
 
+def test_rss_alias_gold_matche_les_news_or(monkeypatch):
+    # XAUUSD n'apparait jamais dans une news sur l'or -> l'alias doit matcher "gold"/"bullion"
+    src = S.RSSNewsSource(_cfg(rss_feeds=("http://x/feed",)))
+    feed = ("<rss><channel>"
+            "<item><title>Gold steadies below $4,350 on Fed bets</title></item>"
+            "<item><title>Bullion demand rises in Asia</title></item>"
+            "<item><title>Apple unveils new iPhone</title></item>"
+            "</channel></rss>")
+    monkeypatch.setattr(S.RSSNewsSource, "_get", lambda self, url, params=None, headers=None: feed)
+    titres = [n["title"] for n in src.news_items("XAUUSD")]
+    assert any("Gold" in t for t in titres) and any("Bullion" in t for t in titres)
+    assert not any("iPhone" in t for t in titres)
+
+
+def test_reddit_utilise_l_alias_comme_requete(monkeypatch):
+    # pour XAUUSD, la requete Reddit doit etre "gold", pas "XAUUSD" (sinon ~0 resultat)
+    src = S.RedditSource(_cfg(reddit_enabled=True, reddit_subs=("Gold",)))
+    vue = {}
+    def capture(self, url, params=None, headers=None):
+        vue["q"] = (params or {}).get("q")
+        return {"data": {"children": []}}
+    monkeypatch.setattr(S.RedditSource, "_get_json", capture)
+    src.social_items("XAUUSD")
+    assert vue["q"] == "gold"
+
+
 def test_rss_filtre_par_devise(monkeypatch):
     # une news qui parle de l'EUR sans ecrire "EURUSD" doit passer (mention de devise)
     src = S.RSSNewsSource(_cfg(rss_feeds=("http://x/feed",)))

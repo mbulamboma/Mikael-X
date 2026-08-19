@@ -41,13 +41,43 @@ from data.sanitize import clean_snippet
 
 log = logging.getLogger("data.sources")
 
-_UA = "ai-company-ftmo/1.0 (research; contact via .env)"
+# UA de navigateur : beaucoup de flux (Investing, FXStreet...) refusent un UA inconnu, comme
+# le note deja data/web.py. On imite un navigateur pour ne pas se faire jeter en 403.
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 _TIMEOUT = 8
 
 #: lexique minimal pour classer un post sans API de sentiment. Volontairement grossier et
 #: LISIBLE : on assume que le signal social est faible et bruite (usage contrarien).
 _BULL = ("long", "buy", "bull", "bullish", "moon", "calls", "up", "breakout", "rally")
 _BEAR = ("short", "sell", "bear", "bearish", "puts", "down", "dump", "crash", "breakdown")
+
+#: ALIAS DE SYMBOLE : (requete de recherche, termes a matcher). Sans ca, chercher/filtrer sur
+#: « XAUUSD » rate tout : une news sur l'or dit « gold », « bullion », jamais « XAUUSD ». On
+#: mappe donc chaque instrument vers ses mots reels. Etendre au besoin (nouvel instrument).
+SYMBOL_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
+    "XAUUSD": ("gold", ("xauusd", "xau", "gold", "bullion", "gold price", "precious metal")),
+    "XAGUSD": ("silver", ("xagusd", "xag", "silver")),
+    "XTIUSD": ("crude oil", ("xtiusd", "wti", "crude", "oil", "brent")),
+    "USOIL":  ("crude oil", ("usoil", "wti", "crude", "oil")),
+    "US30":   ("dow jones", ("us30", "dow", "djia", "dow jones")),
+    "NAS100": ("nasdaq", ("nas100", "nasdaq", "ndx", "us tech")),
+    "US500":  ("s&p 500", ("us500", "s&p", "spx", "s&p 500")),
+    "GER40":  ("dax", ("ger40", "dax", "germany 40")),
+    "BTCUSD": ("bitcoin", ("btcusd", "btc", "bitcoin")),
+    "ETHUSD": ("ethereum", ("ethusd", "eth", "ethereum")),
+}
+
+
+def _alias(symbol: str) -> tuple[str, tuple[str, ...]]:
+    """(requete, termes de match) pour un symbole. Repli FX : la paire + ses deux devises ;
+    repli generique : le symbole lui-meme."""
+    s = (symbol or "").upper()
+    if s in SYMBOL_ALIASES:
+        return SYMBOL_ALIASES[s]
+    if len(s) == 6 and s.isalpha():                       # paire FX EURUSD -> eur, usd
+        return (s, (s.lower(), s[:3].lower(), s[3:].lower()))
+    return (s, (s.lower(),)) if s else ("", ())
 
 
 # --------------------------------------------------------------------------- socle HTTP
@@ -105,11 +135,13 @@ class RedditSource(Source):
     def social_items(self, symbol: str) -> list[dict]:
         if not self.enabled:
             return []
+        requete, _ = _alias(symbol)               # « gold » plutot que « XAUUSD »
         items: list[dict] = []
         for sub in (self.cfg.reddit_subs or ["Forex"]):
             data = self._get_json(
                 f"https://www.reddit.com/r/{sub}/search.json",
-                {"q": symbol, "restrict_sr": 1, "sort": "new", "limit": 15, "t": "week"})
+                {"q": requete or symbol, "restrict_sr": 1, "sort": "new",
+                 "limit": 15, "t": "week"})
             for child in (((data or {}).get("data") or {}).get("children") or []):
                 d = child.get("data") or {}
                 texte = f"{d.get('title', '')} {d.get('selftext', '')}"
@@ -131,7 +163,7 @@ class RSSNewsSource(Source):
         if not self.enabled:
             return []
         out: list[dict] = []
-        cle = (symbol or "").upper()
+        _, termes = _alias(symbol)                # XAUUSD -> gold/bullion/xau/...
         for url in self.cfg.rss_feeds:
             xml = None
             try:
@@ -142,9 +174,10 @@ class RSSNewsSource(Source):
                 titre = clean_snippet(item.get("title", ""), 200)
                 if not titre:
                     continue
-                # filtre leger par symbole/devise : un flux generaliste ne parle pas que de FX
-                blob = (titre + " " + (item.get("summary") or "")).upper()
-                if cle and cle not in blob and not _mentionne_devise(cle, blob):
+                # filtre par ALIAS : un flux generaliste ne parle pas que de notre instrument.
+                # Sans terme (symbole vide), on ne filtre pas.
+                blob = (titre + " " + (item.get("summary") or "")).lower()
+                if termes and not any(t in blob for t in termes):
                     continue
                 out.append({"title": titre, "date": item.get("date"),
                             "source": item.get("source") or "rss"})
@@ -300,13 +333,6 @@ def _num(x: Any) -> Optional[float]:
 
 def _compact(d: dict) -> dict:
     return {k: v for k, v in d.items() if v not in (None, "", {}, [])}
-
-
-def _mentionne_devise(cle: str, blob: str) -> bool:
-    """Une news FX peut ne pas citer 'EURUSD' mais parler de l'EUR ou de la Fed."""
-    if len(cle) == 6 and cle.isalpha():
-        return cle[:3] in blob or cle[3:] in blob
-    return False
 
 
 def _insider_net(inities: dict) -> Optional[int]:
