@@ -183,13 +183,24 @@ class Orchestrator:
     def retail_sentiment(self, symbol: str = "") -> dict:
         """Sentiment retail : myfxbook (si identifiants) EN PRIORITE, sinon repli FXSSI
         (sans compte). L'analyste Sentiment garde ainsi un signal de positionnement meme
-        sans MYFXBOOK_EMAIL/PASSWORD."""
-        r = self.web.retail_sentiment(symbol)
-        if r and not r.get("error") and any(v is not None for k, v in r.items()
-                                            if k not in ("symbol", "source", "error")):
-            return r
-        alt = self.sources.retail_sentiment(symbol)
-        return alt or r
+        sans MYFXBOOK_EMAIL/PASSWORD.
+
+        Quand les DEUX sources repondent, on attache leur DIVERGENCE au signal primaire
+        (`divergence_sources`) : deux mesures independantes qui concordent renforcent la
+        lecture contrarienne, un ecart large la fragilise. FXSSI est opt-in, donc s'il est
+        desactive `sources.retail_sentiment` rend {} sans reseau — aucun cout ajoute."""
+        from data.sources import divergence_retail, _long_myfxbook
+        sym = str(symbol).strip().upper()
+        r = self.web.retail_sentiment(sym)
+        mfb_ok = bool(r and not r.get("error") and any(
+            v is not None for k, v in r.items()
+            if k not in ("symbol", "symbole", "source", "error", "note")))
+        alt = self.sources.retail_sentiment(sym)          # FXSSI ({} si opt-out, sans reseau)
+        primaire = r if mfb_ok else (alt or r)
+        div = divergence_retail(_long_myfxbook(r, sym), (alt or {}).get("long_pct"))
+        if div and isinstance(primaire, dict):
+            primaire = {**primaire, "divergence_sources": div}
+        return primaire
 
     # ---- sources pluggables (data/sources.py) : Social / News / Fondamentaux ----
     def social_sentiment(self, symbol: str = "") -> dict:

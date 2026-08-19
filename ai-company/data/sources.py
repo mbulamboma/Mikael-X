@@ -125,6 +125,43 @@ def _classe_texte(texte: str) -> Optional[str]:
     return "bull" if b > s else "bear"
 
 
+def _long_myfxbook(res: dict, symbol: str) -> Optional[float]:
+    """Part LONGUE (%) que myfxbook attribue au symbole, tiree de la forme rendue par
+    data/web.retail_sentiment (API community outlook). None si absente ou en erreur — on
+    ne devine PAS depuis le repli page (`part_1_pct`/`part_2_pct`) ou l'ordre long/short
+    n'est pas garanti : une divergence calculee sur un chiffre incertain vaudrait pire que
+    pas de divergence."""
+    if not isinstance(res, dict) or res.get("error"):
+        return None
+    sym = (symbol or "").upper()
+    for row in res.get("positionnement") or []:
+        if str(row.get("symbole", "")).upper() == sym:
+            return _num(row.get("longs_pct"))
+    return None
+
+
+def divergence_retail(long_myfxbook: Optional[float],
+                      long_fxssi: Optional[float]) -> dict:
+    """ECART entre deux mesures INDEPENDANTES du positionnement retail (myfxbook vs FXSSI).
+
+    Le desk avait deja les deux sources, mais l'une chassait l'autre (repli) : rien ne les
+    CONFRONTAIT. Or leur ecart est en soi un signal. Quand elles concordent, la lecture
+    contrarienne est robuste ; quand elles DIVERGENT, la foule n'est pas la ou une seule
+    source le laisse croire, et la conviction contrarienne doit faiblir.
+
+    PUR et DETERMINISTE. {} si l'une des deux manque (rien a comparer, fail-closed)."""
+    if long_myfxbook is None or long_fxssi is None:
+        return {}
+    a, b = float(long_myfxbook), float(long_fxssi)
+    ecart = round(abs(a - b), 1)
+    return {"myfxbook_long_pct": round(a, 1), "fxssi_long_pct": round(b, 1),
+            "ecart_pts": ecart,
+            # <= 10 pts : les deux sources racontent la meme histoire (seuil lisible, assume)
+            "concordent": ecart <= 10.0,
+            "note": "Deux sources retail independantes. Ecart faible = signal contrarien "
+                    "robuste ; ecart large = positionnement incertain, prudence sur la lecture."}
+
+
 def score_news(items: list[dict]) -> dict:
     """LE SEUL CHIFFRE qui decrit l'actualite ELLE-MEME — pas le biais macro du Fondamental
     ni les echeances du calendrier. Sans lui, l'analyste ACTUALITE ne pouvait citer que le

@@ -124,6 +124,38 @@ def test_score_actualite_est_un_chiffre_citable():
     assert f.contient(agg["score"])                           # le score est bien un fait
 
 
+# ------------------------------------------------------------------ divergence retail
+def test_long_myfxbook_extrait_la_part_longue():
+    res = {"source": "myfxbook API", "positionnement": [
+        {"symbole": "EURUSD", "longs_pct": 40},
+        {"symbole": "XAUUSD", "longs_pct": 63}]}
+    assert S._long_myfxbook(res, "XAUUSD") == 63.0
+    assert S._long_myfxbook(res, "GBPUSD") is None          # symbole absent
+    assert S._long_myfxbook({"error": "session"}, "XAUUSD") is None
+    assert S._long_myfxbook({}, "XAUUSD") is None
+
+
+def test_divergence_retail_concordance_et_ecart():
+    proche = S.divergence_retail(63, 65)
+    assert proche["ecart_pts"] == 2.0 and proche["concordent"] is True
+    loin = S.divergence_retail(63, 38)
+    assert loin["ecart_pts"] == 25.0 and loin["concordent"] is False
+
+
+def test_divergence_retail_incomplet_est_ferme():
+    assert S.divergence_retail(63, None) == {}
+    assert S.divergence_retail(None, 40) == {}
+
+
+def test_ecart_divergence_est_un_chiffre_citable():
+    """L'ecart doit etre un decimal reconnu par le filtre de preuves : c'est le chiffre
+    que l'analyste SENTIMENT pourra sourcer pour parler de (dis)accord des sources."""
+    from desk import preuves as P
+    div = S.divergence_retail(63, 38)
+    f = P.faits({"sentiment_retail": {"divergence_sources": div}})
+    assert f.contient(div["ecart_pts"])                     # 25.0 est un fait du dossier
+
+
 # ------------------------------------------------------------------ agregateur fail-closed
 def test_agregateur_reste_fail_closed_si_une_source_casse(monkeypatch):
     """Une source qui leve ne doit jamais casser un cycle : l'agregateur l'ignore."""
