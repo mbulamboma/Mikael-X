@@ -156,6 +156,60 @@ def test_ecart_divergence_est_un_chiffre_citable():
     assert f.contient(div["ecart_pts"])                     # 25.0 est un fait du dossier
 
 
+# ------------------------------------------------------------------ COT (CFTC, libre)
+_COT_ROW = {"contract_market_name": "GOLD",
+            "report_date_as_yyyy_mm_dd": "2026-08-11T00:00:00.000",
+            "noncomm_positions_long_all": "250936",
+            "noncomm_positions_short_all": "32996",
+            "open_interest_all": "400309"}
+
+
+def test_cot_ligne_reduit_au_net_speculateur():
+    c = S._cot_ligne("XAUUSD", _COT_ROW)
+    assert c["net_non_commercial"] == 217940                 # 250936 - 32996
+    assert c["date"] == "2026-08-11"
+    assert c["net_pct_open_interest"] == round(100 * 217940 / 400309, 1)   # 54.4
+
+
+def test_cot_ligne_fail_closed_si_champs_manquants():
+    assert S._cot_ligne("XAUUSD", {"open_interest_all": "1"}) == {}
+
+
+def test_cot_desactive_rend_vide():
+    assert S.COTSource(_cfg()).positioning("XAUUSD") == {}   # opt-in : off par defaut
+
+
+def test_cot_symbole_non_mappe_ne_touche_pas_au_reseau(monkeypatch):
+    src = S.COTSource(_cfg(cot_enabled=True))
+
+    def boom(self, url, params=None, headers=None):
+        raise AssertionError("un symbole non mappe ne doit jamais appeler le reseau")
+    monkeypatch.setattr(S.COTSource, "_get_json", boom)
+    assert src.positioning("EURUSD") == {}                   # non mappe -> {} sans appel
+
+
+def test_cot_positioning_selectionne_le_contrat_principal(monkeypatch):
+    src = S.COTSource(_cfg(cot_enabled=True))
+    vus = {}
+
+    def fake(self, url, params=None, headers=None):
+        vus.update(params or {})
+        return [_COT_ROW]
+    monkeypatch.setattr(S.COTSource, "_get_json", fake)
+    c = src.positioning("XAUUSD")
+    assert "088691" in vus["$where"]                         # GOLD, PAS micro-gold (088695)
+    assert c["net_non_commercial"] == 217940
+
+
+def test_net_cot_est_citable():
+    """Le net spec ET sa part d'open interest doivent etre reconnus par le filtre de preuves :
+    ce sont les chiffres que l'analyste Fondamental pourra sourcer sur une matiere premiere."""
+    from desk import preuves as P
+    c = S._cot_ligne("XAUUSD", _COT_ROW)
+    f = P.faits({"positionnement_cot": c})
+    assert f.contient(c["net_non_commercial"]) and f.contient(c["net_pct_open_interest"])
+
+
 # ------------------------------------------------------------------ agregateur fail-closed
 def test_agregateur_reste_fail_closed_si_une_source_casse(monkeypatch):
     """Une source qui leve ne doit jamais casser un cycle : l'agregateur l'ignore."""
@@ -175,6 +229,10 @@ class _Live:
     def news_extra(self, symbol, limit=8):
         return [{"title": "EURUSD up", "source": "rss"}]
 
+    def cot_positioning(self, symbol):
+        return {"symbole": symbol, "net_non_commercial": 217940,
+                "date": "2026-08-11"} if symbol == "XAUUSD" else {}
+
 
 def test_fondamental_ingere_si_actif():
     cfg = AgentConfig()
@@ -188,6 +246,19 @@ def test_fondamental_ignore_si_inactif():
     cfg = replace(cfg, sources=replace(cfg.sources, inject_fundamentals=False))
     d = AnalysteFondamental(cfg).dossier("AAPL", {"snapshots": {}}, _Live(), {})
     assert "fondamentaux" not in d
+
+
+def test_fondamental_ingere_le_cot_si_actif():
+    cfg = AgentConfig()
+    cfg = replace(cfg, sources=replace(cfg.sources, cot_enabled=True))
+    d = AnalysteFondamental(cfg).dossier("XAUUSD", {"snapshots": {}}, _Live(), {})
+    assert d.get("positionnement_cot", {}).get("net_non_commercial") == 217940
+
+
+def test_fondamental_ignore_le_cot_si_inactif():
+    cfg = AgentConfig()      # cot_enabled off par defaut
+    d = AnalysteFondamental(cfg).dossier("XAUUSD", {"snapshots": {}}, _Live(), {})
+    assert "positionnement_cot" not in d
 
 
 def test_actualite_ingere_les_news_sources_si_actif():

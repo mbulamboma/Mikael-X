@@ -269,6 +269,81 @@ class FXSSISource(Source):
                 "source": "fxssi (retail, best-effort)"}
 
 
+# --------------------------------------------------------------------------- COT (libre)
+#: CODES DE CONTRAT CFTC (rapport « futures only », legacy) — SEULS ceux verifies sur l'API
+#: sont mappes. On epingle le contrat PRINCIPAL, jamais sa version « micro » (ex. GOLD 088691
+#: et non MICRO GOLD 088695). Non mappes, et pourquoi : GER40 est europeen (pas de COT CFTC),
+#: le DJIA n'a pas de contrat spec propre clair -> {} plutot qu'un mauvais marche. Extensible.
+COT_CODES: dict[str, str] = {
+    "XAUUSD": "088691",   # GOLD (COMEX)
+    "XAGUSD": "084691",   # SILVER
+    "XTIUSD": "067651",   # WTI-PHYSICAL
+    "USOIL":  "067651",   # WTI-PHYSICAL
+    "US500":  "13874A",   # E-MINI S&P 500
+    "NAS100": "209742",   # NASDAQ MINI
+}
+
+
+class COTSource(Source):
+    """POSITIONNEMENT COT (Commitments of Traders, CFTC) — un vrai fondamental de spec.
+
+    La CFTC publie chaque vendredi (donnees arretees au mardi) le positionnement agrege par
+    contrat. Le chiffre qui porte : la position NETTE des non-commerciaux (les speculateurs),
+    long - short. Une foule spec massivement longue est un fondamental de FRAGILITE (lecture
+    souvent contrarienne) — exactement ce qui manquait a l'analyste Fondamental sur les
+    matieres premieres et les indices, ou le differentiel de taux ne dit rien.
+
+    Libre, sans cle (Socrata). Opt-in + fail-closed. Ne couvre que les instruments MAPPES
+    (COT_CODES) : un instrument non liste rend {} (aucune donnee inventee)."""
+    name = "cot"
+    URL = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.cfg, "cot_enabled", False))
+
+    def positioning(self, symbol: str) -> dict:
+        if not self.enabled:
+            return {}
+        code = COT_CODES.get((symbol or "").upper())
+        if not code:                              # instrument non mappe : pas de COT invente
+            return {}
+        rows = self._get_json(self.URL, params={
+            "$select": ("contract_market_name,report_date_as_yyyy_mm_dd,"
+                        "noncomm_positions_long_all,noncomm_positions_short_all,"
+                        "open_interest_all"),
+            "$where": f"cftc_contract_market_code='{code}'",
+            "$order": "report_date_as_yyyy_mm_dd DESC",
+            "$limit": 1})
+        if not rows:
+            return {}
+        return _cot_ligne((symbol or "").upper(), rows[0])
+
+
+def _cot_ligne(symbol: str, r: dict) -> dict:
+    """Reduit une ligne COT brute au SEUL fondamental utile : le net des speculateurs et sa
+    part de l'open interest (un net de +200k ne se lit qu'a l'aune de la taille du marche).
+    {} si les champs de position manquent (fail-closed)."""
+    longs = _num(r.get("noncomm_positions_long_all"))
+    shorts = _num(r.get("noncomm_positions_short_all"))
+    if longs is None or shorts is None:
+        return {}
+    net = int(longs - shorts)
+    oi = _num(r.get("open_interest_all"))
+    return _compact({
+        "symbole": symbol,
+        "contrat": r.get("contract_market_name"),
+        "date": str(r.get("report_date_as_yyyy_mm_dd") or "")[:10],
+        "net_non_commercial": net,
+        "longs_non_commercial": int(longs),
+        "shorts_non_commercial": int(shorts),
+        "open_interest": int(oi) if oi else None,
+        "net_pct_open_interest": round(100.0 * net / oi, 1) if oi else None,
+        "source": "CFTC COT (futures only, hebdomadaire)",
+        "lecture": "Net des speculateurs (non-commerciaux). Foule spec tres longue = "
+                   "fondamental de fragilite, lecture souvent contrarienne."})
+
+
 # --------------------------------------------------------------------------- agregateur
 class Sources:
     """Facade : construit les adaptateurs actifs et fusionne leurs sorties par categorie.
@@ -284,10 +359,11 @@ class Sources:
         self._news = [RSSNewsSource(cfg)]
         self._fond = []
         self._retail = [FXSSISource(cfg)]
+        self._cot = [COTSource(cfg)]
 
     def actives(self) -> list[str]:
         vus, out = set(), []
-        for s in self._social + self._news + self._fond + self._retail:
+        for s in self._social + self._news + self._fond + self._retail + self._cot:
             if s.enabled and s.name not in vus:
                 vus.add(s.name)
                 out.append(s.name)
@@ -335,6 +411,18 @@ class Sources:
                     return r
             except Exception as e:
                 log.info("%s retail en echec (%s).", s.name, e)
+        return {}
+
+    def cot_positioning(self, symbol: str) -> dict:
+        """Net des speculateurs (CFTC COT) pour un instrument mappe. {} si aucune source
+        active, symbole non mappe, ou panne (fail-closed)."""
+        for s in self._cot:
+            try:
+                c = s.positioning(symbol)
+                if c:
+                    return c
+            except Exception as e:
+                log.info("%s cot en echec (%s).", s.name, e)
         return {}
 
 

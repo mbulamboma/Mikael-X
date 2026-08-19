@@ -256,6 +256,10 @@ class SourcesConfig:
     # (page publique) et fail-closed. Sert de repli quand myfxbook n'est pas configure.
     fxssi_enabled: bool = field(default_factory=lambda:
                                 os.environ.get("SOURCES_FXSSI", "0") == "1")
+    # COT (CFTC Commitments of Traders) : positionnement net des speculateurs, hebdomadaire
+    # et libre (Socrata, sans cle). Vrai fondamental de spec sur or/argent/petrole/indices.
+    cot_enabled: bool = field(default_factory=lambda:
+                              os.environ.get("SOURCES_COT", "0") == "1")
     # Fusion des sources dans les dossiers des analystes (Fondamental/Actualite).
     inject_fundamentals: bool = field(default_factory=lambda:
                                       os.environ.get("SOURCES_FUNDAMENTALS", "1") == "1")

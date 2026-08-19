@@ -232,6 +232,12 @@ class AnalysteFondamental(Analyste):
             fond = _safe(lambda: live.fundamentals(symbol), "fondamentaux")
             if fond:
                 d["fondamentaux"] = fond
+        # COT : net des speculateurs (or/argent/petrole/indices). Un fondamental de
+        # positionnement que le differentiel de taux ne capte pas. Opt-in + fail-closed.
+        if live is not None and self.cfg.sources.cot_enabled:
+            cot = _safe(lambda: live.cot_positioning(symbol), "positionnement COT")
+            if cot:
+                d["positionnement_cot"] = cot
         return d
 
 

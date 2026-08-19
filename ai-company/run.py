@@ -216,6 +216,11 @@ class Orchestrator:
         """Fondamentaux d'un titre (profil, metriques, inities). {} pour une paire FX."""
         return self.sources.fundamentals(symbol)
 
+    def cot_positioning(self, symbol: str = "") -> dict:
+        """Positionnement net des speculateurs (CFTC COT), hebdomadaire et libre. {} pour un
+        instrument non mappe (cf. data/sources.COT_CODES) ou si la source est desactivee."""
+        return self.sources.cot_positioning(symbol)
+
     # -------------------------------------------------------- couts et frictions reelles
     def costs_view(self, symbol: str, lot: float = 0.0, direction: str = "buy") -> dict:
         """Ce que coute VRAIMENT un trade sur ce symbole (vue lisible pour le LLM)."""
