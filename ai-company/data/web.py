@@ -30,7 +30,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, List, Dict, Any, Callable
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 
 import requests
 
@@ -249,8 +249,13 @@ class WebResearch:
         if data.get("error") or not data.get("session"):
             log.info("myfxbook login refuse: %s", data.get("message"))
             return None
-        self._store("mfb:session", {"session": data["session"]})
-        return data["session"]
+        # PIEGE : login.json rend le jeton DEJA percent-encode (base64 dont + / = sont
+        # echappes). Le repasser tel quel en parametre le re-encode une 2e fois (%3D ->
+        # %253D) et myfxbook repond "Invalid session." sur TOUS les endpoints. On le
+        # decode ici une fois ; requests se charge de l'encodage de la requete.
+        session = unquote(str(data["session"]))
+        self._store("mfb:session", {"session": session})
+        return session
 
     def _myfxbook_api(self, symbol: str) -> dict | None:
         session = self._myfxbook_session()
