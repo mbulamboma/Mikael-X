@@ -1,5 +1,10 @@
 # SECRETS : configuration reelle (MT5, Bedrock, SMTP) et reglages de l'entreprise
 .env
+# tout variant du .env : sauvegardes de de-duplication, .env.local, .env.bak-*... (secrets)
+.env.*
+!.env.example
+# traces du desk (peuvent contenir des metadonnees de cycle propres a la machine)
+traces/
 # Etat local : base SQLite (journal, positions suivies, session FTMO) + verrou d'instance.
 # Ne JAMAIS deployer l'etat d'une machine sur une autre : il decrit un compte precis.
 state/
