@@ -340,9 +340,12 @@ class Analystes:
                 for role, b in briefs.items():
                     resume = str(b.get("resume") or "").strip()
                     points = [str(p) for p in (b.get("points_cles") or [])][:4]
-                    if resume or points:
-                        detail = " | ".join(points) if points else ""
-                        log.info("  %-11s [%s/%.2f] %s%s", role.upper(), b["biais"],
-                                 b["confiance"], resume[:280],
-                                 ("  << " + detail if detail else ""))
+                    detail = ("  << " + " | ".join(points)) if points else ""
+                    # TOUJOURS une ligne, meme vide : sans ca, un analyste qui n'a rien
+                    # rendu (dossier trop mince, reponse creuse) est INVISIBLE — on ne peut
+                    # pas distinguer « il n'a pas tourne » de « il n'avait rien a dire ».
+                    corps = resume[:280] if (resume or points) else \
+                        "(aucun avis — dossier trop mince ou reponse vide)"
+                    log.info("  %-11s [%s/%.2f] %s%s", role.upper(), b["biais"],
+                             b["confiance"], corps, detail)
         return out
