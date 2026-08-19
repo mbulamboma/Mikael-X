@@ -5,7 +5,6 @@ Tout est HORS-LIGNE : on injecte la charge utile de `_get`/`_get_json`, jamais d
 
 Verifie :
   - une source sans cle/drapeau est inactive et rend du vide (opt-in) ;
-  - Reddit classe un post par lexique et fabrique des items sociaux ;
   - le parseur RSS lit RSS et Atom, et le filtre par symbole/devise s'applique ;
   - Finnhub compose news/social/fondamentaux quand la cle est presente ;
   - l'assainissement retire une injection dans un titre de news ;
@@ -38,23 +37,6 @@ def test_sources_inactives_par_defaut():
     assert agg.social_sentiment("EURUSD") == {}
     assert agg.news_extra("EURUSD") == []
     assert agg.fundamentals("AAPL") == {}
-
-
-# ------------------------------------------------------------------ Reddit (libre)
-def test_reddit_fabrique_des_items_classes(monkeypatch):
-    src = S.RedditSource(_cfg(reddit_enabled=True, reddit_subs=("Forex",)))
-    payload = {"data": {"children": [
-        {"data": {"title": "going long EURUSD, bullish breakout", "selftext": ""}},
-        {"data": {"title": "short EURUSD, bearish dump", "selftext": ""}},
-        {"data": {"title": "meh, sideways", "selftext": ""}}]}}
-    monkeypatch.setattr(S.RedditSource, "_get_json", lambda self, url, params=None, headers=None: payload)
-    items = src.social_items("EURUSD")
-    sentiments = [it["sentiment"] for it in items]
-    assert sentiments == ["bull", "bear", None]
-
-
-def test_reddit_inactif_rend_vide():
-    assert S.RedditSource(_cfg(reddit_enabled=False)).social_items("EURUSD") == []
 
 
 # ------------------------------------------------------------------ RSS (libre)
@@ -91,18 +73,6 @@ def test_rss_alias_gold_matche_les_news_or(monkeypatch):
     titres = [n["title"] for n in src.news_items("XAUUSD")]
     assert any("Gold" in t for t in titres) and any("Bullion" in t for t in titres)
     assert not any("iPhone" in t for t in titres)
-
-
-def test_reddit_utilise_l_alias_comme_requete(monkeypatch):
-    # pour XAUUSD, la requete Reddit doit etre "gold", pas "XAUUSD" (sinon ~0 resultat)
-    src = S.RedditSource(_cfg(reddit_enabled=True, reddit_subs=("Gold",)))
-    vue = {}
-    def capture(self, url, params=None, headers=None):
-        vue["q"] = (params or {}).get("q")
-        return {"data": {"children": []}}
-    monkeypatch.setattr(S.RedditSource, "_get_json", capture)
-    src.social_items("XAUUSD")
-    assert vue["q"] == "gold"
 
 
 def test_rss_filtre_par_devise(monkeypatch):
@@ -150,15 +120,14 @@ def test_news_injection_est_retiree(monkeypatch):
 
 # ------------------------------------------------------------------ agregateur fail-closed
 def test_agregateur_fusionne_et_reste_fail_closed(monkeypatch):
-    agg = S.Sources(_cfg(reddit_enabled=True, finnhub_key="k"))
-    monkeypatch.setattr(S.RedditSource, "social_items",
-                        lambda self, symbol: [{"sentiment": "bull", "text": "long"}])
+    agg = S.Sources(_cfg(rss_feeds=("http://x/feed",), finnhub_key="k"))
+    monkeypatch.setattr(S.RSSNewsSource, "news_items",
+                        lambda self, symbol, limit=8: [{"title": "EURUSD up", "source": "rss"}])
     # Finnhub casse : l'agregateur ne doit pas lever, juste ignorer cette source
-    def boom(self, symbol):
+    def boom(self, symbol, limit=8):
         raise RuntimeError("finnhub down")
-    monkeypatch.setattr(S.FinnhubSource, "social_items", boom)
-    out = agg.social_sentiment("EURUSD")
-    assert out["items"] == [{"sentiment": "bull", "text": "long"}]
+    monkeypatch.setattr(S.FinnhubSource, "news_items", boom)
+    assert agg.news_extra("EURUSD") == [{"title": "EURUSD up", "source": "rss"}]
 
 
 # ------------------------------------------------------------------ cablage analystes

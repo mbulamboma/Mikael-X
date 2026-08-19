@@ -19,9 +19,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-import pandas as pd
 import requests
 
 from config import NewsConfig
@@ -46,28 +44,6 @@ GDELT_Q = {
 }
 
 
-def _last_sunday(year: int, month: int) -> datetime:
-    """Dernier dimanche du mois (bascule d'heure europeenne, a 01:00 UTC)."""
-    d = datetime(year, month, 31, 1, tzinfo=timezone.utc)
-    while d.month != month:
-        d -= timedelta(days=1)
-    while d.weekday() != 6:                    # 6 = dimanche
-        d -= timedelta(days=1)
-    return d
-
-
-def _eet_offset(t) -> int:
-    """Decalage du serveur MT5 (EET/EEST) par rapport a UTC : +3 en heure d'ete
-    (dernier dimanche de mars -> dernier dimanche d'octobre), +2 sinon."""
-    try:
-        ts = pd.Timestamp(t).to_pydatetime()
-    except Exception:
-        return 2
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return 3 if _last_sunday(ts.year, 3) <= ts < _last_sunday(ts.year, 10) else 2
-
-
 def symbol_ccys(sym: str) -> list[str]:
     """Devises pertinentes pour un symbole. EURUSD -> [EUR, USD] ; XAUUSD -> [XAU, USD]."""
     s = sym.upper()
@@ -78,36 +54,14 @@ def symbol_ccys(sym: str) -> list[str]:
     return [s]
 
 
-def _resolve_mt5_files(cfg: NewsConfig) -> Path | None:
-    """Dossier MQL5\\Files du terminal (idem logique macro_service.py)."""
-    import os
-    if cfg.mt5_files and Path(cfg.mt5_files).is_dir():
-        return Path(cfg.mt5_files)
-    base = Path(os.environ.get("APPDATA", "")) / "MetaQuotes" / "Terminal"
-    if not base.is_dir():
-        return None
-    cands = [p for p in base.glob("*/MQL5/Files") if p.is_dir()]
-    if not cands:
-        return None
-    # Marqueur du terminal "de travail" : les fichiers que produisent
-    # tools/ExportCalendar.mq5 et tools/macro_service.py. Le repli
-    # MIKAEL_* couvre les installations ou un ancien EA tourne encore.
-    def _connu(p: Path) -> bool:
-        return (any((p / f).exists()
-                    for f in ("calendar_history.csv", "macro_features.csv"))
-                or any(p.glob("MIKAEL_*")))
-    return max(cands, key=lambda p: (_connu(p), p.stat().st_mtime))
-
-
 class NewsFeed:
     def __init__(self, cfg: NewsConfig, store=None):
         self.cfg = cfg
         self.store = store or default_store()
-        self.files = _resolve_mt5_files(cfg) if cfg.enabled else None
-        # Calendrier WEB (faireconomy/ForexFactory) : remplace l'export MT5 supprime. Utilise
-        # quand aucun calendar_history.csv n'est present. Meme donnee que la regle news FTMO.
+        # Calendrier WEB (faireconomy/ForexFactory) : SEULE source du calendrier. Meme
+        # donnee que la regle news FTMO (High impact = restriction). Aucun fichier local.
         self._web_cal = None
-        if cfg.enabled and getattr(cfg, "use_web_calendar", True):
+        if cfg.enabled:
             from data.calendar_web import WebCalendar
             self._web_cal = WebCalendar()
         # False des qu'un cycle constate l'absence de calendrier -> le black-out ne
@@ -203,8 +157,8 @@ class NewsFeed:
     def _build(self, symbols: list[str]) -> dict:
         now = datetime.now(timezone.utc)
         recent, upcoming = self._calendar(now)
-        macro = self._macro_features()
         fred = self._fred()
+        macro = self._macro_features(recent, now)
         wanted = sorted({c for sym in symbols for c in symbol_ccys(sym)})
         headlines = self._gdelt(wanted) if self.cfg.use_gdelt else {}
 
@@ -228,71 +182,21 @@ class NewsFeed:
         return {"enabled": True, "as_of": now.isoformat(), "fred": fred,
                 "per_symbol": per_symbol, "blackout": blackout}
 
-    # ------------------------------------------------------------- calendrier MT5
+    # ------------------------------------------------------------- calendrier (web)
     def _calendar(self, now: datetime) -> tuple[list, list]:
-        recent: list[dict] = []
-        upcoming: list[dict] = []
-        # 1) CSV MT5 s'il existe encore (compat) ; 2) sinon calendrier WEB (faireconomy).
-        path = self.files / "calendar_history.csv" if self.files else None
-        if path is None or not path.exists():
-            if self._web_cal is not None:
-                r, u = self._web_calendar(now)
-                # le web fait autorite seulement s'il a REELLEMENT rendu des evenements :
-                # une source vide ne doit pas faire croire a une protection active.
-                self.calendar_ok = bool(r or u)
-                if not self.calendar_ok:
-                    log.error("CALENDRIER WEB VIDE — AUCUN BLACK-OUT NEWS ACTIF ce cycle. "
-                              "Mettre NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.")
-                return r, u
-            # ni CSV ni calendrier web : danger, on le crie fort.
-            log.error("CALENDRIER ECONOMIQUE ABSENT — AUCUN BLACK-OUT NEWS ACTIF. "
-                      "Activer le calendrier web (NEWS_WEB_CALENDAR=1) ou mettre "
-                      "NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.")
+        """(recent, upcoming) depuis le calendrier web. Fail-closed et BRUYANT : une
+        source vide ne doit jamais passer pour une protection active."""
+        if self._web_cal is None:
+            log.error("CALENDRIER ECONOMIQUE DESACTIVE — AUCUN BLACK-OUT NEWS ACTIF. "
+                      "Mettre NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.")
             self.calendar_ok = False
-            return recent, upcoming
-        self.calendar_ok = True
-        try:
-            df = pd.read_csv(path, sep=";", encoding="cp1252", engine="python",
-                             on_bad_lines="skip")
-        except Exception as e:
-            log.warning("lecture calendrier impossible: %s", e)
-            return recent, upcoming
-        cols = {c.lower(): c for c in df.columns}
-        c_time = cols.get("time"); c_ccy = cols.get("currency")
-        c_imp = cols.get("importance"); c_act = cols.get("actual")
-        c_fc = cols.get("forecast")
-        c_ev = cols.get("event") or cols.get("event_id")
-        if not (c_time and c_ccy and c_imp):
-            return recent, upcoming
-        df[c_imp] = pd.to_numeric(df[c_imp], errors="coerce")
-        df["_t"] = pd.to_datetime(df[c_time], format="%Y.%m.%d %H:%M", errors="coerce")
-        df = df.dropna(subset=["_t", c_imp])
-        # Heure serveur MT5 = EET l'hiver (UTC+2), EEST l'ete (UTC+3). Un decalage d'une
-        # heure ferait rater une fenetre de black-out : on applique le VRAI decalage.
-        df["_utc"] = df["_t"] - df["_t"].map(lambda t: pd.Timedelta(hours=_eet_offset(t)))
-        now_naive = now.replace(tzinfo=None)
-        lo = now_naive - timedelta(hours=self.cfg.recent_hours)
-        hi = now_naive + timedelta(hours=self.cfg.upcoming_hours)
-        for _, r in df.iterrows():
-            imp = int(r[c_imp])
-            if imp < self.cfg.min_importance:
-                continue
-            t = r["_utc"]
-            ccy = str(r[c_ccy]).strip().upper()
-            name = str(r[c_ev]).strip() if c_ev else "event"
-            act = pd.to_numeric(r.get(c_act), errors="coerce") if c_act else None
-            fc = pd.to_numeric(r.get(c_fc), errors="coerce") if c_fc else None
-            if lo < t <= now_naive and pd.notna(act) and pd.notna(fc):
-                recent.append({"currency": ccy, "event": name, "importance": imp,
-                               "actual": float(act), "forecast": float(fc),
-                               "surprise": round(float(act) - float(fc), 4),
-                               "when": t.isoformat()})
-            elif now_naive < t <= hi:
-                upcoming.append({"currency": ccy, "event": name, "importance": imp,
-                                 "when": t.isoformat(),
-                                 "hours_until": round((t - now_naive).total_seconds() / 3600, 2)})
-        recent.sort(key=lambda e: e["when"], reverse=True)
-        upcoming.sort(key=lambda e: e["hours_until"])
+            return [], []
+        recent, upcoming = self._web_calendar(now)
+        # le calendrier ne fait autorite que s'il a REELLEMENT rendu des evenements.
+        self.calendar_ok = bool(recent or upcoming)
+        if not self.calendar_ok:
+            log.error("CALENDRIER WEB VIDE — AUCUN BLACK-OUT NEWS ACTIF ce cycle. "
+                      "Mettre NEWS_FAIL_CLOSED=1 pour interdire toute entree sans calendrier.")
         return recent, upcoming
 
     def _web_calendar(self, now: datetime) -> tuple[list, list]:
@@ -304,32 +208,72 @@ class NewsFeed:
             log.warning("calendrier web indisponible (%s).", e)
             return [], []
 
-    # ------------------------------------------------------------- brain macro
-    def _macro_features(self) -> dict:
-        if self.files is None:
+    # ------------------------------------------------------------- biais macro
+    def _macro_features(self, recent: list[dict], now: datetime) -> dict:
+        """Biais macro par devise, calcule dans le cycle (cf. data/macro_web.py) a partir
+        du momentum des taux (FRED) et des surprises du calendrier. Remplace l'ancien
+        `macro_features.csv` (indicateur MT5 + service horaire + FinBERT)."""
+        from data.macro_web import macro_bias
+        return macro_bias(recent, self._fred_rates(), now)
+
+    # Taux directeur / de reference par devise. Le choix privilegie la FRAICHEUR :
+    # series QUOTIDIENNES pour USD/EUR/GBP, series mensuelles OCDE (10 ans) pour les
+    # autres, faute de mieux gratuitement. `age_jours` dit au LLM ce qu'il lit.
+    FRED_TAUX = {
+        "USD": ("DGS2", "rendement 2 ans US"),
+        "EUR": ("ECBDFR", "taux de depot BCE"),
+        "GBP": ("IUDSOIA", "SONIA (taux au jour le jour GB)"),
+        "JPY": ("IRLTLT01JPM156N", "10 ans Japon (mensuel)"),
+        "CAD": ("IRLTLT01CAM156N", "10 ans Canada (mensuel)"),
+        "AUD": ("IRLTLT01AUM156N", "10 ans Australie (mensuel)"),
+        "NZD": ("IRLTLT01NZM156N", "10 ans Nouvelle-Zelande (mensuel)"),
+        "CHF": ("IRLTLT01CHM156N", "10 ans Suisse (mensuel)"),
+    }
+
+    def _fred_rates(self) -> dict:
+        """Momentum des taux par devise sur ~90 jours, borne dans [-1, +1] (tanh).
+
+        Des taux qui montent soutiennent une devise : c'est le socle du biais macro
+        depuis la suppression de `macro_features.csv`. Chaque serie est protegee
+        separement — une devise indisponible manque, elle ne casse pas les autres.
+        """
+        if not self.cfg.fred_key:
             return {}
-        path = self.files / "macro_features.csv"
-        if not path.exists():
-            return {}
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            return {}
-        # trouve la colonne devise
-        ccy_col = None
-        for c in df.columns:
-            vals = df[c].astype(str).str.upper()
-            if vals.isin(CCYS).any():
-                ccy_col = c
-                break
-        if ccy_col is None:
-            return {}
+        import math
         out = {}
-        for _, r in df.iterrows():
-            c = str(r[ccy_col]).strip().upper()
-            if c in CCYS:
-                out[c] = {k: (round(float(v), 3) if isinstance(v, (int, float)) else v)
-                          for k, v in r.items() if k != ccy_col}
+        for ccy, (sid, libelle) in self.FRED_TAUX.items():
+            try:
+                r = requests.get(
+                    "https://api.stlouisfed.org/fred/series/observations",
+                    params={"series_id": sid, "api_key": self.cfg.fred_key,
+                            "file_type": "json", "sort_order": "desc", "limit": 200},
+                    timeout=15)
+                obs = [o for o in r.json().get("observations", [])
+                       if o.get("value") not in (".", "", None)]
+            except Exception as e:
+                log.info("FRED %s (%s) indispo: %s", sid, ccy, e)
+                continue
+            if len(obs) < 2:
+                continue
+            dernier = obs[0]
+            d_last = datetime.fromisoformat(dernier["date"]).replace(tzinfo=timezone.utc)
+            cible = d_last - timedelta(days=90)
+            # premiere observation d'il y a >= 90 jours ; a defaut, la plus ancienne connue
+            ref = next((o for o in obs
+                        if datetime.fromisoformat(o["date"]).replace(tzinfo=timezone.utc) <= cible),
+                       obs[-1])
+            try:
+                delta = float(dernier["value"]) - float(ref["value"])
+            except (TypeError, ValueError):
+                continue
+            out[ccy] = {
+                "momentum": round(math.tanh(delta), 3),   # +-1 pt de taux ~ +-0.76
+                "libelle": libelle,
+                "variation_points": round(delta, 3),
+                "dernier": float(dernier["value"]),
+                "date": dernier["date"],
+                "age_jours": (datetime.now(timezone.utc) - d_last).days,
+            }
         return out
 
     # ------------------------------------------------------------- FRED (Fed)

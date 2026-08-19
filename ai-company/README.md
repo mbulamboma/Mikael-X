@@ -57,7 +57,7 @@ sur le symbole, le timeframe et la période **qu'il choisit**.
 | **Enquêter sur un thème** | `search_news(query, hours)` | recherche libre de titres (banques centrales, géopolitique, matières premières…) |
 | Contexte d'un actif | `get_news(symbol)` | biais macro + événements + black-out, même hors watchlist |
 | **Analyse macro d'expert** | `get_fred_series(series_id)` | n'importe quelle série officielle FRED : CPI, chômage, NFP, DGS10/DGS2, T10Y2Y, DXY, VIX, WTI… |
-| **Naviguer sur le web** | `web_search(query)` puis `web_read(url)` | Google (si clé CSE) ou DuckDuckGo, puis lecture du texte de la page (Fed, BCE, médias, myfxbook…) |
+| **Naviguer sur le web** | `web_search(query)` puis `web_read(url)` | DuckDuckGo, puis lecture du texte de la page (Fed, BCE, médias, myfxbook…) |
 | **Sentiment retail** | `get_retail_sentiment(symbol)` | positionnement des particuliers (myfxbook), lecture contrarienne |
 | **Trailing stop** | `plan_trail(ticket, atr_mult \| pips, activate_r, timeframe)` | distance en ATR ou en pips, TF de suivi, seuil d'activation en R, désarmable |
 
@@ -84,9 +84,10 @@ désarmer et gérer son stop à la main (`plan_modify`).
 | Source | Accès | Configuration |
 |---|---|---|
 | **FRED** (Fed St. Louis) | API officielle, toutes séries | `FRED_API` (déjà dans le `.env`) |
-| **Recherche web** | Google Custom Search, sinon DuckDuckGo | `GOOGLE_API_KEY` + `GOOGLE_CSE_ID` (facultatif) |
+| **Recherche web** | DuckDuckGo (sans clé, sans compte) | rien à configurer |
 | **myfxbook** (sentiment retail) | API officielle (la page publique renvoie 403) | `MYFXBOOK_EMAIL` + `MYFXBOOK_PASSWORD` — **vos** identifiants, envoyés uniquement à myfxbook |
-| Calendrier éco + GDELT | déjà en place | `MT5_FILES`, `NEWS_GDELT` |
+| **Calendrier économique** | flux faireconomy (miroir ForexFactory), libre et sans clé | rien à configurer |
+| GDELT (titres) | libre | `NEWS_GDELT` |
 
 ## Filet de sécurité déterministe (indépendant du LLM)
 
@@ -107,11 +108,11 @@ de l'IA** : elles tournent à chaque cycle **et** dans un watchdog entre deux cy
 | **Gap week-end** | `AGENT_WEEKEND_FLATTEN=1` ferme tout au cutoff du vendredi (défaut 0 : blocage des entrées seulement) |
 | **Objectif vs jours minimum** | l'arrêt « objectif atteint » ne bloque plus les ouvertures tant que le minimum de jours de trading n'est pas atteint (sinon l'étape devenait invalidable) |
 
-## Modèle : Claude, DeepSeek… avec ou sans outils
+## Modèle : Nova, Claude, DeepSeek… avec ou sans outils
 
 Deux modes, choisis automatiquement (`BEDROCK_TOOL_MODE=auto`) :
 
-- **Tool calling** (Claude, Nova, Mistral Large…) : le modèle appelle lui-même
+- **Tool calling** (Nova, Claude, Mistral Large…) : le modèle appelle lui-même
   `get_chart`, `compute_indicator`, `web_search`, `plan_open`…
 - **Mode JSON** (DeepSeek et tout modèle sans *tool use*) : on lui livre un **dossier
   complet** du cycle (compte, positions, marchés, chart, stratégies, post-mortem, news)
@@ -336,8 +337,10 @@ déterministe (perte jour/total, nb positions, trades/jour, cooldown, concentrat
 | `data/market.py` | Indicateurs → snapshot chiffré (scan) |
 | `data/chart.py` | **Lecture chart** : multi-TF **au choix de l'agent** + bougies + swings + niveaux |
 | `data/indicators.py` | **Boîte à outils d'indicateurs** calculés à la demande (17 indicateurs) |
-| `data/news.py` | **News** : calendrier MT5 + FRED (Fed, série au choix) + GDELT + macro/devise |
-| `data/web.py` | **Recherche/lecture web** (Google/DuckDuckGo, pages publiques, sentiment retail) + garde-fous |
+| `data/news.py` | **News** : calendrier web + FRED (Fed, série au choix) + GDELT + biais macro/devise |
+| `data/calendar_web.py` | **Calendrier économique** (faireconomy/ForexFactory) — source du black-out news, sans MT5 |
+| `data/macro_web.py` | **Biais macro par devise** : momentum des taux FRED + surprises — calculé, jamais stocké |
+| `data/web.py` | **Recherche/lecture web** (DuckDuckGo, pages publiques, sentiment retail myfxbook) + garde-fous |
 | `brain/autopilot.py` | **Pilote de secours déterministe** quand l'IA est indisponible |
 | `brain/postmortem.py` | **Bilan chiffré + défauts récurrents** (apprentissage factuel) |
 | `strategy/regime.py` | Classification du régime de marché |
@@ -363,12 +366,21 @@ déterministe (perte jour/total, nb positions, trades/jour, cooldown, concentrat
 L'agent est **news-aware** ([data/news.py](data/news.py)) — à chaque cycle il
 reçoit, par devise du symbole :
 
-- **Calendrier économique MT5** (`calendar_history.csv`, exporté par
-  [`tools/ExportCalendar.mq5`](tools/ExportCalendar.mq5)) : surprises récentes +
-  événements **à venir** à fort impact.
+- **Calendrier économique web** ([data/calendar_web.py](data/calendar_web.py)) : flux
+  faireconomy, miroir du calendrier ForexFactory — **la source même sur laquelle repose la
+  règle news de FTMO**. Aucun terminal MT5, aucun CSV à exporter.
 - **Réserve fédérale / taux** via **FRED** (`FRED_API`) : Fed funds, 2 ans, 10 ans.
 - **Actualités** via **GDELT** (gratuit) : titres 48 h/devise, sentiment jugé par le LLM.
-- **Brain macro par devise** (`macro_features.csv` de `tools/macro_service.py`), s'il existe.
+- **Biais macro par devise** ([data/macro_web.py](data/macro_web.py)) : momentum des taux
+  de référence (FRED, une série par devise) + surprises du calendrier quand la source en
+  fournit. Calculé dans le cycle, **sans fichier** — donc rien qui puisse périmer en silence.
+
+> **Pourquoi ce changement.** Le calendrier et le biais macro venaient de deux CSV
+> (`calendar_history.csv`, `macro_features.csv`) écrits dans `MQL5\Files` par un indicateur
+> MT5 et un service horaire. Le jour où l'un des deux s'arrête, plus rien ne le signale : le
+> code lisait un fichier vieux de cinq semaines en croyant être protégé, et le black-out news
+> ne bloquait plus rien. Tout est désormais tiré du web à chaque cycle, et `calendar_ok`
+> tombe à `False` dès que la source est vide.
 
 Deux protections swing en découlent :
 1. **Black-out news** — l'agent n'ouvre **aucune** nouvelle position si un événement à

@@ -188,18 +188,14 @@ class MT5Config:
 
 @dataclass(frozen=True)
 class NewsConfig:
-    """Flux d'actualite pour un trader swing : calendrier economique MT5, donnees
-    Reserve federale (FRED) et titres d'actualite (GDELT), plus le brain macro
-    par devise (`macro_features.csv` produit par tools/macro_service.py)."""
+    """Flux d'actualite pour un trader swing : calendrier economique WEB (faireconomy /
+    ForexFactory, meme source que la regle news FTMO), donnees Reserve federale (FRED),
+    titres d'actualite (GDELT) et biais macro par devise calcule dans le cycle
+    (`data/macro_web.py`). AUCUN fichier MT5 : ni calendar_history.csv, ni
+    macro_features.csv — ces CSV pouvaient perimer sans que rien ne le signale."""
     enabled: bool = field(default_factory=lambda: os.environ.get("NEWS_ENABLED", "1") == "1")
-    # Dossier MQL5\Files du terminal MT5 (calendar_history.csv, macro_features.csv).
-    mt5_files: str = field(default_factory=lambda: os.environ.get("MT5_FILES", ""))
     fred_key: str = field(default_factory=lambda: _s("FRED_API"))
     use_gdelt: bool = field(default_factory=lambda: os.environ.get("NEWS_GDELT", "1") == "1")
-    # Calendrier WEB (faireconomy/ForexFactory) : remplace l'export MT5 ExportCalendar.mq5.
-    # Meme donnee que la regle news FTMO. Utilise quand aucun calendar_history.csv n'existe.
-    use_web_calendar: bool = field(default_factory=lambda:
-                                   os.environ.get("NEWS_WEB_CALENDAR", "1") == "1")
     # Fenetre "black-out" : pas de NOUVELLE entree si un event a fort impact touche
     # une devise du symbole dans +/- ces minutes (regle FTMO : 60 min avant news).
     blackout_min: int = _i("NEWS_BLACKOUT_MIN", 60)
@@ -239,9 +235,6 @@ class WebConfig:
         d.strip().lower() for d in os.environ.get("WEB_ALLOW_DOMAINS", "").split(",") if d.strip()))
     deny_domains: tuple[str, ...] = field(default_factory=lambda: tuple(
         d.strip().lower() for d in os.environ.get("WEB_DENY_DOMAINS", "").split(",") if d.strip()))
-    # Moteur de recherche : Google Custom Search si les deux cles sont presentes.
-    google_key: str = field(default_factory=lambda: _s("GOOGLE_API_KEY"))
-    google_cse: str = field(default_factory=lambda: _s("GOOGLE_CSE_ID"))
     # Sentiment retail myfxbook : la page publique est protegee (403). L'API officielle
     # demande un compte -> renseignez VOS identifiants dans .env pour l'activer.
     myfxbook_email: str = field(default_factory=lambda: _s("MYFXBOOK_EMAIL"))
@@ -254,15 +247,9 @@ class SourcesConfig:
     Fondamentaux, a l'image de TradingAgents. Tout est OPT-IN, FAIL-CLOSED et ASSAINI.
 
     Rien n'est actif par defaut : une source ne s'allume qu'avec sa cle (.env) ou son
-    drapeau. Les sources textuelles (Reddit, RSS, news) sont traitees comme des donnees
+    drapeau. Les sources textuelles (RSS, news) sont traitees comme des donnees
     hostiles (data/sanitize.py) : agregats chiffres + extraits neutralises seulement.
     """
-    # Reddit : JSON public, SANS cle. Drapeau explicite car c'est une source non fiable.
-    reddit_enabled: bool = field(default_factory=lambda:
-                                 os.environ.get("SOURCES_REDDIT", "0") == "1")
-    reddit_subs: tuple[str, ...] = field(default_factory=lambda: tuple(
-        s.strip() for s in os.environ.get("SOURCES_REDDIT_SUBS", "Forex,wallstreetbets").split(",")
-        if s.strip()))
     # RSS : flux libres (Reuters, banques centrales, medias). URLs separees par des virgules.
     rss_feeds: tuple[str, ...] = field(default_factory=lambda: tuple(
         u.strip() for u in os.environ.get("SOURCES_RSS", "").split(",") if u.strip()))

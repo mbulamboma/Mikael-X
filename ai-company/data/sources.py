@@ -15,7 +15,6 @@ TROIS PRINCIPES, herites du reste du desk :
      n'expose que des agregats chiffres + de rares extraits neutralises.
 
 CE QUI EST BRANCHE ICI (realiste, sans secret invente) :
-  - Reddit  : JSON public (sans cle) -> sentiment social heuristique (lexique bull/bear) ;
   - RSS     : n'importe quel flux (Reuters, banques centrales...) via la stdlib -> news ;
   - Finnhub : cle FINNHUB_API_KEY (palier gratuit) -> news societe, sentiment social score,
               profil + transactions d'inities (couvre l'essentiel de la colonne Fondamentaux) ;
@@ -120,33 +119,6 @@ def _classe_texte(texte: str) -> Optional[str]:
     if b == s:
         return None
     return "bull" if b > s else "bear"
-
-
-# --------------------------------------------------------------------------- Reddit (libre)
-class RedditSource(Source):
-    """Sentiment social via le JSON public de Reddit (sans cle). Heuristique de lexique :
-    le signal est faible, on l'expose comme tel (usage contrarien du desk)."""
-    name = "reddit"
-
-    @property
-    def enabled(self) -> bool:
-        return bool(getattr(self.cfg, "reddit_enabled", False))
-
-    def social_items(self, symbol: str) -> list[dict]:
-        if not self.enabled:
-            return []
-        requete, _ = _alias(symbol)               # « gold » plutot que « XAUUSD »
-        items: list[dict] = []
-        for sub in (self.cfg.reddit_subs or ["Forex"]):
-            data = self._get_json(
-                f"https://www.reddit.com/r/{sub}/search.json",
-                {"q": requete or symbol, "restrict_sr": 1, "sort": "new",
-                 "limit": 15, "t": "week"})
-            for child in (((data or {}).get("data") or {}).get("children") or []):
-                d = child.get("data") or {}
-                texte = f"{d.get('title', '')} {d.get('selftext', '')}"
-                items.append({"sentiment": _classe_texte(texte), "text": texte})
-        return items
 
 
 # --------------------------------------------------------------------------- RSS (libre)
@@ -321,7 +293,7 @@ class Sources:
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self._social = [RedditSource(cfg), FinnhubSource(cfg)]
+        self._social = [FinnhubSource(cfg)]
         self._news = [RSSNewsSource(cfg), FinnhubSource(cfg), EODHDSource(cfg)]
         self._fond = [FinnhubSource(cfg)]
         self._retail = [FXSSISource(cfg)]

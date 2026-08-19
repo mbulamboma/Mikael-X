@@ -1,5 +1,5 @@
 """Correctifs de la revue de risque : filet deterministe, magic, jour serveur,
-correlation, DST du calendrier, mode JSON (DeepSeek)."""
+correlation, calendrier indisponible, tool calling par famille de modele."""
 import _isolation  # noqa: F401  (base SQLite temporaire)
 import sys
 from datetime import datetime, timedelta, timezone
@@ -214,15 +214,22 @@ def test_objectif_atteint_ne_bloque_pas_avant_le_minimum_de_jours():
     assert any("OBJECTIF" in b for b in e.portfolio_gate(assez))     # la, on preserve
 
 
-# ---------------------------------------------------------------- A5 : DST calendrier
-def test_decalage_eet_selon_la_saison():
-    from data.news import _eet_offset
-    assert _eet_offset(datetime(2026, 1, 15, tzinfo=timezone.utc)) == 2    # hiver : UTC+2
-    assert _eet_offset(datetime(2026, 7, 15, tzinfo=timezone.utc)) == 3    # ete : UTC+3
-    assert _eet_offset(datetime(2026, 11, 15, tzinfo=timezone.utc)) == 2
+# ---------------------------------------------------------------- A5 : calendrier absent
+def test_calendrier_indisponible_coupe_le_black_out_visiblement():
+    """Si le calendrier web ne rend rien, `calendar_ok` doit tomber a False : le
+    black-out ne protege plus, et l'orchestrateur doit pouvoir le savoir. Le CSV MT5
+    n'existe plus — c'est justement lui qui masquait la panne en restant present et perime."""
+    from data.news import NewsFeed
+    from config import NewsConfig
+    f = NewsFeed.__new__(NewsFeed)
+    f.cfg = NewsConfig()
+    f.calendar_ok = True
+    f._web_cal = type("Vide", (), {"events": lambda *a, **k: ([], [])})()
+    assert f._calendar(datetime.now(timezone.utc)) == ([], [])
+    assert f.calendar_ok is False
 
 
-# ---------------------------------------------------------------- DeepSeek / mode JSON
+# ---------------------------------------------------------------- tool calling par famille
 def test_mode_json_selectionne_pour_deepseek():
     b = BedrockConfig(model_id="us.deepseek.r1-v1:0")
     assert b.supports_tools is False

@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
 """Recherche et lecture web — l'agent enquete comme un analyste macro.
 
-Le calendrier MT5 et FRED donnent des CHIFFRES ; ici l'agent va chercher le
+Le calendrier economique et FRED donnent des CHIFFRES ; ici l'agent va chercher le
 CONTEXTE : communiques de banques centrales, analyses, positionnement retail
 (myfxbook), commentaires de marche, geopolitique.
 
-  - `search(query)` : Google Custom Search si `GOOGLE_API_KEY` + `GOOGLE_CSE_ID`
-    sont fournis, sinon DuckDuckGo (sans cle).
+  - `search(query)` : DuckDuckGo (sans cle, sans compte).
   - `read(url)`     : telecharge une page publique et en extrait le TEXTE lisible.
   - `retail_sentiment(symbol)` : positionnement des particuliers (myfxbook
     community outlook) — indicateur souvent CONTRARIEN.
@@ -150,23 +149,7 @@ class WebResearch:
         stop = self._spend()
         if stop:
             return {"error": stop, "resultats": []}
-        res = (self._google(q, limit) if (self.cfg.google_key and self.cfg.google_cse)
-               else self._duckduckgo(q, limit))
-        return self._store(key, res)
-
-    def _google(self, q: str, limit: int) -> dict:
-        try:
-            r = requests.get("https://www.googleapis.com/customsearch/v1",
-                             params={"key": self.cfg.google_key, "cx": self.cfg.google_cse,
-                                     "q": q, "num": limit},
-                             timeout=self.cfg.timeout)
-            items = r.json().get("items", [])
-        except Exception as e:
-            log.info("Google CSE indispo (%s) — repli DuckDuckGo.", e)
-            return self._duckduckgo(q, limit)
-        return {"moteur": "google", "query": q,
-                "resultats": [{"titre": i.get("title", ""), "url": i.get("link", ""),
-                               "extrait": i.get("snippet", "")} for i in items][:limit]}
+        return self._store(key, self._duckduckgo(q, limit))
 
     def _duckduckgo(self, q: str, limit: int) -> dict:
         try:
