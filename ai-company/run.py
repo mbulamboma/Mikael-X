@@ -1129,6 +1129,12 @@ class Orchestrator:
             journal.record_cycle(store, T.cycle_context(), actions,
                                  mode=self.cfg.desk.mode, degraded=degraded, shadow=e.shadow,
                                  server_now=self.server_now().isoformat(), keep=e.journal_keep)
+            # issue de chaque debat du cycle (abstentions comprises) : petit, garde longtemps.
+            # Seul le cerveau desk tient un debat -> {} pour le solo, rien n'est ecrit.
+            journal.record_debates(store, getattr(self.agent, "last_debate", None) or {},
+                                   mode=self.cfg.desk.mode, shadow=e.shadow,
+                                   server_now=self.server_now().isoformat(),
+                                   keep=e.journal_keep)
         except Exception as exc:            # mesurer ne doit JAMAIS empecher de trader
             log.warning("Journalisation du cycle impossible (ignore): %s", exc)
 

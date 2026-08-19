@@ -267,6 +267,11 @@ class Debat:
         faits = self._faits(symbol, briefs)
         bull = self.bull.plaide(symbol, briefs, mandate, None, faits)
         bear = self.bear.plaide(symbol, briefs, mandate, bull, faits)
+        # ECART DU TOUR 1, capture AVANT que la boucle n'ecrase bull/bear. C'est le seul
+        # chiffre qui dit si le seuil DESK_DEBATE_GAP est bien place : sans lui, on ne peut
+        # regler le seuil que sur du ressenti. On le compare plus tard a l'ecart final pour
+        # savoir si un second tour a vraiment SEPARE les camps ou n'a rien apporte.
+        gap_initial = round(abs(bull["conviction"] - bear["conviction"]), 2)
         tours = [bull, bear]
         n = 1
         while n < max(1, self.cfg.desk.debate_rounds) and self._serre(bull, bear):
@@ -278,7 +283,10 @@ class Debat:
             bear = self.bear.plaide(symbol, briefs, mandate, bull, faits)
             tours += [bull, bear]
         verdict = self.juge.trancher(symbol, briefs, tours, faits)
-        return {"bull": bull, "bear": bear, "tours": n, "verdict": verdict}
+        mesure = {"gap_initial": gap_initial,
+                  "gap_final": round(abs(bull["conviction"] - bear["conviction"]), 2),
+                  "tours": n}
+        return {"bull": bull, "bear": bear, "tours": n, "verdict": verdict, "mesure": mesure}
 
     def _serre(self, bull: dict, bear: dict) -> bool:
         return abs(bull["conviction"] - bear["conviction"]) <= self.cfg.desk.debate_gap

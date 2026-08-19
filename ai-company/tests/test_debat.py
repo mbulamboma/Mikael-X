@@ -123,6 +123,23 @@ def test_plafond_de_tours_respecte(monkeypatch):
     assert Debat(cfg).sur(["EURUSD"], BRIEFS, {})["EURUSD"]["tours"] == 1
 
 
+def test_mesure_capture_l_ecart_du_tour_1(monkeypatch):
+    """gap_initial doit refleter le TOUR 1, meme si le tour 2 change les convictions —
+    sinon on ne pourrait pas mesurer ce qu'un second tour a change. C'est la donnee qui
+    manquait pour regler DESK_DEBATE_GAP sur des mesures."""
+    _bind()
+    cap = Capture(suites={
+        "bull": [_these(0.6), _these(0.9)],                 # tour 1: 0.6 ; tour 2: 0.9
+        "bear": [_these(0.55, "bear"), _these(0.2, "bear")],
+        "juge": [_verdict()]})
+    install(monkeypatch, cap)
+    res = Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {})["EURUSD"]
+    assert res["tours"] == 2
+    m = res["mesure"]
+    assert m["gap_initial"] == 0.05                          # |0.6 - 0.55|, capture au tour 1
+    assert m["gap_final"] == 0.70                            # |0.9 - 0.2|, apres le tour 2
+
+
 def test_le_juge_voit_tous_les_tours(monkeypatch):
     _bind()
     cap = Capture({"bull": _these(0.6), "bear": _these(0.55, "bear"), "juge": _verdict()})
@@ -246,6 +263,17 @@ def test_ouverture_conforme_au_juge_passe(monkeypatch):
     assert d["verdict"]["direction"] == "buy" and d["tours"] == 1
     assert d["conviction_bull"] == 0.9 and d["conviction_bear"] == 0.2
     assert "VERDICT DU JUGE" in cap.prompts["trader"][0]
+
+
+def test_le_dossier_archive_la_mesure_du_debat(monkeypatch):
+    """La mesure du debat (ecart des convictions) doit survivre dans le dossier du trade,
+    pour la revue par employe."""
+    _bind()
+    cap = _desk_capture(_verdict("buy"))       # bull 0.9 vs bear 0.2, un seul tour
+    install(monkeypatch, cap)
+    actions = TradingDesk(AgentConfig()).decide(SUMMARY)
+    m = actions[0]["dossier"]["debat"]["mesure"]
+    assert m["gap_initial"] == 0.7 and m["tours"] == 1
 
 
 def test_abstention_du_juge_supprime_l_ouverture(monkeypatch):

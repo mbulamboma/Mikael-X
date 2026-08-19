@@ -294,6 +294,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         from desk import bilan_roles
         print("===== REVUE DE PERFORMANCE DES EMPLOYES =====\n")
         print(bilan_roles.bloc_prompt(Memory().closed_trades()))
+        print("\n===== CALIBRATION DU DEBAT (DESK_DEBATE_GAP) =====\n")
+        print(bilan_roles.bloc_debat(journal.debates(store),
+                                     seuil_gap=CFG.desk.debate_gap))
         return 0
 
     from broker.mt5_broker import MT5Broker

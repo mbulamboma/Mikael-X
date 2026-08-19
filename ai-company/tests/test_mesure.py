@@ -201,6 +201,46 @@ def test_executed_opens_ignore_les_ordres_rejetes(tmp_path):
     assert len(executes) == 1 and executes[0]["entry"] == 1.1005
 
 
+# ============================================================ 3bis. journal des debats
+def _debate_dict(direction="buy", conviction=0.7, gap_initial=0.1, gap_final=0.6, tours=2):
+    return {"EURUSD": {"tours": tours,
+                       "mesure": {"gap_initial": gap_initial, "gap_final": gap_final,
+                                  "tours": tours},
+                       "verdict": {"direction": direction, "conviction": conviction,
+                                   "gagnant": "bull"}}}
+
+
+def test_journal_enregistre_chaque_debat(tmp_path):
+    st = _store(tmp_path)
+    journal.record_debates(st, _debate_dict(), mode="desk", shadow=True)
+    debs = journal.debates(st)
+    assert len(debs) == 1
+    d = debs[0]
+    assert d["symbol"] == "EURUSD" and d["direction"] == "buy" and d["shadow"] is True
+    assert d["gap_initial"] == 0.1 and d["gap_final"] == 0.6 and d["tours"] == 2
+
+
+def test_journal_debats_capture_les_abstentions(tmp_path):
+    """Une abstention ne devient jamais un trade : le journal des debats est sa SEULE trace."""
+    st = _store(tmp_path)
+    journal.record_debates(st, _debate_dict(direction="abstention", conviction=0.0),
+                           mode="desk", shadow=False)
+    assert journal.debates(st)[0]["direction"] == "abstention"
+
+
+def test_journal_debats_vide_n_ecrit_rien(tmp_path):
+    st = _store(tmp_path)
+    journal.record_debates(st, {}, mode="desk", shadow=False)
+    assert journal.debates(st) == []
+
+
+def test_journal_debats_ne_leve_jamais():
+    class _KO:
+        def log_event(self, *a, **k):
+            raise RuntimeError("disque plein")
+    journal.record_debates(_KO(), _debate_dict(), mode="desk", shadow=False)   # pas d'exception
+
+
 # ============================================================ 4. simulateur de rejeu
 def _bars(spec):
     """spec = liste de (high, low, close), une bougie par jour apres T0."""

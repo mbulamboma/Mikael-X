@@ -129,6 +129,88 @@ def bilan(trades: list[dict]) -> dict:
     return out
 
 
+def _mediane(xs: list[float]) -> float:
+    xs = sorted(xs)
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+
+def bilan_debat(debates: list[dict], seuil_gap: Optional[float] = None) -> dict:
+    """CALIBRATION de DESK_DEBATE_GAP a partir des debats JOURNALISES (desk/journal.debates),
+    abstentions comprises — l'echantillon que `bilan()` ne voit pas, puisqu'une abstention ne
+    devient jamais un trade.
+
+    On mesure deux choses, et deux seulement :
+      - l'ecart initial (tour 1) entre les convictions : sa distribution dit si le seuil est
+        bien place (trop de debats juste au-dessus = on rate des seconds tours utiles ; trop
+        en-dessous = on paie des tours pour rien) ;
+      - la SEPARATION apportee par un second tour (gap_final - gap_initial) : si elle est
+        quasi nulle, le second tour n'apprend rien et le seuil est trop genereux.
+
+    Sous MIN_N debats, on REFUSE de conclure (comme `bilan`). {} si rien de journalise."""
+    debates = [d for d in (debates or []) if isinstance(d, dict)]
+    if not debates:
+        return {}
+    n = len(debates)
+    verdicts: dict[str, int] = {}
+    gaps: list[float] = []
+    separations: list[float] = []            # gap_final - gap_initial, debats a >= 2 tours
+    n_second_tour = 0
+    for d in debates:
+        verdicts[str(d.get("direction") or "?").lower()] = \
+            verdicts.get(str(d.get("direction") or "?").lower(), 0) + 1
+        gi, gf = _f(d.get("gap_initial")), _f(d.get("gap_final"))
+        if gi is not None:
+            gaps.append(gi)
+        if (_f(d.get("tours")) or 1) >= 2:
+            n_second_tour += 1
+            if gi is not None and gf is not None:
+                separations.append(round(gf - gi, 3))
+    out: dict[str, Any] = {"n_debats": n, "suffisant": n >= MIN_N, "verdicts": verdicts,
+                           "second_tour": {"n": n_second_tour,
+                                           "pct": round(100 * n_second_tour / n, 1)}}
+    if gaps:
+        out["gap_initial"] = {"min": round(min(gaps), 2), "mediane": round(_mediane(gaps), 2),
+                              "max": round(max(gaps), 2)}
+    if separations:
+        out["separation_2e_tour_moyenne"] = round(sum(separations) / len(separations), 3)
+    if seuil_gap is not None and gaps:
+        sous = sum(1 for g in gaps if g <= seuil_gap)
+        out["sous_le_seuil"] = {"seuil": round(seuil_gap, 2), "n": sous,
+                                "pct": round(100 * sous / len(gaps), 1)}
+    return out
+
+
+def bloc_debat(debates: list[dict], seuil_gap: Optional[float] = None) -> str:
+    """Bloc lisible de la calibration du debat, pour `replay.py --roles`."""
+    b = bilan_debat(debates, seuil_gap)
+    if not b:
+        return ("(aucun debat journalise — activer EVAL_JOURNAL_CYCLES=1 ou EVAL_SHADOW=1 et "
+                "laisser tourner le desk ; la calibration du seuil apparaitra alors)")
+    lignes = [f"Debats journalises : {b['n_debats']}"]
+    if not b["suffisant"]:
+        lignes.append(f"ATTENTION : moins de {MIN_N} debats. BRUIT statistique — a lire, "
+                      f"pas a suivre pour regler DESK_DEBATE_GAP.")
+    verd = ", ".join(f"{k}={v}" for k, v in sorted(b["verdicts"].items()))
+    lignes.append(f"  verdicts : {verd}")
+    st = b["second_tour"]
+    lignes.append(f"  second tour : {st['n']} debat(s) ({st['pct']}%)")
+    if "gap_initial" in b:
+        g = b["gap_initial"]
+        lignes.append(f"  ecart tour 1 (conviction) : min={g['min']} mediane={g['mediane']} "
+                      f"max={g['max']}")
+    if "sous_le_seuil" in b:
+        s = b["sous_le_seuil"]
+        lignes.append(f"  sous le seuil {s['seuil']} (declenche un 2e tour) : {s['n']} "
+                      f"({s['pct']}%)")
+    if "separation_2e_tour_moyenne" in b:
+        sep = b["separation_2e_tour_moyenne"]
+        verdict = ("le 2e tour SEPARE les camps" if sep > 0.05 else
+                   "le 2e tour n'apporte quasi rien -> seuil peut-etre trop genereux")
+        lignes.append(f"  separation moyenne au 2e tour : {sep:+.3f} — {verdict}")
+    return "\n".join(lignes)
+
+
 def _ligne(nom: str, s: dict) -> str:
     if not s.get("n"):
         return f"    {nom:<18} (aucun cas)"

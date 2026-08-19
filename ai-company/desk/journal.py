@@ -27,6 +27,10 @@ from typing import Any, Optional
 log = logging.getLogger("desk.journal")
 
 CYCLE_KIND = "cycle_dossier"
+#: issue compacte de chaque debat d'un cycle — separee du dossier de cycle (gros, en
+#: rotation) parce qu'elle est petite et qu'on veut en garder BEAUCOUP : c'est l'echantillon
+#: qui permettra de regler DESK_DEBATE_GAP sur des mesures plutot que sur deux abstentions.
+DEBAT_KIND = "debat_cycle"
 #: au-dela de cette taille, on sacrifie les charts (le plus volumineux) pour garder
 #: le reste du dossier plutot que de gonfler la base sans limite.
 MAX_PAYLOAD_BYTES = 400_000
@@ -65,6 +69,47 @@ def record_cycle(store, ctx: dict, actions: list[dict], *, mode: str, degraded: 
             store.trim_events(CYCLE_KIND, keep)
     except Exception as e:                      # journalisation = confort, jamais critique
         log.warning("Journalisation du cycle impossible (ignore): %s", e)
+
+
+def record_debates(store, debates: dict, *, mode: str, shadow: bool,
+                   server_now: str = "", keep: int = 0) -> None:
+    """Enregistre l'issue de CHAQUE debat du cycle — y compris les abstentions, qui ne
+    deviennent jamais un trade et n'ont donc aucune autre trace. Ne leve jamais : une
+    panne de journalisation ne doit pas empecher de trader. Rien a ecrire -> on passe."""
+    try:
+        lignes = []
+        for sym, d in (debates or {}).items():
+            if not isinstance(d, dict):
+                continue
+            v = d.get("verdict") or {}
+            m = d.get("mesure") or {}
+            lignes.append({
+                "symbol": str(sym).upper(),
+                "gap_initial": m.get("gap_initial"), "gap_final": m.get("gap_final"),
+                "tours": d.get("tours"),
+                "direction": v.get("direction"), "conviction": v.get("conviction"),
+                "gagnant": v.get("gagnant")})
+        if not lignes:
+            return
+        store.log_event(DEBAT_KIND, {"mode": mode, "shadow": bool(shadow),
+                                     "server_now": server_now, "debats": lignes})
+        if keep:
+            store.trim_events(DEBAT_KIND, keep)
+    except Exception as e:                      # journalisation = confort, jamais critique
+        log.warning("Journalisation des debats impossible (ignore): %s", e)
+
+
+def debates(store, limit: Optional[int] = None, shadow_only: bool = False) -> list[dict]:
+    """Issues de debat journalisees, APLATIES (une ligne par symbole-cycle), du plus ancien
+    au plus recent. C'est la matiere de `bilan_roles.bilan_debat`."""
+    out = []
+    for e in store.events(kind=DEBAT_KIND, limit=limit):
+        if shadow_only and not e.get("shadow"):
+            continue
+        for d in e.get("debats") or []:
+            out.append({"ts": e.get("ts"), "mode": e.get("mode"),
+                        "shadow": bool(e.get("shadow")), **d})
+    return out
 
 
 def cycles(store, limit: Optional[int] = None, shadow_only: bool = False) -> list[dict]:

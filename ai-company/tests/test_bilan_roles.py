@@ -97,6 +97,37 @@ def test_le_bloc_reste_lisible_avec_des_donnees_partielles():
     assert isinstance(B.bloc_prompt(trades), str)
 
 
+# =========================================================== calibration du debat
+def _deb(direction="buy", gi=0.1, gf=0.5, tours=2, conviction=0.7):
+    return {"symbol": "EURUSD", "direction": direction, "conviction": conviction,
+            "gap_initial": gi, "gap_final": gf, "tours": tours}
+
+
+def test_bilan_debat_vide():
+    assert B.bilan_debat([]) == {}
+    assert "aucun debat" in B.bloc_debat([])
+
+
+def test_bilan_debat_mesure_la_calibration():
+    """3 debats serres (ecart 0.05, 2e tour qui n'apporte rien) + 2 tranches d'entree."""
+    debs = ([_deb("abstention", gi=0.05, gf=0.06, tours=2) for _ in range(3)]
+            + [_deb("buy", gi=0.5, gf=0.5, tours=1) for _ in range(2)])
+    b = B.bilan_debat(debs, seuil_gap=0.2)
+    assert b["n_debats"] == 5 and b["suffisant"] is True
+    assert b["verdicts"]["abstention"] == 3 and b["verdicts"]["buy"] == 2
+    assert b["second_tour"]["n"] == 3
+    assert b["sous_le_seuil"]["n"] == 3                      # les 3 a ecart 0.05 <= 0.2
+    assert b["separation_2e_tour_moyenne"] < 0.05           # le 2e tour n'a rien separe
+    bloc = B.bloc_debat(debs, seuil_gap=0.2)
+    assert "quasi rien" in bloc                             # diagnostic lisible du seuil
+
+
+def test_bilan_debat_refuse_de_conclure_sous_min_n():
+    debs = [_deb() for _ in range(3)]
+    assert B.bilan_debat(debs)["suffisant"] is False
+    assert "BRUIT" in B.bloc_debat(debs)
+
+
 # =========================================================== integration & CLI
 def test_le_gerant_recoit_la_revue(monkeypatch, tmp_path):
     """Le DG doit savoir qui apporte du signal, pas seulement ce que le compte a fait."""

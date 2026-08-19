@@ -75,6 +75,7 @@ class TradingDesk:
         self.debat = Debat(cfg)
         self.college_risque = CollegeRisque(cfg)
         self._last_mandate: dict = {}
+        self.last_debate: dict = {}          # dernier debat du cycle, expose au journal
         trace.configure(cfg.desk.trace_enabled)
         self._ckpt: Checkpoint | None = None
 
@@ -158,6 +159,9 @@ class TradingDesk:
                 debate = self.debat.sur(candidats, briefs, mandate)
                 if ckpt:
                     ckpt.set("debate", debate)
+            # expose au journal l'issue de CHAQUE debat du cycle, abstentions comprises
+            # (elles ne deviennent jamais un trade -> sinon aucune trace). Cf. run._journal_cycle.
+            self.last_debate = debate
             situations = self._situations(candidats, debate)
             trades = self.mem.closed_trades()
             reflexions = self.mem.reflexions() if self.cfg.desk.reflexion_enabled else []
@@ -404,6 +408,7 @@ class TradingDesk:
             verdict = debate.get("verdict") or {}
             dossier["debat"] = {
                 "tours": debate.get("tours"),
+                "mesure": debate.get("mesure") or {},
                 "conviction_bull": (debate.get("bull") or {}).get("conviction"),
                 "conviction_bear": (debate.get("bear") or {}).get("conviction"),
                 "verdict": {"direction": verdict.get("direction"),
