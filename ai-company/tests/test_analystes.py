@@ -146,11 +146,13 @@ def test_dossier_actualite_porte_les_news():
     assert "recherche" not in d                          # deja des news : pas de requete en plus
 
 
-def test_actualite_cherche_si_aucune_news():
+def test_actualite_survit_a_un_dossier_news_vide():
+    """Plus de repli `news_search` depuis le retrait de GDELT : sans news du symbole,
+    l'analyste doit rendre un dossier exploitable (calendrier + sources), pas lever."""
     live = _Live()
     _bind(live, news={"per_symbol": {}, "blackout": {}})
     d = AnalysteActualite(AgentConfig()).dossier("EURUSD", T.cycle_context(), live, {})
-    assert d["recherche"] == {"resultats": ["titre"]}
+    assert d["symbole"] == "EURUSD" and "recherche" not in d
 
 
 def test_source_en_panne_laisse_un_trou_pas_une_exception():

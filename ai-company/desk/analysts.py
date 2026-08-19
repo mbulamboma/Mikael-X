@@ -264,8 +264,6 @@ class AnalysteActualite(Analyste):
         bo = (news.get("blackout") or {}) if isinstance(news, dict) else {}
         d = {"symbole": symbol, "news_du_symbole": per.get(symbol),
              "blackout": bo.get(symbol), "evenements_a_venir": commun.get("evenements")}
-        if live is not None and not d["news_du_symbole"]:
-            d["recherche"] = _safe(lambda: live.news_search(symbol, 48), "recherche news")
         # sources pluggables : titres RSS, en plus du calendrier economique.
         if live is not None and self.cfg.sources.inject_news:
             extra = _safe(lambda: live.news_extra(symbol, 6), "news supplementaires")

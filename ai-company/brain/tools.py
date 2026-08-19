@@ -69,7 +69,7 @@ _LIVE: dict[str, Any] = {"provider": None}
 
 def bind_live(provider: Any):
     """`provider` expose : symbols(), market(), chart(), indicator(), news(),
-    news_search(), major_events(). Voir run.Orchestrator."""
+    major_events(). Voir run.Orchestrator."""
     _LIVE["provider"] = provider
 
 
