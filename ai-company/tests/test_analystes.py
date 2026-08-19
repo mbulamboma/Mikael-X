@@ -24,7 +24,7 @@ from config import AgentConfig
 from brain import tools as T
 from desk.base import DeskAgent, DeskUnavailable
 from desk.analysts import (Analystes, AnalysteTechnique, AnalysteFondamental,
-                           AnalysteSentiment, AnalysteActualite)
+                           AnalysteSentiment, AnalysteActualite, SERIES_MACRO)
 from desk.desk import TradingDesk
 
 
@@ -237,8 +237,22 @@ def test_dossier_commun_charge_une_seule_fois(monkeypatch):
     _bind(live)
     install(monkeypatch, Capture())
     Analystes(AgentConfig()).briefs(["EURUSD", "GBPUSD"], {})
-    assert live.appels.count("fred") == 5          # SERIES_MACRO, pas 5 x 2 symboles
+    assert live.appels.count("fred") == len(SERIES_MACRO)   # une fois par serie, pas x symbole
     assert live.appels.count("events") == 1
+
+
+def test_le_fondamental_vise_les_moteurs_de_l_or(monkeypatch):
+    """Sur une matiere premiere, la consigne (prompt SYSTEM) ne doit PAS parler d'ecart de
+    taux entre deux devises (l'or n'a pas de taux) mais des vrais moteurs : taux reels,
+    dollar, Fed, refuge, COT."""
+    _bind(_Live())
+    vus: dict[str, str] = {}
+    monkeypatch.setattr(DeskAgent, "ask_json",
+                        lambda self, s, h: vus.update({self.role: s}) or {})
+    AnalysteFondamental(AgentConfig()).brief("XAUUSD", {}, {"macro": {}, "evenements": {}})
+    sys_prompt = vus["fondamental"].lower()
+    assert "taux reels" in sys_prompt and "dollar" in sys_prompt
+    assert "cot" in sys_prompt and "refuge" in sys_prompt
 
 
 # =========================================================== integration desk

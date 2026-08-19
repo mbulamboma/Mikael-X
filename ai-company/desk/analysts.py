@@ -60,8 +60,10 @@ def _outils(*noms: str) -> list:
 log = logging.getLogger("desk.analystes")
 
 #: Toile de fond macro, chargee UNE fois par cycle (independante du symbole) : taux longs
-#: et courts US, inflation, chomage, taux directeur. Reperes de regime, pas de signaux.
-SERIES_MACRO = ("DGS10", "DGS2", "CPIAUCSL", "UNRATE", "FEDFUNDS")
+#: et courts US, inflation, chomage, taux directeur, PLUS le taux reel 10 ans (DFII10) et
+#: l'indice dollar large (DTWEXBGS) — les deux principaux moteurs de l'OR, que le cadre FX
+#: ne captait pas. Reperes de regime, pas de signaux.
+SERIES_MACRO = ("DGS10", "DGS2", "CPIAUCSL", "UNRATE", "FEDFUNDS", "DFII10", "DTWEXBGS")
 
 SYSTEM = """Tu es l'ANALYSTE {titre} d'une entreprise de trading FTMO (compte {account_size:.0f}
 USD). Tu analyses UN symbole : {symbol}.
@@ -216,10 +218,21 @@ class AnalysteTechnique(Analyste):
 class AnalysteFondamental(Analyste):
     role, title = "fondamental", "FONDAMENTAL"
     outils = tuple(_outils("get_fred_series", "get_macro_events", "get_trading_costs"))
-    mission = ("juger le fond macro-economique des DEUX devises du symbole : ecart de taux "
-               "et sa direction, inflation, emploi, trajectoire des banques centrales. Un "
-               "differentiel de taux qui s'ecarte porte une paire ; un cycle qui se retourne "
-               "la retourne. Ignore le graphique.")
+    mission = (
+        "juger le FOND macro-economique du symbole, selon sa NATURE.\n"
+        "  - MATIERE PREMIERE (une des 'devises' est XAU=or, XAG=argent, XTI/WTI=petrole) : "
+        "elle n'a NI banque centrale NI taux propre, le cadre 'ecart de taux entre deux "
+        "devises' ne s'applique PAS. Pour l'OR, ce qui fait le prix : les TAUX REELS US "
+        "(DFII10, ou DGS10 face a l'inflation CPIAUCSL — des taux reels qui montent pesent "
+        "sur l'or, qui baissent le portent) ; la FORCE DU DOLLAR (DTWEXBGS — l'or est cote en "
+        "USD, dollar fort = vent contraire) ; la TRAJECTOIRE DE LA FED (DGS2, FEDFUNDS — un "
+        "virage accommodant soutient l'or) ; la DEMANDE REFUGE (aversion au risque, "
+        "geopolitique) ; et le POSITIONNEMENT COT s'il est au dossier (net des speculateurs : "
+        "une foule deja tres longue est un risque de retournement, lecture contrarienne).\n"
+        "  - PAIRE FX : juge l'ecart de taux entre les DEUX devises et sa direction, "
+        "l'inflation, l'emploi, la trajectoire des banques centrales. Un differentiel qui "
+        "s'ecarte porte une paire ; un cycle qui se retourne la retourne.\n"
+        "Dans tous les cas : cite les series du dossier, ignore le graphique.")
 
     def dossier(self, symbol, ctx, live, commun):
         d = {"symbole": symbol, "devises": _devises(symbol),
