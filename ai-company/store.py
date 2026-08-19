@@ -13,7 +13,6 @@ suivi du trailing, l'attribution du R et le post-mortem. Avec SQLite :
 
 Tables :
   events    : journal horodate (kind + payload JSON) — ordres, vetos, clotures, secours...
-  lessons   : lecons apprises (apprentissage)
   open_meta : ticket -> metadonnees de la position (strategie, risque, trailing, MFE/MAE)
   kv        : etats divers (session FTMO, mode secours, cache news) en JSON
 
@@ -46,15 +45,6 @@ CREATE TABLE IF NOT EXISTS events (
     payload TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, id);
-
-CREATE TABLE IF NOT EXISTS lessons (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts      TEXT NOT NULL,
-    symbol  TEXT,
-    outcome TEXT,
-    text    TEXT NOT NULL,
-    tags    TEXT NOT NULL DEFAULT '[]'
-);
 
 CREATE TABLE IF NOT EXISTS open_meta (
     ticket  TEXT PRIMARY KEY,
@@ -181,23 +171,6 @@ class Store:
                      n, jours)
         return n
 
-    # ------------------------------------------------------------------ lecons
-    def add_lesson(self, symbol: str, outcome: str, text: str, tags: list[str] | None = None):
-        self._exec("INSERT INTO lessons (ts, symbol, outcome, text, tags) VALUES (?, ?, ?, ?, ?)",
-                   (_now(), symbol, outcome, text.strip(),
-                    json.dumps(tags or [], ensure_ascii=False)))
-
-    def lessons(self) -> list[dict]:
-        out = []
-        for r in self._rows("SELECT ts, symbol, outcome, text, tags FROM lessons ORDER BY id"):
-            try:
-                tags = json.loads(r["tags"])
-            except (json.JSONDecodeError, TypeError):
-                tags = []
-            out.append({"ts": r["ts"], "symbol": r["symbol"], "outcome": r["outcome"],
-                        "text": r["text"], "tags": tags if isinstance(tags, list) else []})
-        return out
-
     # ------------------------------------------------------------------ positions
     def meta_all(self) -> dict:
         out = {}
@@ -247,7 +220,6 @@ class Store:
         d = self.path.parent
         jobs = (
             ("trades.jsonl", self._import_trades),
-            ("lessons.json", self._import_lessons),
             ("session.json", lambda data: self.kv_set("session", data)),
             ("open_meta.json", lambda data: self.meta_replace(data)),
             ("news_cache.json", lambda data: self.kv_set("news_cache", data)),
@@ -281,17 +253,6 @@ class Store:
             rows.append((ts, kind, json.dumps(r, ensure_ascii=False, default=str)))
         with self._lock:
             self.db.executemany("INSERT INTO events (ts, kind, payload) VALUES (?, ?, ?)", rows)
-
-    def _import_lessons(self, data: list):
-        if not isinstance(data, list):
-            return
-        rows = [(l.get("ts", _now()), l.get("symbol", ""), l.get("outcome", ""),
-                 str(l.get("text", "")).strip(),
-                 json.dumps(l.get("tags", []), ensure_ascii=False))
-                for l in data if isinstance(l, dict) and l.get("text")]
-        with self._lock:
-            self.db.executemany(
-                "INSERT INTO lessons (ts, symbol, outcome, text, tags) VALUES (?, ?, ?, ?, ?)", rows)
 
 
 _DEFAULT: Optional[Store] = None

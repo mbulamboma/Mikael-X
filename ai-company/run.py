@@ -8,8 +8,9 @@ de cycle). La watchlist AGENT_SYMBOLS n'est qu'un pre-scan de depart.
 
 Cycle (toutes les AGENT_LOOP_SECONDS) :
   1. Rafraichit compte + snapshots marche + positions ; resout les clotures.
-  2. Pour chaque cloture -> attribue le resultat (R) a la strategie utilisee,
-     met a jour le scoreboard, et REFLECHIT (ecrit une lecon) -> apprentissage.
+  2. Pour chaque cloture -> attribue le resultat (R) a la strategie utilisee et met
+     a jour le scoreboard + le post-mortem chiffre (aucune "lecon" redigee par le LLM :
+     seules des mesures verifiables remontent dans les prompts).
   3. Calcule le regime + le classement des strategies (adequation x track-record).
   4. Garde-fous FTMO de portefeuille (peut-on trader ?).
   5. Le LLM choisit la MEILLEURE strategie et rend trade/wait.
@@ -170,6 +171,15 @@ class Orchestrator:
 
     def web_read(self, url: str, max_chars: int | None = None) -> dict:
         return self.web.read(url, max_chars)
+
+    # Recherches / lectures EN PARALLELE : plusieurs pages en un seul aller-retour de
+    # temps mural au lieu de N appels sequentiels (cf. outils web_search_multiple /
+    # web_read_multiple). Le budget web par cycle reste partage et respecte.
+    def multiple_search(self, queries: list[str], limit: int = 6) -> list[dict]:
+        return self.web.multiple_search(queries, limit)
+
+    def multiple_read(self, urls: list[str], max_chars: int | None = None) -> list[dict]:
+        return self.web.multiple_read(urls, max_chars)
 
     def retail_sentiment(self, symbol: str = "") -> dict:
         return self.web.retail_sentiment(symbol)
@@ -403,7 +413,7 @@ class Orchestrator:
 
     def _lazy_agent(self):
         """Choisit le cerveau selon AGENT_MODE : DESK multi-agents (defaut) ou agent SOLO
-        (repli historique). Les deux exposent le meme contrat (decide/reflect/degraded)."""
+        (repli historique). Les deux exposent le meme contrat (decide/degraded)."""
         if self.agent is None:
             if self.cfg.desk.mode == "solo":
                 from brain.agent import TraderAgent
@@ -460,21 +470,14 @@ class Orchestrator:
                  "duree_h": self._duree_h(meta.get("ouvert_le")),
                  "entry_planifiee": meta.get("entry_planifiee"),
                  "derive_entree_pips": meta.get("derive_entree_pips"),
-                 # trace de QUI a decide : sert a l'attribution par rol a la cloture
+                 # trace de QUI a decide : c'est la matiere de la revue par employe
                  "dossier": meta.get("dossier") or {}}
         self.mem.log_event("trade_closed", trade)
         log.info("Cloture %s [%s] -> R=%.2f, PnL=%.2f", meta.get("symbol"), strat, R, pnl)
-        lesson = ""
-        try:
-            # la lecon s'appuie sur le bilan chiffre -> apprentissage fonde, pas de blabla
-            bilan = PostMortem(self.mem.closed_trades()).as_prompt_block()
-            lesson = self._lazy_agent().reflect(trade, bilan)
-            self.mem.add_lesson(meta.get("symbol", "?"), "win" if R > 0 else "loss", lesson,
-                                tags=[strat, str(meta.get("regime") or "")])
-            log.info("Lecon [%s]: %s", strat, lesson)
-        except Exception as e:
-            log.warning("Reflexion impossible: %s", e)
-        self._notifier("trade_ferme", trade, lesson)
+        # Pas de "lecon" ecrite par le LLM a la cloture : le trade journalise ci-dessus
+        # alimente des mesures (post-mortem chiffre, scoreboard, revue par employe, cas
+        # comparables) qui, elles, sont verifiables et se relisent sans y croire sur parole.
+        self._notifier("trade_ferme", trade)
         return R
 
     @staticmethod
@@ -621,8 +624,6 @@ class Orchestrator:
                 log.error("ATTENTION : %d position(s) hors agent restent ouvertes et pesent "
                           "sur la perte du jour — intervention MANUELLE requise.",
                           len(etrangeres))
-            self.mem.add_lesson("*", "loss", f"Urgence FTMO declenchee: {panique}",
-                                tags=["risque", "urgence"])
             self._last_summary = summary
             self._notifier("alerte", "URGENCE FTMO — fermeture totale", panique,
                            action_requise=(
@@ -876,16 +877,11 @@ class Orchestrator:
             log.info("BLACK-OUT news sur %s (%s dans %sh) — entree bloquee.",
                      sym, bo.get("reason"), bo.get("in_hours"))
             self.mem.log_event("news_blackout", {"symbol": sym, **bo})
-            self.mem.add_lesson(sym, "vetoed",
-                                f"Entree {sym} bloquee: news '{bo.get('reason')}' imminente.",
-                                tags=[strat, "news"])
             return
         gap = self._weekend_guard()
         if gap:
             log.info("Ouverture %s bloquee : %s", sym, gap)
             self.mem.log_event("weekend_guard", {"symbol": sym, "raison": gap})
-            self.mem.add_lesson(sym, "vetoed", f"Entree {sym} refusee: {gap}",
-                                tags=[strat, "gap"])
             return
         prop = TradeProposal(symbol=sym, direction=a["direction"], entry=a["entry"],
                              sl=a["sl"], tp=a["tp"], confidence=a.get("confidence", 0.6),
@@ -897,9 +893,6 @@ class Orchestrator:
             log.info("Ouverture %s refusee : %s", sym, refus)
             self.mem.log_event("entry_drift", {"symbol": sym, "strategy": strat,
                                                "entry_ia": entry_ia, "raison": refus})
-            self.mem.add_lesson(sym, "vetoed",
-                                f"Entree {sym} [{strat}] refusee: {refus}. Proposer un niveau "
-                                f"executable maintenant, pas un prix espere.", tags=[strat, "entree"])
             return
         # Plafond de risque impose par le Risk Manager LLM du desk (durcit seulement).
         risk_override = float(a.get("risk_pct") or 0.0)
@@ -914,8 +907,6 @@ class Orchestrator:
         if not rd.approved:
             log.info("VETO risque %s: %s", sym, "; ".join(rd.reasons))
             self.mem.log_event("risk_veto", {"proposal": vars(prop), "reasons": rd.reasons})
-            self.mem.add_lesson(sym, "vetoed", f"Setup {sym} [{strat}] refuse: {rd.reasons[0]}",
-                                tags=[strat])
             return
         log.info("OUVERTURE [%s]: %s %s lot %.2f (%s)", strat, prop.direction, sym,
                  rd.lot, rd.reasons[0])
@@ -1042,10 +1033,7 @@ class Orchestrator:
 
         strat_block = self._strategies_block(snaps, sb)
         pm = PostMortem(self.mem.closed_trades())
-        lessons = self.mem.relevant_lessons_text(
-            symbols=watch + [p["symbol"] for p in pos_view],
-            strategies=[p.get("strategy", "") for p in pos_view] + playbooks.names())
-        T.bind_context(snaps, charts, summary, pos_view, lessons,
+        T.bind_context(snaps, charts, summary, pos_view,
                        strat_block, news, postmortem=pm.as_prompt_block())
         T.bind_live(self)          # acces libre : symboles, timeframes, indicateurs, news
         try:

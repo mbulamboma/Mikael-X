@@ -36,7 +36,7 @@ def _position(ticket=77, symbol="EURUSD", floating_R=-0.9, mfe_R=0.2):
 
 
 def _bind(positions):
-    T.bind_context({}, {}, SUMMARY, positions, "", "", {"blackout": {}})
+    T.bind_context({}, {}, SUMMARY, positions, "", {"blackout": {}})
     T.bind_live(None)
 
 

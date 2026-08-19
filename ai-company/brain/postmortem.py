@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""POST-MORTEM — l'agent apprend de ses erreurs avec des CHIFFRES, pas des impressions.
+"""POST-MORTEM — ce que les trades passes disent VRAIMENT, en chiffres.
 
-Les "lecons" ecrites par le LLM apres chaque cloture sont utiles mais subjectives et
-vite redondantes. Ici on regarde le journal (table `events` de `state/agent.db`) et on extrait
+C'est la seule memoire de performance de l'agent : il n'ecrit aucune "lecon" apres une
+cloture (une phrase produite par un LLM n'est ni verifiable ni mesurable, et elle vieillit
+mal). Ici on regarde le journal (table `events` de `state/agent.db`) et on extrait
 des FAITS mesurables, puis on formule des defauts recurrents :
 
   - plan vs realite : R:R planifie contre R reellement encaisse,
@@ -13,8 +14,8 @@ des FAITS mesurables, puis on formule des defauts recurrents :
     (confiance annoncee vs resultat).
 
 Le bloc produit par `as_prompt_block()` est injecte a chaque cycle : l'agent voit
-ses propres travers chiffres avant de decider, et la reflexion du LLM s'appuie
-dessus au lieu de tourner en rond.
+ses propres travers chiffres avant de decider. Chaque ligne est recalculee depuis le
+journal — rien ici n'est une opinion, donc rien ici ne peut deriver.
 """
 from __future__ import annotations
 

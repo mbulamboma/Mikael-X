@@ -8,7 +8,9 @@ Points verifies :
     abstention ou direction opposee = ouverture supprimee ;
   - un verdict illisible vaut ABSTENTION (le seul defaut qui ne peut pas perdre d'argent) ;
   - une panne pendant le debat retire le debat de CE symbole (jamais de plaidoirie sans
-    contradicteur, ni de debat sans juge) et laisse le Trader decider seul.
+    contradicteur, ni de debat sans juge) et laisse le Trader decider seul ;
+  - ANTI-SPECULATION : un argument qui ne cite aucune donnee du dossier est ecarte, un camp
+    sans preuve perd sa conviction, et un verdict non fonde devient une abstention.
 """
 import _isolation  # noqa: F401  (base SQLite temporaire)
 import sys
@@ -28,11 +30,17 @@ from desk.desk import TradingDesk
 
 SUMMARY = {"equity": 100_000.0, "objectif_atteint": False, "perte_jour_pct": 0.2,
            "positions_ouvertes": 0, "ouvertures_bloquees": False, "gate_raisons": []}
-BRIEFS = {"EURUSD": {"technique": {"biais": "haussier", "confiance": 0.7, "resume": "cassure"}}}
+BRIEFS = {"EURUSD": {"technique": {"biais": "haussier", "confiance": 0.7,
+                                   "resume": "cassure du plus haut 1.1120",
+                                   "points_cles": ["plus haut 20j a 1.1120"]}}}
+#: le scan porte de VRAIS chiffres : sans dossier chiffre, aucune plaidoirie ne serait
+#: recevable (c'est precisement ce que le filtre de preuves garantit).
+SNAP = {"symbol": "EURUSD", "close": 1.1000, "atr": 0.0040,
+        "haut_20": 1.1120, "bas_20": 1.0900}
 
 
 def _bind():
-    T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, SUMMARY, [], "", "trend_up", {})
+    T.bind_context({"EURUSD": SNAP}, {}, SUMMARY, [], "trend_up", {})
     T.bind_live(None)
 
 
@@ -60,14 +68,16 @@ def install(monkeypatch, cap):
     monkeypatch.setattr(DeskAgent, "ask_json", lambda self, s, h: cap.json(self, s, h))
 
 
-def _these(conviction, camp="bull"):
+def _these(conviction, camp="bull", arguments=None):
     return {"conviction": conviction, "these": f"these du {camp}",
-            "arguments": ["chiffre"], "risque_principal": "x", "refutation": "y"}
+            "arguments": arguments if arguments is not None
+            else ["cassure du plus haut 1.1120", "ATR D1 0.0040"],
+            "risque_principal": "x", "refutation": "y"}
 
 
-def _verdict(direction="buy", conviction=0.7):
+def _verdict(direction="buy", conviction=0.7, invalidation="cloture sous 1.0900"):
     return {"direction": direction, "conviction": conviction, "gagnant": "bull",
-            "plan": "acheter le repli", "invalidation": "cloture sous 1.09",
+            "plan": "acheter le repli vers 1.1000", "invalidation": invalidation,
             "risques_non_resolus": ["FOMC"]}
 
 
@@ -144,16 +154,60 @@ def test_juge_injoignable_annule_le_debat(monkeypatch):
     assert Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {}) == {}
 
 
-def test_lecons_par_camp(monkeypatch):
+# =========================================================== anti-speculation
+def test_argument_sans_preuve_est_ecarte(monkeypatch):
+    _bind()
+    cap = Capture({"bull": _these(0.8, arguments=["le dollar va faiblir",
+                                                  "cassure du plus haut 1.1120"]),
+                   "bear": _these(0.2, "bear"), "juge": _verdict()})
+    install(monkeypatch, cap)
+    bull = Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {})["EURUSD"]["bull"]
+    assert bull["arguments"] == ["cassure du plus haut 1.1120"]
+    assert bull["ecartes_sans_preuve"] == ["le dollar va faiblir"]
+    assert bull["conviction"] == 0.8                  # il reste un argument sourcé
+
+
+def test_plaidoirie_sans_aucune_preuve_perd_sa_conviction(monkeypatch):
+    """Plaider sans chiffre ne doit pas payer : la conviction tombe a zero."""
+    _bind()
+    cap = Capture({"bull": _these(0.9, arguments=["ca va monter", "le marche est haussier"]),
+                   "bear": _these(0.2, "bear"), "juge": _verdict()})
+    install(monkeypatch, cap)
+    res = Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {})["EURUSD"]
+    assert res["bull"]["conviction"] == 0.0 and res["bull"]["arguments"] == []
+
+
+def test_verdict_non_source_devient_abstention(monkeypatch):
+    """Le juge conclut a l'achat sans rattacher son plan a une donnee : abstention."""
+    _bind()
+    cap = Capture({"bull": _these(0.9), "bear": _these(0.2, "bear"),
+                   "juge": {"direction": "buy", "conviction": 0.8, "gagnant": "bull",
+                            "plan": "acheter, la tendance est bien orientee",
+                            "invalidation": "si la tendance se retourne"}})
+    install(monkeypatch, cap)
+    v = Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {})["EURUSD"]["verdict"]
+    assert v["direction"] == "abstention" and v["conviction"] == 0.0
+    assert "citent aucune donnee" in v["raison_abstention"]
+
+
+def test_verdict_source_garde_sa_trace(monkeypatch):
     _bind()
     cap = Capture({"bull": _these(0.9), "bear": _these(0.2, "bear"), "juge": _verdict()})
     install(monkeypatch, cap)
-    vus = []
-    Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {},
-                             lambda roles: vus.append(roles[0]) or f"lecon {roles[0]}")
-    assert vus == ["bull", "bear", "juge"]
-    assert "lecon bull" in cap.prompts["bull"][0]
-    assert "lecon bull" not in cap.prompts["bear"][0]
+    v = Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {})["EURUSD"]["verdict"]
+    assert v["direction"] == "buy" and "1.0900" in v["preuves"]
+
+
+def test_debat_entierement_speculatif_ne_produit_aucun_trade(monkeypatch):
+    """Deux camps sans preuve : meme un juge convaincu ne peut pas engager d'argent."""
+    _bind()
+    cap = Capture({"bull": _these(0.9, arguments=["ca va monter"]),
+                   "bear": _these(0.8, "bear", arguments=["ca va baisser"]),
+                   "juge": _verdict()})
+    install(monkeypatch, cap)
+    v = Debat(AgentConfig()).sur(["EURUSD"], BRIEFS, {})["EURUSD"]["verdict"]
+    assert v["direction"] == "abstention"
+    assert "argument" in v["raison_abstention"]
 
 
 # =========================================================== le verdict s'impose (desk)
@@ -162,13 +216,15 @@ def _open(direction="buy", symbol="EURUSD"):
             "direction": direction, "entry": 1.10,
             "sl": 1.09 if direction == "buy" else 1.11,
             "tp": 1.13 if direction == "buy" else 1.07,
-            "confidence": 0.7, "rationale": "macro + technique"}
+            "confidence": 0.7,
+            "rationale": "cassure du plus haut 1.1120, invalidation sous 1.0900"}
 
 
 def _desk_capture(verdict, direction_trader="buy"):
     return Capture({
         "gerant": {"convoquer_desk": True, "candidats": ["EURUSD"], "posture": "selectif"},
-        "technique": {"biais": "haussier", "confiance": 0.7, "resume": "cassure"},
+        "technique": {"biais": "haussier", "confiance": 0.7, "resume": "cassure",
+                      "points_cles": ["plus haut 20j a 1.1120"]},
         "fondamental": {"biais": "neutre", "confiance": 0.3, "resume": "taux stables"},
         "sentiment": {"biais": "baissier", "confiance": 0.5, "resume": "retail long 80%"},
         "actualite": {"biais": "neutre", "confiance": 0.4, "resume": "rien d'imminent"},

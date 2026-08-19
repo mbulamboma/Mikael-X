@@ -117,7 +117,7 @@ def test_le_gerant_recoit_la_revue(monkeypatch, tmp_path):
             mem.log_event("trade_closed", _trade(2.0))
         summary = {"equity": 100_000.0, "objectif_atteint": False, "perte_jour_pct": 0.1,
                    "positions_ouvertes": 0, "ouvertures_bloquees": False, "gate_raisons": []}
-        T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, summary, [], "", "trend_up", {})
+        T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, summary, [], "trend_up", {})
         T.bind_live(None)
         prompts = {}
         monkeypatch.setattr(DeskAgent, "ask_json",

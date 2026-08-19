@@ -6,7 +6,7 @@ deux cerveaux (solo vs desk) sur les memes donnees, ni savoir pourquoi un trade 
 pris. Ce module enregistre, a chaque cycle :
 
   - le DOSSIER complet vu par le cerveau (compte/FTMO, positions, scan, charts, news,
-    strategies, bilan, lecons) — exactement ce que `tools.bind_context` a publie ;
+    strategies, bilan) — exactement ce que `tools.bind_context` a publie ;
   - le PLAN rendu (actions), le mode (`solo`/`desk`), l'etat degrade, le mode ombre.
 
 Deux consommateurs :
@@ -55,7 +55,6 @@ def record_cycle(store, ctx: dict, actions: list[dict], *, mode: str, degraded: 
             "news": ctx.get("news") or {},
             "strategies": ctx.get("strategies") or "",
             "postmortem": ctx.get("postmortem") or "",
-            "lessons": ctx.get("lessons") or "",
             "actions": actions or [],
         }
         if len(json.dumps(payload, ensure_ascii=False, default=str)) > MAX_PAYLOAD_BYTES:

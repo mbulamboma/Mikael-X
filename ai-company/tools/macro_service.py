@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 r"""
-macro_service.py — le "cerveau data" unique des EA MIKAEL (v4).
+macro_service.py — le "cerveau data" de l'entreprise d'agents (ai-company).
 
 Sources -> scores PAR DEVISE (8 majeures) -> MQL5\Files\macro_features.csv
   1. Calendrier MT5 (calendar_history.csv)  : surprises normalisees 72h
@@ -8,6 +8,10 @@ Sources -> scores PAR DEVISE (8 majeures) -> MQL5\Files\macro_features.csv
   3. GDELT (gratuit, sans cle)              : titres de news 72h par devise
   4. Alpha Vantage (--av, cle .env)         : complement news (quota 25/j !)
   5. FinBERT (ProsusAI/finbert, local CPU)  : titre -> score [-1,+1], cache
+
+Consomme par ai-company/data/news.py (biais macro par devise). Si le service
+ne tourne pas, le champ macro du dossier news reste vide : degradation douce,
+l'agent continue sans ce signal.
 
 ANTI-LOOKAHEAD : le service n'ecrit que des donnees deja publiees a l'instant
 du run ; chaque run est aussi APPENDE dans history/ -> c'est le dataset
@@ -27,8 +31,8 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
-ROOT      = Path(__file__).resolve().parent
-TRADING   = ROOT.parent
+ROOT      = Path(__file__).resolve().parent   # ai-company/tools
+APP       = ROOT.parent                        # ai-company (son .env)
 
 def _resolve_mt5_files():
     """Dossier MQL5\\Files du terminal MT5.
@@ -47,8 +51,11 @@ def _resolve_mt5_files():
         raise RuntimeError("Aucun dossier MT5 MQL5\\Files trouve sous %s "
                            "-- definir MT5_FILES." % base)
     def score(p):
-        has_mikael = any(p.glob("MIKAEL_*"))
-        return (has_mikael, p.stat().st_mtime)
+        # marqueur du terminal "de travail" : les fichiers que produisent
+        # ExportCalendar.mq5 / ce service (les EA MIKAEL_* n'existent plus).
+        connu = any((p / f).exists() for f in ("calendar_history.csv",
+                                               "macro_features.csv")) or any(p.glob("MIKAEL_*"))
+        return (connu, p.stat().st_mtime)
     return max(cands, key=score)
 
 TERM_FILES= _resolve_mt5_files()
@@ -57,11 +64,15 @@ HIST_DIR  = ROOT / "history";  HIST_DIR.mkdir(exist_ok=True)
 CACHE_DIR = ROOT / "cache";    CACHE_DIR.mkdir(exist_ok=True)
 CACHE_FILE= CACHE_DIR / "finbert_cache.json"
 
-load_dotenv(TRADING / ".env")
+# UN SEUL .env : celui de l'application (ai-company/.env), la meme source que config.py.
+# Une variable deja presente dans l'environnement l'emporte toujours (conteneur/service).
+load_dotenv(APP / ".env")
 FRED_KEY = os.environ.get("FRED_API", "").strip()
 AV_KEY   = os.environ.get("ALPHA_VANTAGE_API", "").strip()
 
-CCYS = ["EUR","USD","JPY","GBP","AUD","NZD","CAD","CHF"]
+CCYS = ["EUR","USD","JPY","GBP","AUD","NZD","CAD","CHF","XAU"]
+# XAU ajoute le 2026-08-19 (compte OR uniquement) : pas de calendrier ni de FRED
+# propre au metal -> seul le sentiment de presse le renseigne, le reste reste a 0.
 
 # requetes GDELT par devise (anglais uniquement, banques centrales + devise)
 # regle GDELT : mots SEULS sans guillemets, phrases multi-mots avec guillemets
@@ -74,6 +85,7 @@ GDELT_Q = {
  "NZD": '(RBNZ OR "new zealand dollar")',
  "CAD": '("Bank of Canada" OR "canadian dollar")',
  "CHF": '("Swiss National Bank" OR "swiss franc")',
+ "XAU": '(gold OR bullion OR "gold price" OR "precious metals")',
 }
 
 def log(msg): print(f"[{datetime.now(timezone.utc):%H:%M:%S}] {msg}", flush=True)

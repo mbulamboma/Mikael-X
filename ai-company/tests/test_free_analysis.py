@@ -111,7 +111,7 @@ def test_chart_deux_timeframes():
 # ----------------------------------------------------------------- outils LLM
 def test_outils_libres_utilisent_le_provider_live():
     p = FakeProvider()
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     T.bind_live(p)
 
     univers = json.loads(T.list_symbols(query="AUD"))
@@ -141,7 +141,7 @@ def test_outils_libres_utilisent_le_provider_live():
 
 
 def test_outils_degradent_sans_provider():
-    T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, {}, [], "", "", {})
+    T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, {}, [], "", {})
     T.bind_live(None)
     assert "error" in json.loads(T.list_symbols())
     assert json.loads(T.get_market(symbol="EURUSD"))["symbol"] == "EURUSD"   # cache du cycle
@@ -308,7 +308,7 @@ def test_outils_web_passent_par_le_provider():
             return {"serie": series_id, "dernier": {"valeur": 3.1}}
 
     p = P()
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     T.bind_live(p)
     assert "FOMC minutes" in T.web_search(query="FOMC minutes", limit=3)
     assert "maintient" in T.web_read(url="https://fed.gov/x")
@@ -323,7 +323,7 @@ def test_outils_web_passent_par_le_provider():
 
 
 def test_plan_trail_porte_le_timeframe_choisi():
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     T.plan_trail(ticket=11, atr_mult=2.5, activate_r=1.0, timeframe="h4")
     a = T.pop_actions()[0]
     assert a["type"] == "trail" and a["atr_mult"] == 2.5 and a["timeframe"] == "H4"

@@ -193,14 +193,3 @@ def test_mfe_mae_suivis_a_chaque_cycle():
     assert o.mem.saved is meta                                        # persiste
 
 
-def test_lecons_triees_par_pertinence_et_dedupliquees():
-    from brain.memory import Memory
-    from store import Store
-    mem = Memory(Store(Path(tempfile.mkdtemp()) / "agent.db"))
-    mem.add_lesson("USDJPY", "win", "Vieille lecon sans rapport", tags=["momentum"])
-    mem.add_lesson("EURUSD", "loss", "Stop trop serre sur EURUSD", tags=["trend_follow"])
-    mem.add_lesson("GBPUSD", "win", "Stop trop serre sur EURUSD", tags=["trend_follow"])  # doublon
-    txt = mem.relevant_lessons_text(symbols=["EURUSD"], strategies=["trend_follow"], k=5)
-    assert txt.splitlines()[0].startswith("- [loss/EURUSD]")        # le plus pertinent d'abord
-    assert txt.count("Stop trop serre") == 1                         # doublon ecarte
-    assert "Vieille lecon" in txt

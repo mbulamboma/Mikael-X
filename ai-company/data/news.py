@@ -8,7 +8,7 @@ Agrege, avec degradation gracieuse (chaque source protegee), et met en cache :
   2. Reserve federale / taux    -> FRED (cle FRED_API) : Fed funds, 2 ans, 10 ans.
   3. Actualites generales        -> GDELT (gratuit, sans cle) : titres 48h/devise,
      dont la sentiment est jugee par le LLM lui-meme.
-  4. Brain macro par devise      -> `macro_features.csv` (v4_macro/macro_service.py),
+  4. Brain macro par devise      -> `macro_features.csv` (tools/macro_service.py),
      s'il est present : score composite calendrier+taux+news deja calcule.
 
 ANTI-LOOKAHEAD : on ne lit que du deja-publie ; les events "a venir" servent
@@ -89,7 +89,14 @@ def _resolve_mt5_files(cfg: NewsConfig) -> Path | None:
     cands = [p for p in base.glob("*/MQL5/Files") if p.is_dir()]
     if not cands:
         return None
-    return max(cands, key=lambda p: (any(p.glob("MIKAEL_*")), p.stat().st_mtime))
+    # Marqueur du terminal "de travail" : les fichiers que produisent
+    # tools/ExportCalendar.mq5 et tools/macro_service.py. Le repli
+    # MIKAEL_* couvre les installations ou un ancien EA tourne encore.
+    def _connu(p: Path) -> bool:
+        return (any((p / f).exists()
+                    for f in ("calendar_history.csv", "macro_features.csv"))
+                or any(p.glob("MIKAEL_*")))
+    return max(cands, key=lambda p: (_connu(p), p.stat().st_mtime))
 
 
 class NewsFeed:

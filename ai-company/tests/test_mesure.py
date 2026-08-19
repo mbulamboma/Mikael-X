@@ -115,14 +115,16 @@ def test_ouverture_du_desk_porte_son_dossier_de_decision(monkeypatch):
     """Sans trace de QUI a decide, on ne peut attribuer un resultat a personne."""
     account = {"equity": 100000.0, "objectif_atteint": False, "perte_jour_pct": 0.5,
                "positions_ouvertes": 0, "ouvertures_bloquees": False, "gate_raisons": []}
-    T.bind_context({"EURUSD": {"symbol": "EURUSD"}}, {}, account, [], "", "trend_up", {})
+    T.bind_context({"EURUSD": {"symbol": "EURUSD", "close": 1.1000, "atr": 0.0040}},
+                   {}, account, [], "trend_up", {})
     T.bind_live(None)
     router = _Router({
         "gerant": {"convoquer_desk": True, "candidats": ["EURUSD"], "posture": "selectif",
                    "revue": "objectif loin", "consignes": "privilegier le trend"},
         "trader": {"actions": [{"type": "open", "strategy": "trend_follow", "symbol": "EURUSD",
                                 "direction": "buy", "entry": 1.10, "sl": 1.09, "tp": 1.13,
-                                "confidence": 0.7, "rationale": "macro + technique"}]},
+                                "confidence": 0.7,
+                                "rationale": "cassure de 1.1000, ATR 0.0040"}]},
         "risk": {"verdicts": [{"symbol": "EURUSD", "direction": "buy", "verdict": "reduce",
                                "risk_pct": 0.5, "reason": "volatilite elevee"}]},
     })
@@ -345,9 +347,6 @@ class _AgentTest:
         return [{"type": "open", "strategy": "trend_follow", "symbol": "EURUSD",
                  "direction": "buy", "entry": 1.1052, "sl": 1.0952, "tp": 1.1352,
                  "confidence": 0.7, "rationale": "test"}]
-
-    def reflect(self, trade, postmortem=""):
-        return "lecon"
 
 
 def _cycle_orchestrateur(shadow: bool):

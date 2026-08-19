@@ -100,7 +100,7 @@ class MembreRisque(DeskAgent):
     system = ""
 
     def avis(self, proposes: list[dict], book: list[dict], summary: dict,
-             blackout: dict, autres: Optional[dict], lessons: str) -> list[dict]:
+             blackout: dict, autres: Optional[dict]) -> list[dict]:
         f, cfg = self.cfg.ftmo, self.cfg
         system = self.system.format(
             account_size=f.account_size, phase=f.phase, max_daily=f.max_daily_loss_pct,
@@ -114,7 +114,6 @@ class MembreRisque(DeskAgent):
         ]
         if autres:
             blocs.append("== AVIS DEJA RENDUS PAR TES COLLEGUES ==\n" + C.fmt(autres))
-        blocs.append("== TES LECONS PASSEES ==\n" + (lessons or "(aucune)"))
         data = self.ask_json(system, "\n\n".join(blocs) + "\n\nRends UNIQUEMENT tes avis JSON.")
         return _normalise_avis(data, cfg.ftmo.risk_per_trade_pct)
 
@@ -158,8 +157,7 @@ class CollegeRisque:
         self.cfg = cfg
         self.membres = [MembreAgressif(cfg), MembreNeutre(cfg), MembrePrudent(cfg)]
 
-    def review(self, opens: list[dict], summary: dict, gerant,
-               lessons_for: Optional[Callable[[list[str]], str]] = None) -> list[dict]:
+    def review(self, opens: list[dict], summary: dict, gerant) -> list[dict]:
         """Renvoie les ouvertures RETENUES (avec leur eventuel plafond `risk_pct`).
         Peut lever DeskUnavailable : sans officier de risque, on n'ouvre rien."""
         if not opens:
@@ -178,10 +176,9 @@ class CollegeRisque:
 
         avis: dict[str, list[dict]] = {}
         for membre in self.membres:
-            lessons = lessons_for([membre.role]) if lessons_for else ""
             # le Prudent (dernier) voit les avis deja rendus : il doit pouvoir les contredire
             avis[membre.role] = membre.avis(proposes, book, summary, blackout,
-                                            dict(avis) or None, lessons)
+                                            dict(avis) or None)
             log.info("College %s: %s", membre.title,
                      [f"{x['symbol']}:{x['avis']}" for x in avis[membre.role]])
 

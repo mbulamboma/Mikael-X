@@ -2,19 +2,27 @@
 """LE DESK — orchestration de l'entreprise d'agents. Drop-in de brain.agent.TraderAgent.
 
 Expose EXACTEMENT la meme interface que l'agent solo pour que run.Orchestrator ne change
-presque pas : `decide(summary) -> list[actions]`, `reflect(trade, postmortem) -> str`,
-attributs `degraded` / `last_error`. Tout l'aval (moteur FTMO deterministe, execution MT5,
-notifications, journal, apprentissage) reste identique.
+presque pas : `decide(summary) -> list[actions]`, attributs `degraded` / `last_error`.
+Tout l'aval (moteur FTMO deterministe, execution MT5, notifications, journal) reste
+identique.
 
 Enchainement d'un cycle (cf. ai-company/IMPLEMENTATION.md) :
   1. GERANT -> mandat (posture, convoquer le desk ?, candidats, consignes).       [critique]
   2. TRADE MANAGER -> gere le book ouvert (close/modify/trail).                    [critique]
   3. si le Gerant convoque ET les ouvertures sont possibles :
        4 ANALYSTES independants -> DEBAT Bull/Bear arbitre par un JUGE -> TRADER ->
-       ouvertures (celles qui contredisent le juge sont supprimees) ;
+       ouvertures (celles qui contredisent le juge OU qui ne citent aucune donnee du
+       dossier sont supprimees) ;
        RISK MANAGER -> filtre/durcit les ouvertures.                          [non critique]
   + entre deux cycles : VIGIE -> GERANT -> session extraordinaire (`watch`, cf. run.py).
   4. actions = book + ouvertures retenues.
+
+CE QUE LE DESK NE FAIT PLUS : il n'ecrit plus de "lecons" apres une cloture et n'en relit
+plus. Ce que les employes savent du passe vient de faits calcules — bilan chiffre
+(brain/postmortem.py), revue de performance par employe (desk/bilan_roles.py), cas passes
+comparables (desk/situation.py). En echange, ce qu'ils AFFIRMENT est verifie : le filtre de
+preuves (desk/preuves.py) retire toute affirmation qui ne renvoie a aucune donnee du dossier,
+et une ouverture non sourcee est supprimee avant meme le controle du risque.
 
 Politique de DEGRADATION (preserve le filet existant) :
   - Gerant ou Trade Manager injoignable (LLM down) -> `degraded=True`, retourne [] :
@@ -28,8 +36,9 @@ import logging
 
 from config import AgentConfig
 from brain.memory import Memory
-from desk.base import DeskAgent, DeskUnavailable
+from desk.base import DeskUnavailable
 from desk import context as C
+from desk import preuves as P
 from desk import journal as J
 from desk import situation as SIT
 from desk import bilan_roles as BILAN
@@ -43,46 +52,6 @@ from desk.debat import Debat
 from desk.risque import CollegeRisque
 
 log = logging.getLogger("desk")
-
-
-COACH_SYSTEM = """Tu es le COACH de l'entreprise de trading. On te donne un trade cloture (avec
-strategie, regime, R:R PLANIFIE, R REELLEMENT encaisse, MFE/MAE, slippage/spread payes) puis le
-BILAN CHIFFRE de tous les trades passes.
-
-Ecris UNE lecon actionnable en 1-2 phrases (francais), fondee sur les CHIFFRES du trade et du
-bilan, pas sur des generalites. Cherche la cause : stop dans le bruit ? sortie trop tot alors
-que le MFE etait a +2R ? entree payee trop cher ? strategie inadaptee au regime ? sur-confiance ?
-Interdits : repeter une lecon deja presente dans le bilan, les banalites, les conseils sans
-chiffre. Formule un correctif concret et verifiable."""
-
-
-ATTRIBUTION_SYSTEM = """Tu es le COACH d'une entreprise de trading. On te donne un trade
-cloture avec son DOSSIER DE DECISION : le mandat du Gerant, les briefs des 4 analystes, le
-debat Bull/Bear et le verdict du juge, l'avis du college du risque, la these du Trader — puis
-le bilan chiffre de tous les trades passes.
-
-Ton travail : dire QUI, dans cette chaine, a reellement pese sur le resultat, et ecrire a
-chacun une lecon qu'il pourra relire la prochaine fois.
-
-Regles, importantes :
-- **Un trade perdant n'est pas forcement une erreur** et un trade gagnant pas forcement une
-  reussite : juge le PROCESSUS, pas le resultat. Un stop touche sur une these correcte et un
-  R:R sain n'appelle aucune lecon.
-- N'accuse pas tout le monde : 0 a 3 lecons MAXIMUM, uniquement les rols dont la
-  contribution a vraiment change l'issue. Zero lecon est une reponse valable.
-- Chaque lecon est ADRESSEE a un rol, chiffree, et formule un correctif verifiable.
-  Interdits : les banalites, les conseils sans chiffre, repeter une lecon deja au bilan.
-
-Rols possibles : gerant, technique, fondamental, sentiment, actualite, bull, bear, juge,
-trader, agressif, neutre, prudent, suivi.
-
-On te donne aussi la REVUE DE PERFORMANCE de chaque employe (esperance selon qu'il etait
-aligne ou non, par conviction, par verdict...). Appuie-toi dessus — mais si une ligne est
-marquee ECHANTILLON INSUFFISANT, elle ne prouve RIEN : ne fonde pas une lecon dessus.
-
-Reponds UNIQUEMENT par un objet JSON, sans texte autour :
-{"synthese": "1-2 phrases: ce que cette cloture apprend a l'entreprise",
- "lecons": [{"role": "juge", "lecon": "correctif concret et chiffre"}]}"""
 
 
 class TradingDesk:
@@ -102,15 +71,7 @@ class TradingDesk:
         self.analystes = Analystes(cfg)
         self.debat = Debat(cfg)
         self.college_risque = CollegeRisque(cfg)
-        self._coach = DeskAgent(cfg)          # role generique -> modele partage (reflexion)
         self._last_mandate: dict = {}
-
-    # ------------------------------------------------------------------ helpers lecons
-    def _lessons(self, roles, symbols=None):
-        watch = list(symbols or [])
-        ctx = C.read()
-        watch += [p.get("symbol") for p in (ctx.get("positions") or [])]
-        return self.mem.relevant_lessons_text(symbols=[s for s in watch if s], roles=roles)
 
     # ------------------------------------------------------------------ decision cycle
     def decide(self, summary: dict) -> list[dict]:
@@ -122,7 +83,7 @@ class TradingDesk:
 
         # 1. GERANT : mandat du cycle (CRITIQUE)
         try:
-            mandate = self.gerant.mandate(summary, self._lessons(["gerant"]), self._revue())
+            mandate = self.gerant.mandate(summary, self._revue())
         except DeskUnavailable as e:
             return self._degrade(f"Gerant indisponible: {e}")
         self._last_mandate = mandate
@@ -134,7 +95,7 @@ class TradingDesk:
         if positions:
             try:
                 actions += self.trade_manager.manage(
-                    summary, mandate.get("consignes", ""), self._lessons(["suivi"]))
+                    summary, mandate.get("consignes", ""))
             except DeskUnavailable as e:
                 return self._degrade(f"Trade Manager indisponible: {e}")
 
@@ -157,20 +118,20 @@ class TradingDesk:
             # Phase 2 : 4 analystes independants par candidat. Phase 3 : debat Bull/Bear.
             briefs: dict = {}
             if self.cfg.desk.use_analysts:
-                briefs = self.analystes.briefs(candidats, mandate, self._lessons)
+                briefs = self.analystes.briefs(candidats, mandate)
             debate: dict = {}
             if self.cfg.desk.use_debate:
-                debate = self.debat.sur(candidats, briefs, mandate, self._lessons)
+                debate = self.debat.sur(candidats, briefs, mandate)
             situations = self._situations(candidats, debate)
             memoire = {s: SIT.bloc_prompt(sig, self.mem.closed_trades())
                        for s, sig in situations.items()}
-            opens = self.trader.decide(summary, mandate, briefs, debate,
-                                       self._lessons(None), memoire)
+            opens = self.trader.decide(summary, mandate, briefs, debate, memoire)
             opens = self._appliquer_verdicts(opens, debate)
+            opens = self._exiger_preuves(opens, briefs)
             if not opens:
                 return []
             if self.cfg.desk.use_risk_debate:
-                opens = self.college_risque.review(opens, summary, self.gerant, self._lessons)
+                opens = self.college_risque.review(opens, summary, self.gerant)
             else:
                 opens = self.risk_manager.review(opens, summary)
             log.info("Desk -> %d ouverture(s) retenue(s) apres controle du risque.", len(opens))
@@ -211,6 +172,36 @@ class TradingDesk:
                          a.get("symbol"), a.get("direction"), v["direction"])
                 continue
             retenues.append(a)
+        return retenues
+
+    def _exiger_preuves(self, opens: list[dict], briefs: dict) -> list[dict]:
+        """DERNIER FILTRE AVANT LE RISQUE : une ouverture dont la these ne cite aucune
+        donnee du dossier est supprimee.
+
+        Les niveaux (entry/sl/tp) sont deja verifies par ailleurs — ce qu'on controle ici
+        est le RAISONNEMENT : `rationale` doit renvoyer a quelque chose d'observable (un
+        niveau du chart, un ATR, un ecart de taux, une date d'annonce), pas a une
+        anticipation. Une decision de trader qu'on ne peut rattacher a aucun fait n'est pas
+        une decision, c'est un pari — et le desk n'en prend pas.
+
+        Le sens du filtre est unique : il ne peut que RETIRER des ouvertures."""
+        if not opens or not self.cfg.desk.exiger_preuves:
+            return opens
+        ctx = C.read()
+        retenues = []
+        for a in opens:
+            sym = str(a.get("symbol", "")).upper()
+            try:
+                dossier = C.symbol_dossier(sym, ctx, C.live())
+            except Exception:               # source indisponible : on ne relaxe pas le filtre
+                dossier = (ctx.get("snapshots") or {}).get(sym) or {}
+            faits = P.faits(dossier, briefs.get(sym) or {})
+            citations = P.citations(str(a.get("rationale") or ""), faits)
+            if not citations:
+                log.info("Ouverture %s supprimee : these non sourcee (%s).",
+                         sym, str(a.get("rationale") or "")[:120])
+                continue
+            retenues.append({**a, "preuves": citations[:5]})
         return retenues
 
     # ------------------------------------------------------------------ vigie & escalade
@@ -265,7 +256,7 @@ class TradingDesk:
                      f"Recommandation : {verdict['recommandation']} "
                      f"Consignes du DG : {decision['consignes']}")
         try:
-            actions = self.trade_manager.manage(summary, consignes, self._lessons(["suivi"]))
+            actions = self.trade_manager.manage(summary, consignes)
         except DeskUnavailable as e:
             log.warning("Trade Manager injoignable pendant la session (%s) — rien fait.", e)
             return []
@@ -328,7 +319,10 @@ class TradingDesk:
                        "consignes": J.clip(mandate.get("consignes", ""), 300)},
             "trader": {"strategy": action.get("strategy"),
                        "confidence": action.get("confidence"),
-                       "rationale": J.clip(action.get("rationale", ""), 400)},
+                       "rationale": J.clip(action.get("rationale", ""), 400),
+                       # donnees du dossier que la these citait : c'est ce qui distingue,
+                       # a la relecture, une decision fondee d'une intuition bien ecrite
+                       "preuves": action.get("preuves") or []},
             "risque": action.get("verdict_risque") or {},
         }
         if situation:
@@ -360,66 +354,3 @@ class TradingDesk:
         log.error("DESK DEGRADE -> pilote deterministe. %s", why)
         return []
 
-    # ------------------------------------------------------------------ apprentissage
-    def reflect(self, trade: dict, postmortem: str = "") -> str:
-        """Leçon de clôture. Meme contrat que TraderAgent.reflect (rend UNE chaine, que
-        l'orchestrateur enregistre comme lecon generale).
-
-        En plus du contrat, quand le trade porte son DOSSIER DE DECISION (Phase 1C), on
-        fait l'ATTRIBUTION PAR ROLE : le coach dit qui, dans la chaine, a reellement pese
-        sur le resultat, et chaque lecon est ecrite TAGUEE de ce rol. C'est ce qui permet
-        au Bull de relire ses erreurs de Bull, et au juge les siennes — au lieu d'une
-        soupe de conseils que tout le monde ignore.
-        """
-        import json
-        dossier = trade.get("dossier") or {}
-        human = ("Trade cloture :\n" + json.dumps(trade, ensure_ascii=False, default=str)
-                 + (f"\n\nBILAN CHIFFRE ACTUEL :\n{postmortem}" if postmortem else ""))
-        if not dossier:
-            # trade d'avant la Phase 1C, ou ouvert par l'agent solo : pas de chaine a juger
-            try:
-                return self._coach.ask_text(COACH_SYSTEM, human)
-            except DeskUnavailable as e:
-                log.warning("Reflexion desk impossible (%s) — lecon generique.", e)
-                return self._fallback_reflect(trade)
-        try:
-            data = self._coach.ask_json(
-                ATTRIBUTION_SYSTEM,
-                human + "\n\nREVUE DE PERFORMANCE DES EMPLOYES :\n" + self._revue()
-                + "\n\nRends UNIQUEMENT ton analyse JSON.")
-        except DeskUnavailable as e:
-            log.warning("Attribution impossible (%s) — lecon generique.", e)
-            return self._fallback_reflect(trade)
-        return self._enregistrer_attribution(trade, data)
-
-    def _enregistrer_attribution(self, trade: dict, data: dict) -> str:
-        """Ecrit les lecons par rol et rend la synthese (lecon generale de l'orchestrateur)."""
-        symbole = trade.get("symbol", "?")
-        outcome = "win" if (trade.get("R") or 0) > 0 else "loss"
-        base_tags = [str(trade.get("strategy") or ""), str(trade.get("regime") or "")]
-        ecrites = 0
-        for item in (data.get("lecons") or [])[:3]:      # 3 max : on ne blame pas tout le monde
-            if not isinstance(item, dict):
-                continue
-            role = str(item.get("role") or "").strip().lower()
-            texte = str(item.get("lecon") or "").strip()
-            if role not in SIT.ROLES_CONNUS or not texte:
-                continue
-            self.mem.add_lesson(symbole, outcome, texte, tags=[role] + base_tags)
-            log.info("Lecon [%s]: %s", role, texte[:200])
-            ecrites += 1
-        synthese = str(data.get("synthese") or "").strip()
-        if not synthese:
-            synthese = self._fallback_reflect(trade)
-        log.info("Attribution: %d lecon(s) par rol ecrite(s).", ecrites)
-        return synthese
-
-    @staticmethod
-    def _fallback_reflect(trade: dict) -> str:
-        strat = trade.get("strategy", "unknown")
-        result = trade.get("result")
-        if result == "tp":
-            return f"{strat}: conserver la discipline, ne pas forcer le risque apres un gain."
-        if result == "sl":
-            return f"{strat}: reevaluer l'adaptation au regime avant de retenter ce setup."
-        return f"{strat}: rester selectif, ne pas trader par impatience."

@@ -26,7 +26,6 @@ def test_etat_relu_apres_redemarrage():
                           "risk_dollars": 990.0, "mfe_R": 1.8, "mae_R": -0.4,
                           "trail": {"enabled": True, "atr_mult": 2.0}}})
     mem.log_event("order_sent", {"symbol": "EURUSD", "lot": 0.5})
-    mem.add_lesson("EURUSD", "loss", "Stop dans le bruit", tags=["trend_follow"])
     mem.store.close()                                  # simule l'arret du process
 
     repris = Memory(Store(db))                          # redemarrage
@@ -35,7 +34,6 @@ def test_etat_relu_apres_redemarrage():
     assert m["strategy"] == "trend_follow" and m["mfe_R"] == 1.8
     assert m["trail"]["enabled"] is True                # le trailing arme est retrouve
     assert repris.store.events(kind="order_sent")[0]["lot"] == 0.5
-    assert "Stop dans le bruit" in repris.recent_lessons_text()
 
 
 def test_ecriture_des_positions_atomique():
@@ -91,7 +89,6 @@ def test_migration_des_anciens_fichiers_json():
     mem = Memory(Store(d / "agent.db"))
     assert mem.load_session()["phase"] == 2
     assert mem.load_meta()["9"]["symbol"] == "XAUUSD"
-    assert "Ne pas surtrader" in mem.recent_lessons_text()
     assert mem.closed_trades()[0]["R"] == 2.0            # ligne corrompue ignoree
     assert (d / "session.json.migrated").exists()        # ancien fichier conserve
     assert not (d / "session.json").exists()

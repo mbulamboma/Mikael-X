@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """MEMOIRE SITUATIONNELLE — « qu'est-il arrive les dernieres fois, DANS CE CAS-LA ? »
 
-Jusqu'ici l'agent relisait ses 12 lecons les plus recentes/pertinentes par symbole. C'est
-mieux que rien, mais ca ne repond pas a la seule question qui compte au moment de decider :
+La question qui compte au moment de decider n'est pas « qu'ai-je retenu de mes erreurs »
+(une phrase qu'on se raconte) mais :
 *dans une configuration comme celle d'aujourd'hui, qu'est-ce qui s'est reellement passe ?*
 
 On calcule donc une SIGNATURE deterministe de la situation (regime, volatilite relative,

@@ -66,8 +66,10 @@ def bind(account=None, positions=None, snapshots=None):
     account = account or {"equity": 100000.0, "objectif_atteint": False,
                           "perte_jour_pct": 0.5, "positions_ouvertes": len(positions),
                           "ouvertures_bloquees": False, "gate_raisons": []}
-    T.bind_context(snapshots if snapshots is not None else {"EURUSD": {"symbol": "EURUSD"}},
-                   {}, account, positions, "", "Regime dominant: trend_up", {})
+    T.bind_context(snapshots if snapshots is not None else
+                   {"EURUSD": {"symbol": "EURUSD", "close": 1.1000, "atr": 0.0040,
+                               "haut_20": 1.1120, "bas_20": 1.0900}},
+                   {}, account, positions, "Regime dominant: trend_up", {})
     T.bind_live(None)
     return account
 
@@ -101,7 +103,8 @@ def install(monkeypatch, router):
 def _open(symbol, direction="buy", entry=1.10, sl=1.09, tp=1.13, conf=0.7):
     return {"type": "open", "strategy": "trend_follow", "symbol": symbol,
             "direction": direction, "entry": entry, "sl": sl, "tp": tp,
-            "confidence": conf, "rationale": "macro + technique"}
+            "confidence": conf,
+            "rationale": "cassure du plus haut 1.1120, ATR 0.0040"}
 
 
 # --------------------------------------------------------------------------- flux nominal
@@ -121,7 +124,11 @@ def test_desk_ouvre_via_gerant_trader_risk(monkeypatch):
 
 
 def test_desk_risk_manager_durcit(monkeypatch):
-    summary = bind(snapshots={"EURUSD": {}, "GBPUSD": {}})
+    # snapshots SOURCES pour les deux symboles : sans les chiffres cites par la rationale
+    # (1.1120, ATR 0.0040), le filtre de preuves supprimerait les ouvertures avant le risque.
+    summary = bind(snapshots={
+        "EURUSD": {"symbol": "EURUSD", "close": 1.1000, "atr": 0.0040, "haut_20": 1.1120},
+        "GBPUSD": {"symbol": "GBPUSD", "close": 1.2700, "atr": 0.0040, "haut_20": 1.1120}})
     router = Router(json_by_role={
         "gerant": {"convoquer_desk": True, "candidats": ["EURUSD", "GBPUSD"]},
         "trader": {"actions": [_open("EURUSD"), _open("GBPUSD", entry=1.27, sl=1.26, tp=1.30)]},
@@ -242,13 +249,3 @@ def test_validate_risk_override_reduit_le_lot():
     assert bigger.lot == full.lot
 
 
-# --------------------------------------------------------------------------- lecons par role
-def test_lessons_filtrees_par_role():
-    m = Memory()
-    m.add_lesson("ZZ9", "loss", "Lecon du trader ZZ9.", tags=["trader", "trend_follow"])
-    m.add_lesson("ZZ9", "loss", "Lecon du suivi ZZ9.", tags=["suivi"])
-    m.add_lesson("ZZ9", "loss", "Lecon sans role ZZ9.", tags=["trend_follow"])
-    out = m.relevant_lessons_text(symbols=["ZZ9"], roles=["trader"])
-    assert "trader ZZ9" in out
-    assert "suivi ZZ9" not in out          # lecon d'un autre role -> masquee
-    assert "sans role ZZ9" in out          # lecon non taguee -> visible de tous

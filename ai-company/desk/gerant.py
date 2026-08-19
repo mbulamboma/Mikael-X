@@ -50,7 +50,8 @@ TON ROLE CE CYCLE : fixer le mandat. Tu regardes ou en est l'entreprise et tu de
 3. CANDIDATS : choisis au plus {max_candidates} symboles a etudier a fond ce cycle, parmi ceux
    pre-scannes (regarde le regime et l'edge des strategies). Qualite > quantite.
 4. CONSIGNES : 1-3 phrases de direction concretes aux equipes (sur quoi se concentrer, quoi
-   eviter, quel biais macro surveiller), fondees sur le bilan et les lecons.
+   eviter, quel biais macro surveiller), fondees sur le BILAN CHIFFRE et les donnees du
+   dossier — jamais sur une intuition invérifiable.
 
 Tu DIRIGES : la revue de performance ci-dessous te dit ce que chaque employe a reellement
 apporte (esperance quand l'analyste etait aligne vs oppose, quand le juge etait convaincu,
@@ -58,8 +59,9 @@ quand le college a durci...). Sers-t'en pour orienter tes consignes — mais ref
 conclure sur un echantillon marque INSUFFISANT : diriger d'apres 3 trades est pire que ne
 pas diriger du tout.
 
-Tu apprends de tes decisions passees (lecons de direction ci-dessous) : ne repete pas une
-erreur d'allocation ou de timing deja constatee.
+Regle absolue : chaque phrase de ton mandat doit pouvoir etre rattachee a un CHIFFRE du
+dossier (etat du compte, scan, bilan, revue). Une consigne qui n'est appuyee sur rien
+n'est pas une direction, c'est de la speculation : ne l'ecris pas.
 
 Reponds UNIQUEMENT par un objet JSON, sans texte autour :
 {{"posture": "selectif",
@@ -93,7 +95,7 @@ class Gerant(DeskAgent):
     role = "gerant"
     title = "Gerant/DG"
 
-    def mandate(self, summary: dict, lessons: str, revue: str = "") -> dict:
+    def mandate(self, summary: dict, revue: str = "") -> dict:
         ctx = C.read()
         f = self.cfg.ftmo
         system = SYSTEM.format(
@@ -107,7 +109,6 @@ class Gerant(DeskAgent):
             "== REGIME / STRATEGIES ==\n" + (ctx.get("strategies") or "(aucun)"),
             "== BILAN / POST-MORTEM ==\n" + (ctx.get("postmortem") or "(aucun)"),
             "== REVUE DE PERFORMANCE DES EMPLOYES ==\n" + (revue or "(aucune)"),
-            "== TES LECONS DE DIRECTION ==\n" + (lessons or "(aucune)"),
         ])
         data = self.ask_json(system, dossier + "\n\nRends UNIQUEMENT le mandat JSON.")
         return self._normalise(data, ctx)

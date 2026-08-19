@@ -21,6 +21,12 @@ DEUX PARTIS PRIS, differents du cadre TradingAgents (cf. IMPLEMENTATION.md §7bi
 COUT : 4 appels par candidat (borne par `DESK_MAX_CANDIDATS`), uniquement quand le
 Gerant convoque le desk. Coupe-circuit : `DESK_USE_ANALYSTS=0`.
 
+ANTI-SPECULATION : un point cle qui ne cite aucun chiffre du dossier est ECARTE
+(cf. desk/preuves.py), et un brief qui n'en garde aucun est neutralise (biais neutre,
+confiance 0). Un analyste qui n'a rien d'observable a dire ne doit pas peser sur une
+decision : c'est exactement la que naissent les theses inventees que le debat, ensuite,
+prend pour des faits.
+
 PANNE : l'echec d'UN analyste retire son brief, rien de plus. Si le LLM est globalement
 injoignable, c'est l'appel du Trader qui leve `DeskUnavailable` -> aucune ouverture ce
 cycle, le book reste gere (contrat inchange).
@@ -32,6 +38,7 @@ from typing import Any, Callable, Optional
 
 from desk.base import DeskAgent, DeskUnavailable
 from desk import context as C
+from desk import preuves as P
 
 log = logging.getLogger("desk.analystes")
 
@@ -49,9 +56,12 @@ Un « je ne sais pas » honnete vaut mieux qu'une conviction inventee.
 
 TA MISSION : {mission}
 
-Regles : appuie CHAQUE affirmation sur un chiffre du dossier ; pas de generalites ; pas de
-recommandation de taille de position (ce n'est ni ton role ni ton information) ; profil SWING
-(tenue plusieurs jours), donc raisonne en journalier/hebdomadaire, pas en bruit intraday.
+Regles : appuie CHAQUE affirmation sur un chiffre PRESENT DANS TON DOSSIER (niveau, ATR,
+RSI, spread, taux, date) et cite-le tel quel. Un point cle sans chiffre du dossier est
+AUTOMATIQUEMENT SUPPRIME avant lecture — inutile d'ecrire ce que tu ne peux pas montrer, et
+n'invente jamais un chiffre absent du dossier pour contourner ce filtre. Pas de recommandation
+de taille de position (ce n'est ni ton role ni ton information) ; profil SWING (tenue plusieurs
+jours), donc raisonne en journalier/hebdomadaire, pas en bruit intraday.
 
 Reponds UNIQUEMENT par un objet JSON, sans texte autour :
 {{"biais": "haussier|baissier|neutre",
@@ -73,13 +83,13 @@ def _safe(fn: Callable[[], Any], quoi: str) -> Any:
 
 class Analyste(DeskAgent):
     """Base des 4 analystes : meme squelette, un dossier et une mission par metier."""
-    model_role = "analyste"        # meme modele pour les 4 ; lecons separees par `role`
+    model_role = "analyste"        # meme modele pour les 4 ; un `role` distinct par metier
     mission = ""
 
     def dossier(self, symbol: str, ctx: dict, live: Any, commun: dict) -> dict:
         raise NotImplementedError
 
-    def brief(self, symbol: str, mandate: dict, lessons: str, commun: dict) -> dict:
+    def brief(self, symbol: str, mandate: dict, commun: dict) -> dict:
         ctx = C.read()
         dossier = self.dossier(symbol, ctx, C.live(), commun)
         system = SYSTEM.format(titre=self.title, symbol=symbol, mission=self.mission,
@@ -87,13 +97,19 @@ class Analyste(DeskAgent):
         human = "\n\n".join([
             f"== TON DOSSIER SUR {symbol} ==\n" + C.fmt(dossier),
             "== CONSIGNES DU GERANT ==\n" + (mandate.get("consignes") or "(aucune)"),
-            "== TES LECONS PASSEES ==\n" + (lessons or "(aucune)"),
         ])
-        return self._normalise(self.ask_json(system, human + "\n\nRends UNIQUEMENT ton brief JSON."))
+        data = self.ask_json(system, human + "\n\nRends UNIQUEMENT ton brief JSON.")
+        return self._normalise(data, dossier)
 
-    def _normalise(self, data: dict) -> dict:
+    def _normalise(self, data: dict, dossier: dict | None = None) -> dict:
         """Un brief mal forme devient un brief NEUTRE : il ne doit ni disparaitre en
-        silence, ni faire passer du bruit pour une conviction."""
+        silence, ni faire passer du bruit pour une conviction.
+
+        Meme traitement pour un brief SANS PREUVE : les points cles qui ne citent aucune
+        donnee du dossier sont ecartes (ils restent visibles dans `ecartes_sans_preuve`,
+        pour qu'on puisse verifier ce que le filtre a retire), et s'il n'en reste aucun,
+        le brief perd son biais et sa confiance. Il n'est pas supprime : le Trader doit
+        voir qu'un analyste n'avait rien d'observable a dire."""
         biais = str(data.get("biais") or "").strip().lower()
         if biais not in ("haussier", "baissier", "neutre"):
             biais = "neutre"
@@ -105,10 +121,21 @@ class Analyste(DeskAgent):
         # une CHAINE est iterable : sans ce garde-fou, "abc" deviendrait ['a','b','c']
         points = [str(p)[:200] for p in (brut if isinstance(brut, list) else [])
                   if isinstance(p, (str, int, float))][:5]
-        return {"analyste": self.title, "biais": biais, "confiance": round(confiance, 2),
-                "resume": str(data.get("resume") or "").strip()[:600],
-                "points_cles": points,
-                "invalidation": str(data.get("invalidation") or "").strip()[:300]}
+        ecartes: list[str] = []
+        if dossier is not None and self.cfg.desk.exiger_preuves:
+            points, ecartes = P.filtrer(points, P.faits(dossier))
+            if not points:
+                biais, confiance = "neutre", 0.0
+        brief = {"analyste": self.title, "biais": biais, "confiance": round(confiance, 2),
+                 "resume": str(data.get("resume") or "").strip()[:600],
+                 "points_cles": points,
+                 "invalidation": str(data.get("invalidation") or "").strip()[:300]}
+        if ecartes:
+            brief["ecartes_sans_preuve"] = ecartes[:5]
+            log.info("Analyste %s: %d affirmation(s) sans preuve ecartee(s)%s.",
+                     self.title, len(ecartes),
+                     " — brief neutralise" if not points else "")
+        return brief
 
 
 class AnalysteTechnique(Analyste):
@@ -204,8 +231,7 @@ class Analystes:
         return {"macro": macro or None,
                 "evenements": _safe(lambda: live.major_events(72), "evenements macro")}
 
-    def briefs(self, symbols: list[str], mandate: dict,
-               lessons_for: Optional[Callable[[list[str]], str]] = None) -> dict:
+    def briefs(self, symbols: list[str], mandate: dict) -> dict:
         """{symbole: {rol: brief}} — l'echec d'un analyste retire SON brief, rien d'autre."""
         if not symbols:
             return {}
@@ -214,9 +240,8 @@ class Analystes:
         for symbol in symbols:
             briefs = {}
             for membre in self.membres:
-                lessons = lessons_for([membre.role]) if lessons_for else ""
                 try:
-                    briefs[membre.role] = membre.brief(symbol, mandate, lessons, commun)
+                    briefs[membre.role] = membre.brief(symbol, mandate, commun)
                 except DeskUnavailable as e:
                     log.warning("Analyste %s indisponible sur %s (%s) — brief manquant.",
                                 membre.title, symbol, e)

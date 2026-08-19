@@ -238,7 +238,7 @@ def test_cle_api_bedrock_exportee_pour_boto3():
 
 
 def test_plan_json_valide_par_les_memes_controles():
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     plan = {"analyse": "test", "actions": [
         {"type": "open", "strategy": "trend_follow", "symbol": "EURUSD", "direction": "buy",
          "entry": 1.10, "sl": 1.09, "tp": 1.13, "confidence": 0.7},
@@ -267,11 +267,12 @@ def test_extraction_json_tolerante_au_bavardage():
 
 def test_dossier_de_contexte_complet_pour_le_mode_sans_outils():
     T.bind_context({"EURUSD": {"price": 1.1}}, {"EURUSD": {"levels": {}}},
-                   {"equity": 100000}, [{"ticket": 1}], "lecon A", "regime trend_up",
+                   {"equity": 100000}, [{"ticket": 1}], "regime trend_up",
                    {"enabled": True, "blackout": {"EURUSD": {"active": False}}},
                    postmortem="defaut: gains rendus")
     d = T.context_digest()
     for attendu in ("COMPTE", "POSITIONS", "MARCHES", "CHART EURUSD", "STRATEGIES",
-                    "DEFAUTS RECURRENTS", "LECONS", "NEWS"):
+                    "DEFAUTS RECURRENTS", "NEWS"):
         assert attendu in d
+    assert "LECON" not in d                     # le dossier ne contient que des faits
     assert "gains rendus" in d and "trend_up" in d

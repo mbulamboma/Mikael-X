@@ -30,15 +30,16 @@ SUMMARY = {"equity": 100_000.0, "objectif_atteint": False, "perte_jour_pct": 0.2
 
 
 def _bind(positions=None):
-    T.bind_context({"EURUSD": {"symbol": "EURUSD"}, "GBPUSD": {"symbol": "GBPUSD"}}, {},
-                   SUMMARY, positions or [], "", "trend_up", {"blackout": {}})
+    T.bind_context({"EURUSD": {"symbol": "EURUSD", "close": 1.1000, "atr": 0.0040},
+                    "GBPUSD": {"symbol": "GBPUSD", "close": 1.2700, "atr": 0.0060}}, {},
+                   SUMMARY, positions or [], "trend_up", {"blackout": {}})
     T.bind_live(None)
 
 
 def _open(symbol="EURUSD", direction="buy"):
     return {"type": "open", "strategy": "trend_follow", "symbol": symbol,
             "direction": direction, "entry": 1.10, "sl": 1.09, "tp": 1.13,
-            "confidence": 0.7, "rationale": "macro + technique"}
+            "confidence": 0.7, "rationale": "cassure de 1.1000, ATR 0.0040"}
 
 
 def _avis(symbol="EURUSD", direction="buy", avis="approve", risk_pct=None, raison="x"):
@@ -147,17 +148,6 @@ def test_avis_illisible_ne_bloque_pas(monkeypatch):
     gerant = _Gerant()
     assert len(CollegeRisque(AgentConfig()).review([_open()], SUMMARY, gerant)) == 1
     assert gerant.vus["agressif"][0]["avis"] == "approve"      # defaut neutre
-
-
-def test_lecons_par_temperament(monkeypatch):
-    _bind()
-    cap = Capture({"agressif": _avis(), "neutre": _avis(), "prudent": _avis()})
-    install(monkeypatch, cap)
-    vus = []
-    CollegeRisque(AgentConfig()).review([_open()], SUMMARY, _Gerant(),
-                                        lambda r: vus.append(r[0]) or f"lecon {r[0]}")
-    assert vus == ["agressif", "neutre", "prudent"]
-    assert "lecon prudent" in cap.prompts["prudent"][0]
 
 
 # =========================================================== integration desk

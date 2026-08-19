@@ -3,7 +3,7 @@
 
 Quatre moments comptent :
   1. une position est OUVERTE  -> ce qu'il a pris, pourquoi, avec quel risque,
-  2. une position est FERMEE   -> resultat en R, PnL, lecon retenue,
+  2. une position est FERMEE   -> resultat en R, PnL, deroule du trade,
   3. une URGENCE se declenche  -> perte du jour proche de la limite, fermeture totale,
   4. l'IA tombe / le script s'arrete -> il faut intervenir a la main.
 
@@ -589,7 +589,7 @@ class Mailer:
                                       f"confiance {_fmt(d.get('confidence'), '', 2)}",
                             corps=corps_html))
 
-    def trade_ferme(self, trade: dict, lecon: str, summary: dict, positions: list):
+    def trade_ferme(self, trade: dict, summary: dict, positions: list):
         if not (self.cfg.on_trade and self.cfg.ready):
             return
         R = trade.get("R", 0.0) or 0.0
@@ -607,9 +607,6 @@ class Mailer:
             f"(net {_fmt(trade.get('rr_net_planifie'))})",
             f"  MFE / MAE         : {_fmt(trade.get('mfe_R'))} R / {_fmt(trade.get('mae_R'))} R",
             f"  Duree             : {_fmt(trade.get('duree_h'), ' h', 1)}",
-            "",
-            "LECON RETENUE",
-            f"  {str(lecon or '(aucune)')[:800]}",
             "",
             self.portefeuille(summary, positions),
         ])
@@ -634,8 +631,6 @@ class Mailer:
                                  f'(net {_fmt(trade.get("rr_net_planifie"))})</span>'),
                 ("Regime", _e(trade.get("regime", "?"))),
             ])
-            + _titre_section("Lecon retenue")
-            + _citation(str(lecon or "(aucune)")[:1200])
             + self.portefeuille_html(summary, positions))
         badge_bg = VERT_BG if R > 0 else (ROUGE_BG if R < 0 else SLATE_BG)
         self.send(f"Cloture {trade.get('symbol')} — {verdict} {_fmt(R)} R "

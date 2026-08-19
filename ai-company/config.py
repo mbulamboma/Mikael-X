@@ -190,7 +190,7 @@ class MT5Config:
 class NewsConfig:
     """Flux d'actualite pour un trader swing : calendrier economique MT5, donnees
     Reserve federale (FRED) et titres d'actualite (GDELT), plus le brain macro
-    par devise (`macro_features.csv` produit par v4_macro/macro_service.py)."""
+    par devise (`macro_features.csv` produit par tools/macro_service.py)."""
     enabled: bool = field(default_factory=lambda: os.environ.get("NEWS_ENABLED", "1") == "1")
     # Dossier MQL5\Files du terminal MT5 (calendar_history.csv, macro_features.csv).
     mt5_files: str = field(default_factory=lambda: os.environ.get("MT5_FILES", ""))
@@ -222,6 +222,7 @@ class WebConfig:
     timeout: int = _i("WEB_TIMEOUT", 20)
     max_chars: int = _i("WEB_MAX_CHARS", 6000)       # texte extrait par page
     max_calls_per_cycle: int = _i("WEB_MAX_CALLS", 12)
+    max_parallel: int = _i("WEB_MAX_PARALLEL", 3)     # appels web parallèles simultanés
     cache_min: int = _i("WEB_CACHE_MIN", 20)
     # UA de navigateur : beaucoup de sites refusent les UA inconnus. Certains sites
     # interdisent l'acces automatise dans leurs CGU — privilegier les API officielles.
@@ -354,6 +355,13 @@ class DeskConfig:
     # ecrase l'autre n'apprend rien.
     debate_rounds: int = _i("DESK_DEBATE_ROUNDS", 2)
     debate_gap: float = _f("DESK_DEBATE_GAP", 0.2)
+    # ANTI-SPECULATION (cf. desk/preuves.py) : une affirmation qui ne cite aucune donnee du
+    # dossier est ecartee, un camp sans preuve perd sa conviction, un verdict non fonde
+    # devient une abstention et une ouverture dont la these n'est pas sourcee est supprimee.
+    # Sens unique assume : le doute n'a pas besoin de preuve, la prise de risque, si.
+    # 0 = filtre desactive (les prompts continuent d'exiger des chiffres).
+    exiger_preuves: bool = field(default_factory=lambda:
+                                 os.environ.get("DESK_EXIGER_PREUVES", "1") == "1")
     # nb max de symboles envoyes au desk complet par cycle (borne le cout LLM)
     max_candidates: int = _i("DESK_MAX_CANDIDATS", 2)
     # tokens/temperature propres aux agents du desk (reponses courtes et structurees)
@@ -410,7 +418,7 @@ class EvalConfig:
     qualite. Trois leviers, tous inoffensifs pour le trading reel :
 
     - `journal_cycles` : chaque cycle enregistre son DOSSIER D'ENTREE complet (compte,
-      scan, charts, news, lecons, bilan) + le plan rendu par le cerveau. C'est la
+      scan, charts, news, bilan) + le plan rendu par le cerveau. C'est la
       matiere premiere du rejeu hors-ligne (`desk/replay.py`) : sans ca, impossible de
       comparer solo vs desk sur les MEMES donnees.
     - `shadow` : MODE OMBRE. Le cerveau decide et son plan est journalise, mais AUCUNE

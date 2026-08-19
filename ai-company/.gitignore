@@ -7,3 +7,7 @@ state/
 *.migrated
 __pycache__/
 .pytest_cache/
+# Etat local de tools/macro_service.py : cache FinBERT et historique des runs.
+# Recrees automatiquement ; propres a la machine, jamais a deployer.
+tools/cache/
+tools/history/

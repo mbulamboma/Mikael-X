@@ -1,100 +1,29 @@
 # -*- coding: utf-8 -*-
-"""Memoire persistante de l'agent : journal des trades + lecons apprises.
+"""Memoire persistante de l'agent : journal des trades + etats.
 
-C'est le mecanisme d'AMELIORATION CONTINUE :
-  1. Chaque decision (prise ou refusee) est journalisee.
-  2. A la cloture d'un trade, un "reflecteur" LLM ecrit une LECON courte, fondee sur
-     le bilan chiffre (brain/postmortem.py).
-  3. Les lecons les plus pertinentes sont reinjectees dans le prompt du cycle suivant
-     -> l'agent ne refait pas deux fois la meme erreur.
+Ce module ne contient AUCUN apprentissage : l'agent ne se raconte pas d'histoires sur
+ses erreurs passees. Ce qui remonte dans les prompts vient de FAITS calcules —
+`brain/postmortem.py` (bilan chiffre), `strategy/scoreboard.py` (edge par strategie),
+`desk/bilan_roles.py` (revue par employe), `desk/situation.py` (cas passes comparables).
+Une "lecon" ecrite par un LLM apres une cloture n'est ni verifiable ni mesurable : elle a
+ete retiree.
 
 STOCKAGE : SQLite (`state/agent.db`, cf. store.py), pas des fichiers JSON. Un arret
 brutal (VPS redemarre, process tue, coupure) ne peut plus corrompre l'etat : chaque
 ecriture est transactionnelle et le mode WAL est resistant aux coupures. Au
-redemarrage, l'agent retrouve exactement ses positions suivies, sa session FTMO et
-ses lecons. Les anciens fichiers JSON sont importes automatiquement une fois.
+redemarrage, l'agent retrouve exactement ses positions suivies et sa session FTMO.
+Les anciens fichiers JSON sont importes automatiquement une fois.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Optional
 
 from store import Store, default_store
 
 
-@dataclass
-class Lesson:
-    ts: str
-    symbol: str
-    outcome: str          # "win" | "loss" | "breakeven" | "vetoed"
-    text: str             # la lecon, 1-2 phrases actionnables
-    tags: list[str] = field(default_factory=list)
-
-
 class Memory:
     def __init__(self, store: Optional[Store] = None):
         self.store = store or default_store()
-
-    # ------------------------------------------------------------- lecons
-    @property
-    def lessons(self) -> list[Lesson]:
-        return [Lesson(**l) for l in self.store.lessons()]
-
-    def add_lesson(self, symbol: str, outcome: str, text: str, tags: Optional[list[str]] = None):
-        if not str(text).strip():
-            return
-        self.store.add_lesson(symbol, outcome, str(text), [t for t in (tags or []) if t])
-
-    def recent_lessons_text(self, k: int = 12) -> str:
-        """Bloc a injecter dans le prompt systeme (les plus recentes, dedupliquees)."""
-        return self.relevant_lessons_text(k=k)
-
-    def relevant_lessons_text(self, symbols: Optional[list[str]] = None,
-                              strategies: Optional[list[str]] = None, k: int = 12,
-                              roles: Optional[list[str]] = None) -> str:
-        """Lecons PERTINENTES d'abord : celles qui concernent les symboles/strategies du
-        moment, puis les plus recentes. Doublons ecartes (le LLM se repete beaucoup).
-
-        `roles` (desk multi-agents) : si fourni, on ne garde QUE les lecons taguees d'un de
-        ces roles (ex ["trader"], ["suivi"]) — chaque employe apprend de SES propres erreurs.
-        Une lecon sans tag de rol reste visible de tous (heritage de l'agent solo)."""
-        lessons = self.lessons
-        if not lessons:
-            return "(aucune lecon pour l'instant — premier demarrage)"
-        syms = {s.upper() for s in (symbols or [])}
-        strats = {s.lower() for s in (strategies or [])}
-        wanted_roles = {r.lower() for r in (roles or [])}
-        role_tags = {"gerant", "trader", "risk", "analyste", "debat", "suivi", "vigie",
-                     "technique", "fondamental", "sentiment", "actualite", "bull", "bear",
-                     "juge", "agressif", "neutre", "prudent"}
-
-        if wanted_roles:
-            def keep(l) -> bool:
-                tags = {(t or "").lower() for t in l.tags}
-                has_role = bool(tags & role_tags)
-                return (not has_role) or bool(tags & wanted_roles)
-            lessons = [l for l in lessons if keep(l)]
-            if not lessons:
-                return "(aucune lecon specifique a ce rol pour l'instant)"
-
-        def score(idx_lesson) -> tuple:
-            i, l = idx_lesson
-            cible = (l.symbol or "").upper() in syms
-            meth = any((t or "").lower() in strats for t in l.tags)
-            perte = l.outcome in ("loss", "vetoed")        # on apprend surtout des erreurs
-            return (cible + meth + perte, i)               # tri stable : pertinence puis recence
-
-        ranked = sorted(enumerate(lessons), key=score, reverse=True)
-        seen, rows = set(), []
-        for _, l in ranked:
-            cle = l.text.strip().lower()[:90]
-            if cle in seen:
-                continue
-            seen.add(cle)
-            rows.append(f"- [{l.outcome}/{l.symbol}] {l.text}")
-            if len(rows) >= k:
-                break
-        return "\n".join(rows)
 
     # ------------------------------------------------------------- journal
     def log_event(self, kind: str, payload: dict):

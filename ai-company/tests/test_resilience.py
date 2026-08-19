@@ -14,13 +14,13 @@ from risk.ftmo import FTMOEngine, AccountState, TradeProposal
 
 
 def test_plan_open_rejects_incoherent_and_accepts_valid():
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     # buy avec sl == entry -> incoherent, ne doit PAS creer d'action
     T.plan_open(strategy="trend_follow", symbol="EURUSD", direction="buy",
                 entry=1.0, sl=1.0, tp=1.2, confidence=0.8, rationale="")
     assert T.pop_actions() == []
     # setup valide buy (sl < entry < tp) -> une action open
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     T.plan_open(strategy="trend_follow", symbol="EURUSD", direction="buy",
                 entry=1.10, sl=1.09, tp=1.13, confidence=0.7, rationale="ok")
     actions = T.pop_actions()
@@ -29,7 +29,7 @@ def test_plan_open_rejects_incoherent_and_accepts_valid():
 
 
 def test_plan_close_and_modify_collected():
-    T.bind_context({}, {}, {}, [], "", "", {})
+    T.bind_context({}, {}, {}, [], "", {})
     T.plan_close(ticket=42, fraction=0.5, reason="prise partielle")
     T.plan_modify(ticket=42, sl=1.10, tp=0.0, reason="break-even")
     actions = T.pop_actions()
@@ -39,11 +39,11 @@ def test_plan_close_and_modify_collected():
 
 def test_memory_survit_a_un_etat_corrompu(tmp_path):
     """Ancien etat JSON illisible : il est ignore, pas fatal, et SQLite prend le relais."""
-    (tmp_path / "lessons.json").write_text("{not valid json", encoding="utf-8")
+    (tmp_path / "open_meta.json").write_text("{not valid json", encoding="utf-8")
     (tmp_path / "session.json").write_text("<<corrompu>>", encoding="utf-8")
     mem = Memory(Store(tmp_path / "agent.db"))
-    mem.add_lesson("EURUSD", "loss", "Do not overtrade", tags=["trend_follow"])
-    assert mem.recent_lessons_text(1).startswith("- [loss/EURUSD]")
+    mem.log_event("order_sent", {"symbol": "EURUSD"})
+    assert mem.store.events(kind="order_sent")[0]["symbol"] == "EURUSD"
     assert mem.load_session() == {}
 
 

@@ -105,9 +105,9 @@ class DeskAgent:
     """Agent-employe generique. Sous-classe : definir `role`, `title`, un `system(...)`
     et une methode metier qui appelle `self.ask_json(...)`."""
 
-    role = "desk"          # tag de lecons + cle de config modele (par defaut)
+    role = "desk"          # identite de l'employe + cle de config modele (par defaut)
     model_role = ""        # cle de config modele SI differente du rol : les 4 analystes
-                           # ont des rols distincts (lecons separees) mais partagent
+                           # ont des rols distincts (revue separee) mais partagent
                            # le meme reglage `DESK_MODEL_ANALYSTE`.
     title = "Employe"      # libelle lisible (logs, journal)
 

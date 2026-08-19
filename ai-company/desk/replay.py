@@ -209,8 +209,8 @@ def replay_cycles(store, agent, limit: Optional[int] = None,
     for c in journal.cycles(store, limit=limit, shadow_only=shadow_only):
         T.bind_context(c.get("snapshots") or {}, c.get("charts") or {},
                        c.get("account") or {}, c.get("positions") or [],
-                       c.get("lessons") or "", c.get("strategies") or "",
-                       c.get("news") or {}, postmortem=c.get("postmortem") or "")
+                       c.get("strategies") or "", c.get("news") or {},
+                       postmortem=c.get("postmortem") or "")
         T.bind_live(None)
         try:
             actions = agent.decide(c.get("account") or {})

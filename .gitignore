@@ -1,24 +1,20 @@
 # --- SECRETS : ne JAMAIS pousser ---
 .env
 
-# --- donnees lourdes / caches / artefacts locaux ---
-*.parquet
-*.npy
-v4_macro/data/
-v4_macro/cache/
-v4_macro/history/
-v3_outcome/raw_dataset/
+# --- environnement local ---
+.venv/
+.claude/
 __pycache__/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- artefacts / journaux locaux ---
 *.log
 *.tmp
+*.parquet
+*.npy
 
-# --- projets de recherche non necessaires au VPS ---
-MIKAEL_IA/
-v2_imitation/
-v3_outcome/*
-!v3_outcome/ExportCalendar.mq5
-
-# --- divers ---
-.claude/
-*.csv
-.ipynb_checkpoints/
+# NOTE : le `*.csv` global a ete retire lors du regroupement autour de ai-company/.
+# Les CSV locaux sont desormais ignores la ou ils naissent (ai-company/.gitignore :
+# tools/cache/, tools/history/) — un `*.csv` a la racine masquait silencieusement
+# tout jeu de donnees qu'on voudrait versionner.

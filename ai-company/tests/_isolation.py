@@ -4,16 +4,36 @@ Importe en tete de chaque module de test (et par conftest.py) AVANT toute creati
 de Memory/NewsFeed/Orchestrator, pour ne jamais toucher `agent/state/agent.db`
 ni migrer l'etat reel de l'utilisateur.
 
+Isole aussi la CONFIGURATION : sans ca, `config.py` charge le `.env` REEL de
+l'operateur et les tests qui construisent un `FTMOConfig()`/`DeskConfig()` assertent
+contre SES reglages. La suite devenait alors verte ou rouge selon la machine, et un
+changement de configuration legitime (ex. passage a un seul symbole, 2026-08-19) faisait
+echouer un test qui n'avait rien a voir. Ici : `.env` neutralise + variables purgees ->
+les tests assertent contre les DEFAUTS DU CODE, partout, toujours.
+
 Isole aussi le RESEAU SMTP : un test qui construit un `Orchestrator` construit un
 `Mailer` a partir du VRAI `.env` (serveur, identifiants, destinataire). Le moindre
 trade simule declenchait alors un envoi reel depuis le compte de l'utilisateur, dans
 un thread daemon dont l'echec passait inapercu. On coupe la socket, pas la logique :
 le formatage des messages et le comportement "serveur injoignable" restent testes.
 """
+import os
 import smtplib
 import sys
 import tempfile
 from pathlib import Path
+
+# --- 1) CONFIGURATION : couper le `.env` reel AVANT le premier import de config -----
+import dotenv
+
+dotenv.load_dotenv = lambda *a, **kw: False        # type: ignore[assignment]
+
+#: prefixes pilotant le comportement teste (risque, desk, news, evaluation, modeles).
+#: Purges de l'environnement : un test doit voir les defauts du code, pas la machine.
+_PREFIXES = ("AGENT_", "FTMO_", "DESK_", "EVAL_", "NEWS_", "BEDROCK_", "SAFE_",
+             "WEB_", "MT5_", "SMTP_", "GOOGLE_", "MYFXBOOK_", "FRED_", "AWS_")
+for _cle in [k for k in os.environ if k.startswith(_PREFIXES)]:
+    del os.environ[_cle]
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:

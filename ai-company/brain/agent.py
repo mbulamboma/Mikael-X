@@ -6,9 +6,10 @@ marche, le classement des strategies (adequation + track-record) et le mode
 d'emploi de chacune ; il CHOISIT la meilleure et l'applique. C'est le "peut
 changer de strategie / choisir la meilleure" demande.
 
-Deux appels LLM :
-  - decide()  : observe (outils) -> choisit une strategie -> rend trade/wait.
-  - reflect() : apres cloture -> ecrit une LECON (apprentissage continu).
+UN seul appel LLM : decide() — observe (outils) -> choisit une strategie -> rend
+trade/wait. Il n'y a plus de "reflexion" post-cloture : ce que l'agent sait de ses
+trades passes vient de faits calcules (brain/postmortem.py, strategy/scoreboard.py),
+jamais d'une lecon que le modele se serait ecrite a lui-meme.
 """
 from __future__ import annotations
 import json
@@ -150,7 +151,7 @@ DISCIPLINE DE L'INFORMATION (obligatoire des que tu utilises le web) :
 5. Le web est lent et limite (budget de requetes par cycle) : cible tes recherches, n'ouvre
    pas dix pages pour un trade. Si l'info manque, tu peux tres bien conclure "je m'abstiens".
 
-APPRENDRE DE TES ERREURS (obligatoire, avant de chercher un setup) — get_postmortem() :
+TON BILAN CHIFFRE (obligatoire, avant de chercher un setup) — get_postmortem() :
 c'est TON bilan chiffre : winrate, esperance en R, ecart entre le R:R planifie et le R
 reellement encaisse, MFE/MAE (jusqu'ou tes trades montent avant de retomber), cout
 d'execution reel, performance par strategie/symbole/regime, et une liste de DEFAUTS
@@ -160,8 +161,9 @@ RECURRENTS. Regle : tant qu'un defaut est liste, le corriger PRIME sur toute nou
 - "ecart plan/realite" -> vise des cibles atteignables (Donchian oppose, swing precedent) ;
 - "strategie/symbole a eviter" -> ne le retente pas tant que le regime n'a pas change ;
 - "sur-confiance" -> baisse ta `confidence` et exige une confirmation supplementaire.
-get_lessons() complete avec les lecons ecrites apres chaque cloture (les plus pertinentes
-pour les symboles et strategies du moment).
+Ce bilan est CALCULE sur tes trades reels : il n'y a pas d'autre "memoire" et surtout pas
+de lecon redigee apres coup. Une affirmation qui ne s'appuie ni sur ce bilan ni sur une
+donnee du dossier est de la speculation : elle ne fonde aucune decision.
 
 ORDRE DE TRAVAIL A CHAQUE CYCLE :
 A) GERER L'EXISTANT D'ABORD — get_account, get_open_positions. Pour chaque position :
@@ -174,7 +176,7 @@ A) GERER L'EXISTANT D'ABORD — get_account, get_open_positions. Pour chaque pos
    desarme-le (plan_trail enabled=false) si tu preferes gerer le stop a la main.
 B) NOUVELLES OPPORTUNITES (seulement si objectif NON atteint, budget risque et slots dispo) —
    get_postmortem D'ABORD (corrige tes defauts), get_macro_events/get_news pour savoir ce qui
-   bouge, get_strategies + get_lessons pour la methode, get_trading_costs(symbol) pour verifier
+   bouge, get_strategies pour la methode, get_trading_costs(symbol) pour verifier
    que le trade est rentable APRES frais, get_market (scan) puis list_symbols si tu cherches un actif mieux adapte, get_chart
    pour LIRE le graphique et compute_indicator pour verifier ta these. Si la these repose sur
    du fondamental, appuie-la sur get_fred_series et/ou une source lue via web_search/web_read
@@ -207,19 +209,6 @@ Reponds UNIQUEMENT par un objet JSON, sans texte autour, sans balise de code :
 Regles : "actions" vide = ne rien faire (parfaitement acceptable). Les prix sont des PRIX
 reels du dossier. Ne calcule JAMAIS le lot. Coherence : buy -> sl<entry<tp ; sell ->
 tp<entry<sl. Les ouvertures repassent par le moteur de risque FTMO qui peut opposer un veto."""
-
-
-REFLECT_SYSTEM = """Tu es le coach du trader. On te donne un trade cloture — avec la
-strategie, le regime, le R:R PLANIFIE, le R REELLEMENT encaisse, le MFE (meilleur point
-atteint) et le MAE (pire point), le slippage et le spread payes — puis le BILAN CHIFFRE
-de tous les trades passes.
-
-Ecris UNE lecon actionnable en 1-2 phrases (francais), fondee sur les CHIFFRES du trade
-et du bilan, pas sur des generalites. Cherche la cause : stop dans le bruit ? sortie trop
-tot alors que le MFE etait a +2R ? entree payee trop cher (spread/slippage) ? strategie
-inadaptee au regime ? sur-confiance ?
-Interdits : repeter une lecon deja presente dans le bilan, les banalites ("rester
-discipline"), les conseils sans chiffre. Formule un correctif concret et verifiable."""
 
 
 class TraderAgent:
@@ -256,17 +245,6 @@ class TraderAgent:
     def _fallback_actions(self) -> list[dict]:
         # LLM indisponible -> aucune action (prudence : on ne trade pas a l'aveugle).
         return []
-
-    def _fallback_reflect(self, trade: dict) -> str:
-        strat = trade.get("strategy", "unknown")
-        result = trade.get("result")
-        if result == "tp":
-            return f"{strat}: conserver la discipline et ne pas forcer le risque apres un gain." \
-                   f" La strategie reste valable si le regime reste compatible."
-        if result == "sl":
-            return f"{strat}: eviter de prolonger un setup en regime de faible qualite; respecter les regles de stop." \
-                   f" Reevaluer l'adaptation au regime avant le prochain trade."
-        return f"{strat}: garder une approche selective et ne pas trader par impatience."
 
     # ------------------------------------------------------------------ mode JSON
     # Certains modeles Bedrock (DeepSeek notamment) exposent Converse mais PAS le tool
@@ -354,20 +332,3 @@ class TraderAgent:
         self.degraded = False
         self.last_error = ""
         return actions
-
-    def reflect(self, trade: dict, postmortem: str = "") -> str:
-        """Ecrit la lecon d'un trade cloture, en s'appuyant sur le bilan chiffre
-        (brain/postmortem.py) pour eviter les lecons redondantes ou hors-sol."""
-        if self.llm is None or not _LANGCHAIN_OK:
-            return self._fallback_reflect(trade)
-        # messages BRUTS : le JSON du trade contient des accolades, que
-        # ChatPromptTemplate prendrait pour des variables (la lecon echouait toujours).
-        msgs = [("system", REFLECT_SYSTEM),
-                ("human", "Trade cloture :\n" + json.dumps(trade, ensure_ascii=False, default=str)
-                 + (f"\n\nBILAN CHIFFRE ACTUEL :\n{postmortem}" if postmortem else ""))]
-        try:
-            resp = self.llm.invoke(msgs)
-            return resp.content if isinstance(resp.content, str) else str(resp.content)
-        except Exception as exc:
-            log.warning("Reflexion LLM impossible (%s) — lecon generique.", exc)
-            return self._fallback_reflect(trade)

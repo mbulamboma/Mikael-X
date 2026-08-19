@@ -193,15 +193,6 @@ def test_cycle_complet_bascule_en_secours_puis_arrete_le_script():
         def closed_trades(self):
             return []
 
-        def recent_lessons_text(self, k=12):
-            return ""
-
-        def relevant_lessons_text(self, symbols=None, strategies=None, k=12):
-            return ""
-
-        def add_lesson(self, *a, **kw):
-            self.lessons.append((a, kw))
-
     class StubNews:
         def snapshot(self, symbols):
             return {"enabled": False, "per_symbol": {}, "blackout": {}}

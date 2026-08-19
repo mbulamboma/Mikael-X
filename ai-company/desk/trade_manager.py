@@ -38,8 +38,10 @@ Pour CHAQUE position ouverte, decide l'action juste, dans cet esprit :
 - Un `modify` ne doit JAMAIS eloigner le stop au point d'augmenter le risque (l'orchestrateur
   refusera). Un stop ne se deplace que pour REDUIRE le risque ou verrouiller du profit.
 
-Respecte les CONSIGNES du Gerant et tes LECONS de gestion (ci-dessous). Corrige d'abord les
-DEFAUTS RECURRENTS du bilan (gains rendus, stop trop serre...). Si une position va bien et
+Respecte les CONSIGNES du Gerant et corrige d'abord les DEFAUTS RECURRENTS du bilan
+chiffre (gains rendus, stop trop serre...). Chaque `reason` doit citer un CHIFFRE de la
+position (R flottant, MFE/MAE, distance au stop, age) : une action justifiee par une
+impression n'est pas une gestion de position. Si une position va bien et
 n'appelle aucune action, ne fais RIEN dessus (ne bouge pas un stop pour bouger).
 
 Reponds UNIQUEMENT par un objet JSON, sans texte autour :
@@ -58,7 +60,7 @@ class TradeManager(DeskAgent):
     role = "suivi"
     title = "Trade Manager"
 
-    def manage(self, summary: dict, consignes: str, lessons: str) -> list[dict]:
+    def manage(self, summary: dict, consignes: str) -> list[dict]:
         ctx = C.read()
         positions = ctx.get("positions") or []
         if not positions:
@@ -74,7 +76,6 @@ class TradeManager(DeskAgent):
             "== NEWS / BLACK-OUT ==\n" + C.fmt({"blackout": news.get("blackout", {})}
                                                if isinstance(news, dict) else {}),
             "== BILAN / DEFAUTS RECURRENTS ==\n" + (ctx.get("postmortem") or "(aucun)"),
-            "== TES LECONS DE GESTION ==\n" + (lessons or "(aucune)"),
         ])
         plan = self.ask_json(system, dossier + "\n\nRends UNIQUEMENT le plan d'actions JSON.")
         if plan.get("analyse"):

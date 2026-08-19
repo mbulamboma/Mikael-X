@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""Phase 4 — ATTRIBUTION PAR ROLE + MEMOIRE SITUATIONNELLE.
+"""MEMOIRE SITUATIONNELLE — « qu'est-il arrive les dernieres fois, DANS CE CAS-LA ? »
 
 Points verifies :
   - la signature de situation est deterministe et tolere les donnees manquantes ;
   - la distance rapproche les configurations semblables, pas les symboles au hasard ;
   - le bloc injecte au Trader contient les cas passes ET leur bilan chiffre ;
-  - a la cloture, les lecons sont ECRITES PAR ROLE (taguees), plafonnees a 3, et un rol
-    inconnu est ignore ;
-  - un trade sans dossier (agent solo, trades d'avant la Phase 1C) garde l'ancien
-    comportement : une lecon generale, sans attribution.
+  - la signature du moment est rangee dans le dossier du trade (c'est elle qui permettra
+    de retrouver, plus tard, « les fois ou le marche ressemblait a ca »).
+
+Il n'y a AUCUN test de « lecon » ici : le desk n'en ecrit plus. Ce qu'il sait de son passe
+est calcule (post-mortem, scoreboard, revue par employe, cas comparables).
 """
 import _isolation  # noqa: F401  (base SQLite temporaire)
 import sys
@@ -141,7 +142,7 @@ def _cfg():
 
 
 def _bind():
-    T.bind_context({"EURUSD": SNAP}, {}, SUMMARY, [], "", "trend_up", {"blackout": {}})
+    T.bind_context({"EURUSD": SNAP}, {}, SUMMARY, [], "trend_up", {"blackout": {}})
     T.bind_live(None)
 
 
@@ -169,7 +170,7 @@ def test_la_signature_est_rangee_dans_le_dossier_du_trade(monkeypatch, tmp_path)
         "trader": {"actions": [{"type": "open", "strategy": "trend_follow",
                                 "symbol": "EURUSD", "direction": "buy", "entry": 1.10,
                                 "sl": 1.09, "tp": 1.13, "confidence": 0.7,
-                                "rationale": "cassure"}]},
+                                "rationale": "RSI 62.0 et position 78.0 % du range"}]},
         "risk": {"verdicts": [{"symbol": "EURUSD", "direction": "buy", "verdict": "approve"}]},
     }))
     actions = TradingDesk(_cfg()).decide(SUMMARY)
@@ -177,67 +178,3 @@ def test_la_signature_est_rangee_dans_le_dossier_du_trade(monkeypatch, tmp_path)
     assert s["rsi"] == 62.0 and s["direction"] == "buy"       # direction reprise du trade
 
 
-# =========================================================== attribution par role
-def _trade_cloture(R=-1.0):
-    return {"symbol": "EURUSD", "strategy": "trend_follow", "regime": "trend_up", "R": R,
-            "result": "sl" if R < 0 else "tp",
-            "dossier": {"mandat": {"posture": "selectif"},
-                        "trader": {"strategy": "trend_follow", "confidence": 0.8},
-                        "debat": {"verdict": {"direction": "buy", "conviction": 0.7}}}}
-
-
-def test_lecons_ecrites_par_role(monkeypatch, tmp_path):
-    set_default_store(Store(tmp_path / "a.db", migrate=False))
-    install(monkeypatch, Capture({"desk": {
-        "synthese": "on a paye un debat trop optimiste",
-        "lecons": [{"role": "juge", "lecon": "conviction 0.7 sur 2 arguments: exiger 3 faits"},
-                   {"role": "trader", "lecon": "stop a 10 pips sous un ATR de 40: elargir"}]}}))
-    desk = TradingDesk(_cfg())
-    synthese = desk.reflect(_trade_cloture(), "bilan")
-    assert synthese == "on a paye un debat trop optimiste"
-    lecons = Memory().lessons
-    assert {l.tags[0] for l in lecons} == {"juge", "trader"}
-    assert all("trend_follow" in l.tags and "trend_up" in l.tags for l in lecons)
-    # chaque employe ne relit que les siennes
-    assert "exiger 3 faits" in Memory().relevant_lessons_text(roles=["juge"])
-    assert "exiger 3 faits" not in Memory().relevant_lessons_text(roles=["trader"])
-
-
-def test_roles_inconnus_ignores_et_plafond_de_trois(monkeypatch, tmp_path):
-    set_default_store(Store(tmp_path / "b.db", migrate=False))
-    install(monkeypatch, Capture({"desk": {
-        "synthese": "s",
-        "lecons": [{"role": "juge", "lecon": "l1"}, {"role": "martien", "lecon": "l2"},
-                   {"role": "trader", "lecon": "l3"}, {"role": "bull", "lecon": "l4"},
-                   {"role": "bear", "lecon": "l5"}]}}))
-    TradingDesk(_cfg()).reflect(_trade_cloture(), "")
-    lecons = Memory().lessons
-    assert len(lecons) == 2                       # 3 premieres examinees, 'martien' rejete
-    assert {l.tags[0] for l in lecons} == {"juge", "trader"}
-
-
-def test_aucune_lecon_est_une_reponse_valable(monkeypatch, tmp_path):
-    """Un stop touche sur un bon processus n'appelle aucun reproche."""
-    set_default_store(Store(tmp_path / "c.db", migrate=False))
-    install(monkeypatch, Capture({"desk": {"synthese": "these correcte, stop normal",
-                                           "lecons": []}}))
-    assert TradingDesk(_cfg()).reflect(_trade_cloture(), "") == "these correcte, stop normal"
-    assert Memory().lessons == []
-
-
-def test_trade_sans_dossier_garde_l_ancien_comportement(monkeypatch, tmp_path):
-    """Trades d'avant la Phase 1C ou ouverts par l'agent solo : lecon generale, sans blame."""
-    set_default_store(Store(tmp_path / "d.db", migrate=False))
-    cap = Capture(texte="lecon de coach")
-    install(monkeypatch, cap)
-    trade = {"symbol": "EURUSD", "strategy": "trend_follow", "R": -1.0}
-    assert TradingDesk(_cfg()).reflect(trade, "") == "lecon de coach"
-    assert "desk:text" in cap.prompts             # passe par le coach texte, pas l'attribution
-    assert Memory().lessons == []
-
-
-def test_coach_injoignable_donne_une_lecon_de_secours(monkeypatch, tmp_path):
-    set_default_store(Store(tmp_path / "e.db", migrate=False))
-    install(monkeypatch, Capture(down=("desk",)))
-    lecon = TradingDesk(_cfg()).reflect(_trade_cloture(), "")
-    assert "trend_follow" in lecon                # repli deterministe, jamais d'exception

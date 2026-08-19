@@ -17,6 +17,7 @@ GARDE-FOUS (le web est une source hostile) :
   - liste blanche / liste noire de domaines configurables ;
   - le contenu ramene est du TEXTE A ANALYSER, jamais des instructions a executer :
     le prompt de l'agent lui interdit explicitement d'obeir a une page web.
+  - Parallélisme : exécution simultanée de plusieurs appels web (WEB_MAX_PARALLEL)
 """
 from __future__ import annotations
 
@@ -25,7 +26,10 @@ import ipaddress
 import logging
 import re
 import socket
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, List, Dict, Any, Callable
 from urllib.parse import quote_plus, urlparse
 
 import requests
@@ -70,18 +74,27 @@ class WebResearch:
         self.cfg = cfg
         self._cache: dict[str, tuple[float, dict]] = {}
         self._calls = 0
+        # Le budget et le cache sont lus/ecrits depuis plusieurs threads (appels web
+        # paralleles) : un verrou garantit un comptage exact et un cache coherent.
+        self._lock = threading.Lock()
+        # Pool d'execution pour les appels paralleles. La concurrence est bornee par
+        # WEB_MAX_PARALLEL (plafonnee a 8 pour ne pas matraquer les serveurs distants).
+        self._executor = ThreadPoolExecutor(
+            max_workers=max(1, min(self.cfg.max_parallel, 8)))
 
     # --------------------------------------------------------------- budget/cycle
     def reset_budget(self):
         """Appele a chaque cycle : rend a l'agent son quota de requetes web."""
-        self._calls = 0
+        with self._lock:
+            self._calls = 0
 
     def _spend(self) -> str | None:
-        if self._calls >= self.cfg.max_calls_per_cycle:
-            return (f"budget web epuise pour ce cycle "
-                    f"({self.cfg.max_calls_per_cycle} requetes) — decide avec ce que tu as")
-        self._calls += 1
-        return None
+        with self._lock:
+            if self._calls >= self.cfg.max_calls_per_cycle:
+                return (f"budget web epuise pour ce cycle "
+                        f"({self.cfg.max_calls_per_cycle} requetes) — decide avec ce que tu as")
+            self._calls += 1
+            return None
 
     # --------------------------------------------------------------- securite URL
     def _check(self, url: str) -> str | None:
@@ -111,13 +124,15 @@ class WebResearch:
 
     # --------------------------------------------------------------- cache
     def _cached(self, key: str) -> dict | None:
-        hit = self._cache.get(key)
+        with self._lock:
+            hit = self._cache.get(key)
         if hit and time.time() - hit[0] < self.cfg.cache_min * 60:
             return hit[1]
         return None
 
     def _store(self, key: str, value: dict) -> dict:
-        self._cache[key] = (time.time(), value)
+        with self._lock:
+            self._cache[key] = (time.time(), value)
         return value
 
     # --------------------------------------------------------------- recherche
@@ -250,7 +265,8 @@ class WebResearch:
         except Exception as e:
             return {"source": "myfxbook API", "error": f"appel impossible: {e}"}
         if data.get("error"):
-            self._cache.pop("mfb:session", None)          # session expiree -> re-login
+            with self._lock:
+                self._cache.pop("mfb:session", None)      # session expiree -> re-login
             return {"source": "myfxbook API", "error": str(data.get("message"))}
         rows = []
         for s in data.get("symbols", []):
@@ -301,3 +317,46 @@ class WebResearch:
                         "verifie la coherence, et souviens-toi que la lecture est souvent "
                         "contrarienne.",
                 "extrait_page": "" if rows else text[:1500]}
+
+    # --------------------------------------------------------------- parallélisme
+    #
+    # Les appels web sequentiels dominent le temps d'un cycle (chaque page = un aller-
+    # retour reseau de plusieurs secondes). On les paralellise en REUTILISANT search()
+    # et read() telles quelles : elles portent deja le budget par cycle, le cache, la
+    # securite URL (anti-SSRF) et la mise en forme. Le pool borne la concurrence a
+    # WEB_MAX_PARALLEL ; l'ordre des resultats suit l'ordre des requetes (les appelants
+    # font `zip(queries, results)`), et une erreur isolee ne fait pas tomber le lot.
+    def multiple_search(self, queries: List[str], limit: int = 6) -> List[Dict[str, Any]]:
+        """Plusieurs recherches web EN PARALLELE, resultats dans l'ordre des requetes."""
+        tasks = [str(q).strip()[:300] for q in (queries or []) if str(q).strip()]
+        if not tasks or not self.cfg.enabled:
+            return []
+        return self._en_parallele(lambda q: self.search(q, limit), tasks)
+
+    def multiple_read(self, urls: List[str], max_chars: Optional[int] = None
+                      ) -> List[Dict[str, Any]]:
+        """Plusieurs pages lues EN PARALLELE, resultats dans l'ordre des URLs."""
+        tasks = [str(u).strip() for u in (urls or []) if str(u).strip()]
+        if not tasks or not self.cfg.enabled:
+            return []
+        return self._en_parallele(lambda u: self.read(u, max_chars), tasks)
+
+    def _en_parallele(self, fn: Callable[[str], dict], items: List[str]) -> List[dict]:
+        """Applique `fn` a chaque element via le pool (concurrence bornee par
+        WEB_MAX_PARALLEL), en CONSERVANT l'ordre d'entree. Le budget et le cache sont
+        geres par `fn` (search/read), sous verrou : aucun comptage en double ici."""
+        resultats: List[dict] = [None] * len(items)              # type: ignore[list-item]
+        futures = {self._executor.submit(fn, item): i for i, item in enumerate(items)}
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                resultats[i] = future.result()
+            except Exception as e:
+                resultats[i] = {"error": f"appel web echoue: {e}", "cible": items[i]}
+        return resultats
+
+    def __del__(self):
+        """Nettoyage des ressources."""
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)

@@ -15,7 +15,7 @@ from brain import tools as T
 
 def read() -> dict:
     """Contexte de cycle en lecture seule (account, positions, snapshots, charts,
-    news, strategies, postmortem, lessons)."""
+    news, strategies, postmortem)."""
     return T.cycle_context()
 
 

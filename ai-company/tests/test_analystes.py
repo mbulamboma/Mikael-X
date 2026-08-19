@@ -6,6 +6,8 @@ Points verifies :
     le fondamental voit la macro, etc.) — c'est le remplacant du tool-calling ;
   - ils sont INDEPENDANTS : aucun ne voit le brief d'un autre ;
   - un brief mal forme devient neutre/0.0 (le bruit ne doit pas passer pour une conviction) ;
+  - un point cle qui ne cite aucune donnee du dossier est ecarte, et un brief qui n'en
+    garde aucun perd son biais et sa confiance (desk/preuves.py) ;
   - une source de donnees en panne laisse un trou, jamais une exception ;
   - l'echec d'un analyste retire son seul brief ; le desk continue.
 """
@@ -63,7 +65,7 @@ class _Live:
 
     def major_events(self, hours=72):
         self._check("events")
-        return {"evenements": ["FOMC"]}
+        return {"evenements": ["FOMC"], "prochain_dans_h": 36.0}
 
     def news_search(self, query, hours=48):
         self._check("news_search")
@@ -76,10 +78,18 @@ class _Live:
 
 def _bind(live=None, news=None):
     T.bind_context({"EURUSD": {"symbol": "EURUSD", "close": 1.1000}}, {"EURUSD": {"D1": []}},
-                   SUMMARY, [], "", "Regime dominant: trend_up",
+                   SUMMARY, [], "Regime dominant: trend_up",
                    news if news is not None else {"per_symbol": {"EURUSD": {"titres": ["CPI"]}},
                                                   "blackout": {}})
     T.bind_live(live)
+
+
+#: un point cle SOURCE par metier (le filtre de preuves ne laisse passer que ce qui
+#: cite une donnee du dossier de CET analyste).
+POINTS = {"technique": ["cassure au-dessus de 1.1000, ATR 0.0040"],
+          "fondamental": ["DGS10 a 4.2 %"],
+          "sentiment": ["78.0 % de retail long"],
+          "actualite": ["evenement a fort impact dans 36.0 h"]}
 
 
 class Capture:
@@ -94,7 +104,8 @@ class Capture:
             raise DeskUnavailable(f"{agent.role} down (test)")
         self.prompts[agent.role] = human
         return self.by_role.get(agent.role, {"biais": "haussier", "confiance": 0.6,
-                                             "resume": f"avis de {agent.role}"})
+                                             "resume": f"avis de {agent.role}",
+                                             "points_cles": POINTS.get(agent.role, [])})
 
 
 def install(monkeypatch, capture):
@@ -163,7 +174,7 @@ def test_les_analystes_ne_se_lisent_pas(monkeypatch):
     _bind(live)
     cap = Capture()
     install(monkeypatch, cap)
-    Analystes(AgentConfig()).briefs(["EURUSD"], {"consignes": "prudence"}, None)
+    Analystes(AgentConfig()).briefs(["EURUSD"], {"consignes": "prudence"})
     assert set(cap.prompts) == {"technique", "fondamental", "sentiment", "actualite"}
     for role, prompt in cap.prompts.items():
         for autre in cap.prompts:
@@ -176,35 +187,46 @@ def test_brief_illisible_devient_neutre(monkeypatch):
     cap = Capture({"technique": {"biais": "TRES HAUSSIER", "confiance": "beaucoup",
                                  "points_cles": "pas une liste"}})
     install(monkeypatch, cap)
-    b = AnalysteTechnique(AgentConfig()).brief("EURUSD", {}, "", {})
+    b = AnalysteTechnique(AgentConfig()).brief("EURUSD", {}, {})
     assert b["biais"] == "neutre" and b["confiance"] == 0.0 and b["points_cles"] == []
 
 
 def test_confiance_bornee(monkeypatch):
     _bind(_Live())
-    install(monkeypatch, Capture({"technique": {"biais": "haussier", "confiance": 5}}))
-    assert AnalysteTechnique(AgentConfig()).brief("EURUSD", {}, "", {})["confiance"] == 1.0
+    install(monkeypatch, Capture({"technique": {"biais": "haussier", "confiance": 5,
+                                                "points_cles": ["cassure de 1.1000"]}}))
+    assert AnalysteTechnique(AgentConfig()).brief("EURUSD", {}, {})["confiance"] == 1.0
+
+
+def test_point_cle_sans_preuve_est_ecarte(monkeypatch):
+    """Une affirmation qu'aucun chiffre du dossier ne soutient ne doit pas circuler."""
+    _bind(_Live())
+    install(monkeypatch, Capture({"technique": {
+        "biais": "haussier", "confiance": 0.8,
+        "points_cles": ["le dollar devrait s'affaiblir", "cassure au-dessus de 1.1000"]}}))
+    b = AnalysteTechnique(AgentConfig()).brief("EURUSD", {}, {})
+    assert b["points_cles"] == ["cassure au-dessus de 1.1000"]
+    assert b["ecartes_sans_preuve"] == ["le dollar devrait s'affaiblir"]
+    assert b["biais"] == "haussier" and b["confiance"] == 0.8   # il reste une preuve
+
+
+def test_brief_entierement_speculatif_est_neutralise(monkeypatch):
+    """Aucune preuve = aucune conviction : le brief reste lisible mais ne pese plus."""
+    _bind(_Live())
+    install(monkeypatch, Capture({"technique": {
+        "biais": "haussier", "confiance": 0.9,
+        "points_cles": ["la structure semble haussiere", "le marche va chercher le haut"]}}))
+    b = AnalysteTechnique(AgentConfig()).brief("EURUSD", {}, {})
+    assert b["points_cles"] == [] and b["biais"] == "neutre" and b["confiance"] == 0.0
+    assert len(b["ecartes_sans_preuve"]) == 2
 
 
 def test_un_analyste_hs_ne_retire_que_son_brief(monkeypatch):
     _bind(_Live())
     cap = Capture(down=("sentiment",))
     install(monkeypatch, cap)
-    briefs = Analystes(AgentConfig()).briefs(["EURUSD"], {}, None)
+    briefs = Analystes(AgentConfig()).briefs(["EURUSD"], {})
     assert set(briefs["EURUSD"]) == {"technique", "fondamental", "actualite"}
-
-
-def test_lecons_filtrees_par_analyste(monkeypatch):
-    """Chaque analyste apprend de SES erreurs : on lui passe ses lecons, pas celles du desk."""
-    _bind(_Live())
-    cap = Capture()
-    install(monkeypatch, cap)
-    vus = []
-    Analystes(AgentConfig()).briefs(["EURUSD"], {},
-                                    lambda roles: vus.append(roles) or f"lecon {roles[0]}")
-    assert vus == [["technique"], ["fondamental"], ["sentiment"], ["actualite"]]
-    assert "lecon technique" in cap.prompts["technique"]
-    assert "lecon technique" not in cap.prompts["sentiment"]
 
 
 def test_dossier_commun_charge_une_seule_fois(monkeypatch):
@@ -212,7 +234,7 @@ def test_dossier_commun_charge_une_seule_fois(monkeypatch):
     live = _Live()
     _bind(live)
     install(monkeypatch, Capture())
-    Analystes(AgentConfig()).briefs(["EURUSD", "GBPUSD"], {}, None)
+    Analystes(AgentConfig()).briefs(["EURUSD", "GBPUSD"], {})
     assert live.appels.count("fred") == 5          # SERIES_MACRO, pas 5 x 2 symboles
     assert live.appels.count("events") == 1
 
@@ -223,12 +245,16 @@ def _router_desk(briefs_ok=True):
         "gerant": {"convoquer_desk": True, "candidats": ["EURUSD"], "posture": "selectif"},
         "trader": {"actions": [{"type": "open", "strategy": "trend_follow", "symbol": "EURUSD",
                                 "direction": "buy", "entry": 1.10, "sl": 1.09, "tp": 1.13,
-                                "confidence": 0.7, "rationale": "macro + technique"}]},
+                                "confidence": 0.7,
+                                "rationale": "cassure au-dessus de 1.1000, spread 1.0 pip"}]},
         "risk": {"verdicts": [{"symbol": "EURUSD", "direction": "buy", "verdict": "approve"}]},
     }
     if briefs_ok:
         for role in ("technique", "fondamental", "sentiment", "actualite"):
-            canned[role] = {"biais": "haussier", "confiance": 0.7, "resume": f"vu par {role}"}
+            # points_cles SOURCES : sans eux, le filtre de preuves (desk/preuves.py)
+            # neutralise le brief (biais neutre, confiance 0).
+            canned[role] = {"biais": "haussier", "confiance": 0.7, "resume": f"vu par {role}",
+                            "points_cles": POINTS.get(role, [])}
     return canned
 
 

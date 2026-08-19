@@ -71,14 +71,13 @@ def test_mail_cloture_marque_les_pertes_comme_urgentes():
              "R": -1.0, "pnl": -1000.0, "entry": 1.10, "exit": 1.095,
              "rr_planifie": 2.0, "rr_net_planifie": 1.8, "mfe_R": 0.3, "mae_R": -1.0,
              "duree_h": 30.0}
-    m.trade_ferme(trade, "Stop dans le bruit : elargir a 1 ATR.",
-                  summary=SUMMARY, positions=[])
+    m.trade_ferme(trade, summary=SUMMARY, positions=[])
     sujet, corps, urgent, html = m.envois[0]
     assert "PERTE" in sujet and urgent is True
-    assert "MFE / MAE" in corps and "Stop dans le bruit" in corps
+    assert "MFE / MAE" in corps
 
     m2 = _mailer()
-    m2.trade_ferme({**trade, "R": 2.0, "pnl": 2000.0}, "ok", summary=SUMMARY, positions=[])
+    m2.trade_ferme({**trade, "R": 2.0, "pnl": 2000.0}, summary=SUMMARY, positions=[])
     assert "GAIN" in m2.envois[0][0] and m2.envois[0][2] is False
 
 

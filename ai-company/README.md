@@ -363,11 +363,12 @@ déterministe (perte jour/total, nb positions, trades/jour, cooldown, concentrat
 L'agent est **news-aware** ([data/news.py](data/news.py)) — à chaque cycle il
 reçoit, par devise du symbole :
 
-- **Calendrier économique MT5** (`calendar_history.csv`, exporté par votre
-  `ExportCalendar.mq5`) : surprises récentes + événements **à venir** à fort impact.
+- **Calendrier économique MT5** (`calendar_history.csv`, exporté par
+  [`tools/ExportCalendar.mq5`](tools/ExportCalendar.mq5)) : surprises récentes +
+  événements **à venir** à fort impact.
 - **Réserve fédérale / taux** via **FRED** (`FRED_API`) : Fed funds, 2 ans, 10 ans.
 - **Actualités** via **GDELT** (gratuit) : titres 48 h/devise, sentiment jugé par le LLM.
-- **Brain macro par devise** (`macro_features.csv` de `v4_macro/macro_service.py`), s'il existe.
+- **Brain macro par devise** (`macro_features.csv` de `tools/macro_service.py`), s'il existe.
 
 Deux protections swing en découlent :
 1. **Black-out news** — l'agent n'ouvre **aucune** nouvelle position si un événement à
@@ -427,11 +428,12 @@ n'interrompt jamais le trading** (l'erreur est simplement journalisée).
 
 ## Configuration : un seul fichier
 
-`.env` est **autonome** — MT5, Bedrock, FTMO, coûts, news, web, mail, état. Le
-`.env` du projet parent n'est lu qu'en repli, si `.env` n'existe pas. Une variable
-définie dans l'environnement l'emporte sur le fichier (`AGENT_WEEKEND_FLATTEN=1 python
-run.py`). Les placeholders non remplacés (`<votre_cle>`) sont traités comme vides, pour
-ne jamais s'authentifier avec une fausse clé.
+`.env` est **autonome** — MT5, Bedrock, FTMO, coûts, news, web, mail, état. C'est le
+**seul** fichier lu (`ai-company/.env`) : ni `.env` parent, ni couche superposée. Une
+variable définie dans l'environnement l'emporte sur le fichier (`AGENT_WEEKEND_FLATTEN=1
+python run.py`), ce qui permet de tout piloter par variables d'environnement en conteneur,
+sans `.env` du tout. Les placeholders non remplacés (`<votre_cle>`) sont traités comme
+vides, pour ne jamais s'authentifier avec une fausse clé.
 
 ```bash
 cp .env.example .env   # puis remplir
