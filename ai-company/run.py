@@ -606,6 +606,11 @@ class Orchestrator:
         premiere du post-mortem (stop trop serre ? sortie trop tot ?)."""
         out = []
         touched = False
+        # open_time du broker = heure SERVEUR (EET/EEST) etiquetee UTC ; on calcule donc
+        # l'age contre l'horloge SERVEUR (elle aussi etiquetee UTC), sinon l'age est negatif
+        # du decalage serveur (~2-3 h). cf. broker.server_now(). Repli UTC si indispo.
+        server_now = getattr(self.broker, "server_now", None)
+        now_srv = server_now() if callable(server_now) else datetime.now(timezone.utc)
         for p in positions:
             spec = self._spec(p["symbol"])
             m = meta.get(str(p["ticket"]), {})
@@ -632,7 +637,7 @@ class Orchestrator:
                 "dist_sl_pips": round(abs(price - p["sl"]) * p2p, 1) if p["sl"] else None,
                 "dist_tp_pips": round(abs(p["tp"] - price) * p2p, 1) if p["tp"] else None,
                 "mfe_R": m.get("mfe_R"), "mae_R": m.get("mae_R"),
-                "age_h": round((datetime.now(timezone.utc) - p["open_time"]).total_seconds() / 3600, 1)
+                "age_h": round((now_srv - p["open_time"]).total_seconds() / 3600, 1)
                 if p.get("open_time") else None,
             })
         if touched:
@@ -710,7 +715,7 @@ class Orchestrator:
                                                 "etrangeres": len(etrangeres), **summary})
             for p in positions:
                 self._exec_close({"ticket": p["ticket"], "fraction": 1.0,
-                                  "reason": f"urgence: {panique}"[:24]}, meta)
+                                  "reason": f"urgence: {panique}"[:24]}, meta, deterministe=True)
             if etrangeres:
                 log.error("ATTENTION : %d position(s) hors agent restent ouvertes et pesent "
                           "sur la perte du jour — intervention MANUELLE requise.",
@@ -729,7 +734,7 @@ class Orchestrator:
             self.mem.log_event("weekend_flatten", {"positions": len(positions)})
             for p in positions:
                 self._exec_close({"ticket": p["ticket"], "fraction": 1.0,
-                                  "reason": "week-end: gap"}, meta)
+                                  "reason": "week-end: gap"}, meta, deterministe=True)
             return bool(positions)
 
         # protections position par position (stop d'urgence, break-even, trailing)
@@ -748,11 +753,11 @@ class Orchestrator:
             pos_by_tk = {p["ticket"]: p for p in positions}
             for a in actions:
                 if a["type"] == "modify":
-                    self._exec_modify(a, pos_by_tk, meta)
+                    self._exec_modify(a, pos_by_tk, meta, deterministe=True)
                 elif a["type"] == "trail":
                     self._exec_trail(a, meta)
                 elif a["type"] == "close":
-                    self._exec_close(a, meta)
+                    self._exec_close(a, meta, deterministe=True)
         return False
 
     def _flatten_weekend_due(self) -> bool:
@@ -892,8 +897,33 @@ class Orchestrator:
             acc = self._account_state(account, positions, s)
             self._exec_open(a, acc, s, meta, news)
 
-    def _exec_close(self, a: dict, meta: dict):
+    def _floating_r(self, p: dict, meta: dict) -> float | None:
+        """Profit flottant d'une position broker exprime en R (risque initial), via open_meta.
+        None si le risque n'est pas connu (position hors agent, meta perdue)."""
+        risk = (meta.get(str(p.get("ticket"))) or {}).get("risk_dollars", 0.0)
+        if not risk:
+            return None
+        return p.get("floating", 0.0) / risk
+
+    def _exec_close(self, a: dict, meta: dict, deterministe: bool = False):
         tk = a["ticket"]; frac = a.get("fraction", 1.0)
+        # GARDE-FOU anti-scratch : le LLM ne ferme pas un trade quasi plat (ni vrai perdant, ni
+        # vrai gagnant) — on laisse le stop travailler. Le pilote deterministe (deterministe=True)
+        # et un motif dur (black-out news) ne sont jamais brides.
+        if self.cfg.desk.tm_guard and not deterministe:
+            p = next((x for x in self.broker.positions() if x["ticket"] == tk), None)
+            fr = self._floating_r(p, meta) if p else None
+            if fr is not None and self.cfg.desk.tm_scratch_floor_r < fr < self.cfg.desk.tm_lock_r:
+                bo = self.news.blackout_for(p["symbol"]) if self.cfg.news.enabled else {}
+                if not (bo or {}).get("active"):
+                    log.info("Cloture %s refusee (garde-fou gestion) : trade quasi plat a "
+                             "%.2fR (zone %.1f..%.1f) — on laisse le stop travailler, pas de "
+                             "scratch.", tk, fr, self.cfg.desk.tm_scratch_floor_r,
+                             self.cfg.desk.tm_lock_r)
+                    self.mem.log_event("close_veto_gestion",
+                                       {"ticket": tk, "floating_R": round(fr, 2),
+                                        "reason": a.get("reason")})
+                    return
         res = self.broker.close_position(tk, frac, comment=str(a.get("reason", "AI-close"))[:24])
         log.info("CLOTURE ticket %s x%.2f -> %s", tk, frac, res.get("message"))
         self.mem.log_event("close", {"ticket": tk, "fraction": frac,
@@ -904,12 +934,27 @@ class Orchestrator:
                 m["risk_dollars"] = m.get("risk_dollars", 0.0) * (1 - frac)
                 self.mem.save_meta(meta)
 
-    def _exec_modify(self, a: dict, pos_by_tk: dict, meta: dict):
+    def _exec_modify(self, a: dict, pos_by_tk: dict, meta: dict, deterministe: bool = False):
         tk = a["ticket"]; new_sl = a.get("sl"); new_tp = a.get("tp")
         p = pos_by_tk.get(tk)
         if p is None:
             log.info("Modify ignore : ticket %s introuvable.", tk)
             return
+        # GARDE-FOU anti break-even premature : tant que le trade n'a pas atteint tm_lock_r,
+        # le LLM ne resserre PAS le stop vers le prix (verrou de gain / break-even). Sans marge,
+        # le trade se fait scratcher au moindre recul. Le break-even reste l'affaire du pilote
+        # deterministe (a +1R). Elargir un stop (dans le budget) ou poser un 1er stop reste permis.
+        if self.cfg.desk.tm_guard and not deterministe and new_sl and p.get("sl"):
+            resserre = (new_sl > p["sl"]) if p["direction"] == "buy" else (new_sl < p["sl"])
+            fr = self._floating_r(p, meta)
+            if resserre and fr is not None and fr < self.cfg.desk.tm_lock_r:
+                log.info("Modify %s refuse (garde-fou gestion) : resserrage du stop a %.2fR < "
+                         "%.1fR — le break-even reste au pilote deterministe.", tk, fr,
+                         self.cfg.desk.tm_lock_r)
+                self.mem.log_event("modify_veto_gestion",
+                                   {"ticket": tk, "sl": new_sl, "floating_R": round(fr, 2),
+                                    "reason": a.get("reason")})
+                return
         # garde-fou : un nouveau SL ne doit pas AUGMENTER le risque au-dela du budget FTMO
         if new_sl:
             spec = self._spec(p["symbol"])

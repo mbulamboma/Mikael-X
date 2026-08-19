@@ -319,3 +319,77 @@ def test_objectif_atteint_ne_declenche_pas_lalerte_jours():
     # objectif fait : on n'exige plus de forcer des jours de trading supplementaires.
     assert _alertes_ftmo(_info(objectif_atteint=True, jours_restants=1,
                                jours_trades_manquants=4)) == []
+
+
+# ------------------------------------------------ garde-fous de GESTION (anti mort par mille coupures)
+def _orch_gestion(pos, risk_dollars=500.0):
+    o = _orchestrateur(pos)
+    o.news.blackout_for = lambda s: {}           # pas d'appel web, aucun black-out
+    meta = {str(p["ticket"]): {"ticket": p["ticket"], "risk_dollars": risk_dollars}
+            for p in pos}
+    return o, meta
+
+
+def test_llm_ne_scratch_pas_un_trade_quasi_plat():
+    """Le defaut du log : fermer un trade a ~0R au moindre pretexte. Doit etre refuse."""
+    o, meta = _orch_gestion([_pos(1, floating=-3.0)])       # -3$ / 500$ = -0.006R (zone morte)
+    o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "biais degrade"}, meta)
+    assert o.broker.closes == []                            # trade PRESERVE
+    assert "close_veto_gestion" in [k for k, _ in o.mem.events]
+
+
+def test_le_pilote_deterministe_ferme_meme_un_trade_plat():
+    """Le garde-fou ne bride JAMAIS l'urgence / le pilote de secours."""
+    o, meta = _orch_gestion([_pos(1, floating=-3.0)])
+    o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "urgence"}, meta, deterministe=True)
+    assert o.broker.closes == [1]
+
+
+def test_un_vrai_perdant_peut_etre_ferme_par_le_llm():
+    """Sous le plancher (-0.5R), une sortie discretionnaire reste permise."""
+    o, meta = _orch_gestion([_pos(1, floating=-400.0)])     # -0.8R : vrai perdant
+    o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "these cassee"}, meta)
+    assert o.broker.closes == [1]
+
+
+def test_un_gagnant_peut_etre_pris_partiellement():
+    """Au-dela de +1R, prise de profit / scratch autorises."""
+    o, meta = _orch_gestion([_pos(1, floating=600.0)])      # +1.2R
+    o._exec_close({"ticket": 1, "fraction": 0.5, "reason": "prise partielle"}, meta)
+    assert o.broker.closes == [1]
+
+
+def test_llm_ne_resserre_pas_le_stop_avant_1r():
+    """Break-even premature refuse : sous +1R, le stop reste au pilote deterministe."""
+    o, meta = _orch_gestion([_pos(1, sl=1.0950, floating=-3.0)])
+    o._exec_modify({"ticket": 1, "sl": 1.1000, "reason": "break-even"},
+                   {1: o.broker.pos[0]}, meta)
+    assert o.broker.modifs == []                            # stop NON deplace
+    assert "modify_veto_gestion" in [k for k, _ in o.mem.events]
+
+
+def test_break_even_autorise_une_fois_1r_atteint():
+    """A +1R, le LLM peut verrouiller le break-even."""
+    o, meta = _orch_gestion([_pos(1, sl=1.0950, floating=600.0)])   # +1.2R
+    o._exec_modify({"ticket": 1, "sl": 1.1000, "reason": "break-even"},
+                   {1: o.broker.pos[0]}, meta)
+    assert o.broker.modifs == [(1, 1.1000)]
+
+
+def test_pilote_deterministe_pose_le_break_even_sans_etre_bride():
+    """Le break-even du pilote (a +1R) passe meme via le garde-fou (deterministe=True)."""
+    o, meta = _orch_gestion([_pos(1, sl=1.0950, floating=-3.0)])
+    o._exec_modify({"ticket": 1, "sl": 1.1000, "reason": "secours: break-even"},
+                   {1: o.broker.pos[0]}, meta, deterministe=True)
+    assert o.broker.modifs == [(1, 1.1000)]
+
+
+def test_age_des_positions_calcule_sur_lhorloge_serveur():
+    """Fix #3 : open_time est en heure SERVEUR ; l'age doit se calculer contre server_now(),
+    sinon il est negatif du decalage serveur (le bug 'age negatif' du log)."""
+    o = _orchestrateur()
+    # ouverture 3h avant l'horloge serveur du _Broker (2026-08-11 12:00 UTC)
+    p = _pos(1)
+    p["open_time"] = datetime(2026, 8, 11, 9, 0, tzinfo=timezone.utc)
+    view = o._enrich_positions([p], {"1": {"risk_dollars": 500.0}})
+    assert view[0]["age_h"] == 3.0                          # positif, pas negatif

@@ -482,6 +482,18 @@ class DeskConfig:
     vigie_giveback_r: float = _f("DESK_VIGIE_GIVEBACK_R", 1.0) # MFE atteint -> "gains rendus"
     vigie_min_minutes: int = _i("DESK_VIGIE_MIN_MINUTES", 30)  # anti-spam par ticket
 
+    # GARDE-FOUS DE GESTION (Trade Manager / Vigie) — anti "mort par mille coupures".
+    # Constat : le LLM resserrait le stop a l'entree (break-even) et fermait des trades quasi
+    # plats des +2$, si bien qu'aucun trade n'avait la marge d'atteindre +1R. Tant qu'une
+    # position n'a pas atteint `tm_lock_r`, le LLM ne peut NI resserrer le stop vers le prix
+    # NI la fermer : le break-even/trailing reste l'affaire du pilote deterministe (a +1R).
+    # Une sortie discretionnaire anticipee n'est permise que pour un vrai perdant
+    # (R < `tm_scratch_floor_r`) ou un motif dur (black-out news actif sur le symbole).
+    # Le pilote deterministe (urgence, week-end, secours) N'EST JAMAIS bride par ce garde-fou.
+    tm_guard: bool = field(default_factory=lambda: os.environ.get("DESK_TM_GUARD", "1") == "1")
+    tm_lock_r: float = _f("DESK_TM_LOCK_R", 1.0)                    # +R requis pour resserrer/scratcher
+    tm_scratch_floor_r: float = _f("DESK_TM_SCRATCH_FLOOR_R", -0.5) # en-dessous : sortie libre
+
     # TRACING PAS-A-PAS (cf. desk/trace.py) : chaque appel LLM du desk est journalise
     # (rol, modele, latence, taille, ok/erreur) dans state/traces/<cycle>.jsonl. C'est la
     # debuggabilite qu'un graphe LangGraph offrirait, sans en adopter le framework.
