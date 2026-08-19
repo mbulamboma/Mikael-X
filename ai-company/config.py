@@ -245,6 +245,34 @@ class WebConfig:
 
 
 @dataclass(frozen=True)
+class SourcesConfig:
+    """SOURCES DE DONNEES PLUGGABLES (cf. data/sources.py) — Marche / Social / News /
+    Fondamentaux, a l'image de TradingAgents. Tout est OPT-IN, FAIL-CLOSED et ASSAINI.
+
+    Rien n'est actif par defaut : une source ne s'allume qu'avec sa cle (.env) ou son
+    drapeau. Les sources textuelles (Reddit, RSS, news) sont traitees comme des donnees
+    hostiles (data/sanitize.py) : agregats chiffres + extraits neutralises seulement.
+    """
+    # Reddit : JSON public, SANS cle. Drapeau explicite car c'est une source non fiable.
+    reddit_enabled: bool = field(default_factory=lambda:
+                                 os.environ.get("SOURCES_REDDIT", "0") == "1")
+    reddit_subs: tuple[str, ...] = field(default_factory=lambda: tuple(
+        s.strip() for s in os.environ.get("SOURCES_REDDIT_SUBS", "Forex,wallstreetbets").split(",")
+        if s.strip()))
+    # RSS : flux libres (Reuters, banques centrales, medias). URLs separees par des virgules.
+    rss_feeds: tuple[str, ...] = field(default_factory=lambda: tuple(
+        u.strip() for u in os.environ.get("SOURCES_RSS", "").split(",") if u.strip()))
+    # Cles API (paliers gratuits) : activent news/social/fondamentaux quand renseignees.
+    finnhub_key: str = field(default_factory=lambda: _s("FINNHUB_API_KEY"))
+    eodhd_key: str = field(default_factory=lambda: _s("EODHD_API_KEY"))
+    # Fusion des sources dans les dossiers des analystes (Fondamental/Actualite).
+    inject_fundamentals: bool = field(default_factory=lambda:
+                                      os.environ.get("SOURCES_FUNDAMENTALS", "1") == "1")
+    inject_news: bool = field(default_factory=lambda:
+                              os.environ.get("SOURCES_NEWS", "1") == "1")
+
+
+@dataclass(frozen=True)
 class MailConfig:
     """Notifications par email : ouverture/cloture de trade, urgences, arret du script.
 
@@ -496,6 +524,7 @@ class AgentConfig:
     mt5: MT5Config = field(default_factory=MT5Config)
     news: NewsConfig = field(default_factory=NewsConfig)
     web: WebConfig = field(default_factory=WebConfig)
+    sources: SourcesConfig = field(default_factory=SourcesConfig)
     safe: SafeModeConfig = field(default_factory=SafeModeConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     mail: MailConfig = field(default_factory=MailConfig)

@@ -90,6 +90,8 @@ class Orchestrator:
         self.mem = Memory()
         self.news = NewsFeed(CFG.news)
         self.web = WebResearch(CFG.web)
+        from data.sources import Sources
+        self.sources = Sources(CFG.sources)            # sources pluggables (opt-in, assainies)
         self.pilot = SafePilot(CFG.safe, CFG.ftmo)     # secours deterministe (sans LLM)
         self.mail = Mailer(CFG.mail)                   # notifications (trades, urgences)
         self.agent = None
@@ -183,6 +185,20 @@ class Orchestrator:
 
     def retail_sentiment(self, symbol: str = "") -> dict:
         return self.web.retail_sentiment(symbol)
+
+    # ---- sources pluggables (data/sources.py) : Social / News / Fondamentaux ----
+    def social_sentiment(self, symbol: str = "") -> dict:
+        """Sentiment social AGREGE et assaini (Reddit/Finnhub...). {} si aucune source active.
+        Consomme par desk/social.py -> analyste Sentiment (Point 4)."""
+        return self.sources.social_sentiment(symbol)
+
+    def news_extra(self, symbol: str = "", limit: int = 8) -> list[dict]:
+        """News supplementaires (RSS/Finnhub/EODHD), en plus du calendrier et de GDELT."""
+        return self.sources.news_extra(symbol, limit)
+
+    def fundamentals(self, symbol: str = "") -> dict:
+        """Fondamentaux d'un titre (profil, metriques, inities). {} pour une paire FX."""
+        return self.sources.fundamentals(symbol)
 
     # -------------------------------------------------------- couts et frictions reelles
     def costs_view(self, symbol: str, lot: float = 0.0, direction: str = "buy") -> dict:

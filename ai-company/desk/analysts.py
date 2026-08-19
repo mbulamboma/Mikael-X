@@ -214,10 +214,17 @@ class AnalysteFondamental(Analyste):
                "la retourne. Ignore le graphique.")
 
     def dossier(self, symbol, ctx, live, commun):
-        return {"symbole": symbol, "devises": _devises(symbol),
-                "series_macro": commun.get("macro"),
-                "evenements_a_venir": commun.get("evenements"),
-                "couts_de_portage": (C.symbol_dossier(symbol, ctx, live) or {}).get("couts")}
+        d = {"symbole": symbol, "devises": _devises(symbol),
+             "series_macro": commun.get("macro"),
+             "evenements_a_venir": commun.get("evenements"),
+             "couts_de_portage": (C.symbol_dossier(symbol, ctx, live) or {}).get("couts")}
+        # sources pluggables : fondamentaux d'un TITRE (profil, metriques, inities). Vide pour
+        # une paire FX (aucune societe derriere). Opt-in + fail-closed (cf. data/sources.py).
+        if live is not None and self.cfg.sources.inject_fundamentals:
+            fond = _safe(lambda: live.fundamentals(symbol), "fondamentaux")
+            if fond:
+                d["fondamentaux"] = fond
+        return d
 
 
 class AnalysteSentiment(Analyste):
@@ -255,6 +262,11 @@ class AnalysteActualite(Analyste):
              "blackout": bo.get(symbol), "evenements_a_venir": commun.get("evenements")}
         if live is not None and not d["news_du_symbole"]:
             d["recherche"] = _safe(lambda: live.news_search(symbol, 48), "recherche news")
+        # sources pluggables : titres RSS/Finnhub/EODHD, en plus du calendrier et de GDELT.
+        if live is not None and self.cfg.sources.inject_news:
+            extra = _safe(lambda: live.news_extra(symbol, 6), "news supplementaires")
+            if extra:
+                d["news_sources"] = extra
         return d
 
 

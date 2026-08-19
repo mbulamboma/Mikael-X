@@ -1,0 +1,352 @@
+# -*- coding: utf-8 -*-
+"""COUCHE DE SOURCES EXTENSIBLE — brancher de nouvelles donnees sans toucher aux analystes.
+
+Le desk lisait jusqu'ici : MT5 (prix/chart/couts), FRED (taux), GDELT (titres), Google/DDG
+(web), myfxbook (sentiment retail). Ce module ajoute une couche PLUGGABLE ou chaque source
+est un petit adaptateur a interface uniforme, et une agregation par CATEGORIE (a l'image de
+TradingAgents : Marche / Social / News / Fondamentaux).
+
+TROIS PRINCIPES, herites du reste du desk :
+  1. OPT-IN. Une source ne s'active qu'avec sa cle (.env) ou son drapeau. Rien de branche par
+     defaut : on n'ajoute pas une dependance reseau a l'insu de l'operateur.
+  2. FAIL-CLOSED. Toute source qui tombe (reseau, quota, format) laisse un TROU (None/[]),
+     jamais une exception : une source non fiable ne doit ni bloquer ni fausser un cycle.
+  3. ASSAINI. Tout texte externe passe par data/sanitize.py (injection de prompt) : on
+     n'expose que des agregats chiffres + de rares extraits neutralises.
+
+CE QUI EST BRANCHE ICI (realiste, sans secret invente) :
+  - Reddit  : JSON public (sans cle) -> sentiment social heuristique (lexique bull/bear) ;
+  - RSS     : n'importe quel flux (Reuters, banques centrales...) via la stdlib -> news ;
+  - Finnhub : cle FINNHUB_API_KEY (palier gratuit) -> news societe, sentiment social score,
+              profil + transactions d'inities (couvre l'essentiel de la colonne Fondamentaux) ;
+  - EODHD   : cle EODHD_API_KEY -> news + sentiment.
+
+CE QUI N'EST PAS BRANCHE, et pourquoi (honnetete) :
+  - X/Twitter : plus d'API gratuite exploitable -> hors de portee sans budget ;
+  - Yahoo Finance : pas d'API officielle libre, et pour le FX le broker MT5 fait deja foi ;
+  - Bloomberg/Reuters : pas d'API libre -> passer par leurs flux RSS (adaptateur RSS ci-dessus).
+
+Chaque adaptateur isole son unique appel HTTP dans `_get()`, ce qui rend les tests
+DETERMINISTES et HORS-LIGNE (on injecte la charge utile, on ne touche jamais au reseau).
+"""
+from __future__ import annotations
+
+import json
+import logging
+import urllib.request
+import xml.etree.ElementTree as ET
+from typing import Any, Optional
+
+from data.sanitize import clean_snippet
+
+log = logging.getLogger("data.sources")
+
+_UA = "ai-company-ftmo/1.0 (research; contact via .env)"
+_TIMEOUT = 8
+
+#: lexique minimal pour classer un post sans API de sentiment. Volontairement grossier et
+#: LISIBLE : on assume que le signal social est faible et bruite (usage contrarien).
+_BULL = ("long", "buy", "bull", "bullish", "moon", "calls", "up", "breakout", "rally")
+_BEAR = ("short", "sell", "bear", "bearish", "puts", "down", "dump", "crash", "breakdown")
+
+
+# --------------------------------------------------------------------------- socle HTTP
+class Source:
+    """Base d'un adaptateur. Sous-classe : definir `name`, `enabled`, et les methodes metier.
+    `_get` est l'unique porte reseau (monkeypatchee dans les tests)."""
+    name = "source"
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+
+    @property
+    def enabled(self) -> bool:
+        return False
+
+    def _get(self, url: str, params: Optional[dict] = None, headers: Optional[dict] = None) -> Any:
+        """GET JSON (ou texte brut si `raw`). Rend None a la moindre anomalie (fail-closed)."""
+        if params:
+            from urllib.parse import urlencode
+            url = f"{url}?{urlencode(params)}"
+        req = urllib.request.Request(url, headers={"User-Agent": _UA, **(headers or {})})
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:   # nosec - URLs constantes
+            data = resp.read().decode("utf-8", "replace")
+        return data
+
+    def _get_json(self, url: str, params: Optional[dict] = None,
+                  headers: Optional[dict] = None) -> Any:
+        try:
+            return json.loads(self._get(url, params, headers))
+        except Exception as e:                    # reseau/quota/format : trou, pas d'exception
+            log.info("%s: appel indisponible (%s).", self.name, e)
+            return None
+
+
+def _classe_texte(texte: str) -> Optional[str]:
+    """Sentiment heuristique d'un texte social. None si aucun signal directionnel."""
+    bas = (texte or "").lower()
+    b = sum(1 for m in _BULL if m in bas)
+    s = sum(1 for m in _BEAR if m in bas)
+    if b == s:
+        return None
+    return "bull" if b > s else "bear"
+
+
+# --------------------------------------------------------------------------- Reddit (libre)
+class RedditSource(Source):
+    """Sentiment social via le JSON public de Reddit (sans cle). Heuristique de lexique :
+    le signal est faible, on l'expose comme tel (usage contrarien du desk)."""
+    name = "reddit"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.cfg, "reddit_enabled", False))
+
+    def social_items(self, symbol: str) -> list[dict]:
+        if not self.enabled:
+            return []
+        items: list[dict] = []
+        for sub in (self.cfg.reddit_subs or ["Forex"]):
+            data = self._get_json(
+                f"https://www.reddit.com/r/{sub}/search.json",
+                {"q": symbol, "restrict_sr": 1, "sort": "new", "limit": 15, "t": "week"})
+            for child in (((data or {}).get("data") or {}).get("children") or []):
+                d = child.get("data") or {}
+                texte = f"{d.get('title', '')} {d.get('selftext', '')}"
+                items.append({"sentiment": _classe_texte(texte), "text": texte})
+        return items
+
+
+# --------------------------------------------------------------------------- RSS (libre)
+class RSSNewsSource(Source):
+    """News via n'importe quel flux RSS/Atom (Reuters, banques centrales, medias). Parse
+    stdlib, aucun secret. Les flux se configurent dans SOURCES_RSS (URLs separees par des ,)."""
+    name = "rss"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.cfg, "rss_feeds", None))
+
+    def news_items(self, symbol: str, limit: int = 8) -> list[dict]:
+        if not self.enabled:
+            return []
+        out: list[dict] = []
+        cle = (symbol or "").upper()
+        for url in self.cfg.rss_feeds:
+            xml = None
+            try:
+                xml = self._get(url)
+            except Exception as e:
+                log.info("rss %s indisponible (%s).", url, e)
+            for item in _parse_rss(xml or ""):
+                titre = clean_snippet(item.get("title", ""), 200)
+                if not titre:
+                    continue
+                # filtre leger par symbole/devise : un flux generaliste ne parle pas que de FX
+                blob = (titre + " " + (item.get("summary") or "")).upper()
+                if cle and cle not in blob and not _mentionne_devise(cle, blob):
+                    continue
+                out.append({"title": titre, "date": item.get("date"),
+                            "source": item.get("source") or "rss"})
+                if len(out) >= limit:
+                    return out
+        return out
+
+
+# --------------------------------------------------------------------------- Finnhub (cle)
+class FinnhubSource(Source):
+    """Palier gratuit avec cle FINNHUB_API_KEY : news societe, sentiment social score, profil
+    + transactions d'inities. Couvre l'essentiel de la colonne Fondamentaux de l'image."""
+    name = "finnhub"
+    BASE = "https://finnhub.io/api/v1"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.cfg, "finnhub_key", ""))
+
+    def _call(self, path: str, params: dict) -> Any:
+        return self._get_json(f"{self.BASE}{path}", {**params, "token": self.cfg.finnhub_key})
+
+    def social_items(self, symbol: str) -> list[dict]:
+        if not self.enabled:
+            return []
+        data = self._call("/stock/social-sentiment", {"symbol": symbol})
+        items: list[dict] = []
+        for canal in ("reddit", "twitter"):
+            for m in ((data or {}).get(canal) or [])[:20]:
+                score = _num(m.get("score"))
+                if score is None:
+                    pos, neg = _num(m.get("positiveScore")), _num(m.get("negativeScore"))
+                    score = (pos or 0) - (neg or 0) if (pos is not None or neg is not None) else None
+                items.append({"sentiment": score, "text": ""})
+        return items
+
+    def news_items(self, symbol: str, limit: int = 8) -> list[dict]:
+        if not self.enabled:
+            return []
+        data = self._call("/company-news", {"symbol": symbol,
+                                            "from": "2020-01-01", "to": "2100-01-01"})
+        out = []
+        for a in (data or [])[:limit]:
+            titre = clean_snippet(a.get("headline", ""), 200)
+            if titre:
+                out.append({"title": titre, "source": a.get("source") or "finnhub",
+                            "date": a.get("datetime")})
+        return out
+
+    def fundamentals(self, symbol: str) -> dict:
+        if not self.enabled:
+            return {}
+        profil = self._call("/stock/profile2", {"symbol": symbol}) or {}
+        metrics = (self._call("/stock/metric", {"symbol": symbol, "metric": "all"}) or {})
+        inities = self._call("/stock/insider-transactions", {"symbol": symbol}) or {}
+        # on ne garde que des CHAMPS CHIFFRES/BORNES : pas de prose a ingerer telle quelle.
+        return _compact({
+            "profil": _compact({"nom": clean_snippet(profil.get("name", ""), 80),
+                                "secteur": clean_snippet(profil.get("finnhubIndustry", ""), 80),
+                                "capitalisation": _num(profil.get("marketCapitalization")),
+                                "devise": profil.get("currency")}),
+            "metriques": _compact({
+                "per": _num((metrics.get("metric") or {}).get("peTTM")),
+                "beta": _num((metrics.get("metric") or {}).get("beta")),
+                "haut_52s": _num((metrics.get("metric") or {}).get("52WeekHigh")),
+                "bas_52s": _num((metrics.get("metric") or {}).get("52WeekLow"))}),
+            "inities_net": _insider_net(inities),
+        })
+
+
+# --------------------------------------------------------------------------- EODHD (cle)
+class EODHDSource(Source):
+    """Cle EODHD_API_KEY : news + sentiment financier. Meme discipline (agregat + assaini)."""
+    name = "eodhd"
+
+    @property
+    def enabled(self) -> bool:
+        return bool(getattr(self.cfg, "eodhd_key", ""))
+
+    def news_items(self, symbol: str, limit: int = 8) -> list[dict]:
+        if not self.enabled:
+            return []
+        data = self._get_json("https://eodhd.com/api/news",
+                              {"s": symbol, "limit": limit, "api_token": self.cfg.eodhd_key,
+                               "fmt": "json"})
+        out = []
+        for a in (data or [])[:limit]:
+            titre = clean_snippet(a.get("title", ""), 200)
+            if titre:
+                out.append({"title": titre, "source": "eodhd", "date": a.get("date")})
+        return out
+
+
+# --------------------------------------------------------------------------- agregateur
+class Sources:
+    """Facade : construit les adaptateurs actifs et fusionne leurs sorties par categorie.
+    C'est CE que branche l'orchestrateur sur le provider live."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self._social = [RedditSource(cfg), FinnhubSource(cfg)]
+        self._news = [RSSNewsSource(cfg), FinnhubSource(cfg), EODHDSource(cfg)]
+        self._fond = [FinnhubSource(cfg)]
+
+    def actives(self) -> list[str]:
+        vus, out = set(), []
+        for s in self._social + self._news + self._fond:
+            if s.enabled and s.name not in vus:
+                vus.add(s.name)
+                out.append(s.name)
+        return out
+
+    def social_sentiment(self, symbol: str) -> dict:
+        """Forme consommee par desk/social.py : {'items': [...]}. Fusion des sources sociales
+        actives ; {} si aucune (le desk n'affiche alors pas de sentiment social)."""
+        items: list[dict] = []
+        for s in self._social:
+            try:
+                items += s.social_items(symbol) or []
+            except Exception as e:                # fail-closed par source
+                log.info("%s social en echec (%s).", s.name, e)
+        return {"items": items} if items else {}
+
+    def news_extra(self, symbol: str, limit: int = 8) -> list[dict]:
+        out: list[dict] = []
+        for s in self._news:
+            try:
+                out += s.news_items(symbol, limit) or []
+            except Exception as e:
+                log.info("%s news en echec (%s).", s.name, e)
+        return out[:limit]
+
+    def fundamentals(self, symbol: str) -> dict:
+        """Fondamentaux d'un titre (profil, metriques, inities). {} pour une paire FX (aucune
+        societe) ou si aucune source active."""
+        for s in self._fond:
+            try:
+                f = s.fundamentals(symbol)
+                if f:
+                    return f
+            except Exception as e:
+                log.info("%s fondamentaux en echec (%s).", s.name, e)
+        return {}
+
+
+# --------------------------------------------------------------------------- helpers
+def _num(x: Any) -> Optional[float]:
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compact(d: dict) -> dict:
+    return {k: v for k, v in d.items() if v not in (None, "", {}, [])}
+
+
+def _mentionne_devise(cle: str, blob: str) -> bool:
+    """Une news FX peut ne pas citer 'EURUSD' mais parler de l'EUR ou de la Fed."""
+    if len(cle) == 6 and cle.isalpha():
+        return cle[:3] in blob or cle[3:] in blob
+    return False
+
+
+def _insider_net(inities: dict) -> Optional[int]:
+    """Solde net des transactions d'inities (achats - ventes en nombre d'operations) : un
+    chiffre, jamais la liste brute."""
+    data = (inities or {}).get("data") or []
+    if not data:
+        return None
+    net = 0
+    for t in data:
+        chg = _num(t.get("change"))
+        if chg is None:
+            continue
+        net += 1 if chg > 0 else (-1 if chg < 0 else 0)
+    return net
+
+
+def _parse_rss(xml: str) -> list[dict]:
+    """Parse RSS OU Atom en une liste {title, summary, date, source}. [] si illisible."""
+    if not xml:
+        return []
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return []
+    out: list[dict] = []
+    # RSS 2.0 : channel/item ; Atom : feed/entry (avec espace de noms)
+    for item in root.iter():
+        tag = item.tag.rsplit("}", 1)[-1]
+        if tag not in ("item", "entry"):
+            continue
+        titre = summary = date = ""
+        for child in item:
+            ctag = child.tag.rsplit("}", 1)[-1]
+            if ctag == "title":
+                titre = (child.text or "").strip()
+            elif ctag in ("description", "summary"):
+                summary = (child.text or "").strip()
+            elif ctag in ("pubDate", "updated", "published"):
+                date = (child.text or "").strip()
+        if titre:
+            out.append({"title": titre, "summary": summary, "date": date, "source": "rss"})
+    return out

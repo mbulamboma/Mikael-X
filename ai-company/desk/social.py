@@ -23,19 +23,12 @@ doit pas empecher l'analyse, et surtout pas la fausser.
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any, Optional
+
+from data.sanitize import clean_snippet
 
 log = logging.getLogger("desk.social")
 
-_URL = re.compile(r"https?://\S+|www\.\S+", re.I)
-_MENTION = re.compile(r"[@#]\w+")
-#: tournures qui trahissent une tentative de pilotage plutot qu'un avis de marche. Un extrait
-#: qui en contient est ECARTE (pas nettoye a moitie : on ne garde pas ce qui cherche a diriger).
-_INJECTION = re.compile(
-    r"\b(ignore|disregard|forget|override|system|prompt|instruction|assistant|"
-    r"you are|tu es|oublie|ignore[rz]|agis comme|act as|jailbreak|api[_ ]?key|"
-    r"buy now|sell now|achete maintenant|vends maintenant)\b", re.I)
 _MAX_EXTRAIT = 120
 _MAX_EXTRAITS = 3
 
@@ -49,16 +42,8 @@ def _clip(x: Any) -> Optional[float]:
 
 
 def _assainir_extrait(texte: str) -> Optional[str]:
-    """Neutralise un extrait social. Rend None si l'extrait cherche a injecter des consignes
-    ou ne contient plus rien d'exploitable apres nettoyage."""
-    if not texte:
-        return None
-    t = _URL.sub("", str(texte))
-    t = _MENTION.sub("", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    if not t or _INJECTION.search(t):
-        return None
-    return t[:_MAX_EXTRAIT]
+    """Neutralise un extrait social (delegue au module d'assainissement partage)."""
+    return clean_snippet(texte, _MAX_EXTRAIT)
 
 
 def agreger(items: list[dict]) -> dict:
