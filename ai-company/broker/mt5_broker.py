@@ -38,6 +38,12 @@ class MT5Broker:
         self.mcfg = mcfg
         self.acfg = acfg
         self.connected = False
+        # Symboles que NOUS avons rendus visibles dans le Market Watch. Chaque symbole
+        # selectionne fait telecharger et garder son historique par le TERMINAL MT5 :
+        # l'agent etant libre d'explorer l'univers du broker, le Market Watch enflait a
+        # chaque cycle et terminal64.exe finissait par manger toute la RAM de la machine.
+        # On note ce qu'on a ouvert pour pouvoir le refermer (cf. release_symbols).
+        self._selectionnes: set[str] = set()
 
     # ---------------------------------------------------------------- connexion
     def connect(self) -> bool:
@@ -139,9 +145,36 @@ class MT5Broker:
         si = mt5.symbol_info(symbol)
         if si is None:
             return False
-        if not si.visible and not mt5.symbol_select(symbol, True):
-            return False
+        if not si.visible:
+            if not mt5.symbol_select(symbol, True):
+                return False
+            self._selectionnes.add(symbol)      # a nous -> a refermer en fin de cycle
         return True
+
+    def release_symbols(self, garder: set[str] | frozenset[str]) -> int:
+        """Retire du Market Watch les symboles QUE NOUS avons ouverts et dont on n'a plus
+        besoin. Renvoie le nombre de symboles liberes.
+
+        Pourquoi : MT5 garde en memoire l'historique de chaque symbole visible. L'agent
+        explorant librement l'univers du broker (get_chart, list_symbols), le Market Watch
+        grossissait sans fin et le terminal saturait la RAM de la machine. On ne touche
+        JAMAIS a un symbole que l'utilisateur avait deja affiche : seulement aux notres.
+        """
+        if not (_HAS_MT5 and self.connected):
+            return 0
+        garder = {str(s).strip().upper() for s in (garder or set())}
+        liberes = 0
+        for sym in sorted(self._selectionnes - garder):
+            try:
+                if mt5.symbol_select(sym, False):   # MT5 refuse si position/ordre en cours
+                    self._selectionnes.discard(sym)
+                    liberes += 1
+            except Exception as e:                  # pragma: no cover - depend du terminal
+                log.debug("liberation de %s impossible: %s", sym, e)
+        if liberes:
+            log.info("Market Watch : %d symbole(s) explore(s) referme(s) — la RAM du "
+                     "terminal MT5 ne s'accumule plus de cycle en cycle.", liberes)
+        return liberes
 
     def symbol_spec(self, symbol: str) -> dict:
         """Renvoie les parametres necessaires au sizing FTMO exact."""
@@ -151,7 +184,8 @@ class MT5Broker:
                     "lot_step": 0.01, "pip_value_per_lot": 10.0, "price_to_pips": 10_000.0}
         si = mt5.symbol_info(symbol)
         if si is None or not si.visible:
-            mt5.symbol_select(symbol, True)
+            if mt5.symbol_select(symbol, True):
+                self._selectionnes.add(symbol)      # a nous -> a refermer en fin de cycle
             si = mt5.symbol_info(symbol)
         if si is None:                              # symbole inconnu du broker
             return {}

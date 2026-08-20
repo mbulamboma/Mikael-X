@@ -346,10 +346,65 @@ def test_le_pilote_deterministe_ferme_meme_un_trade_plat():
 
 
 def test_un_vrai_perdant_peut_etre_ferme_par_le_llm():
-    """Sous le plancher (-0.5R), une sortie discretionnaire reste permise."""
+    """Sous le plancher (-0.5R), une sortie discretionnaire reste permise — a condition que
+    le trade ait eu le temps de travailler."""
     o, meta = _orch_gestion([_pos(1, floating=-400.0)])     # -0.8R : vrai perdant
+    meta["1"]["ouvert_le"] = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
     o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "these cassee"}, meta)
     assert o.broker.closes == [1]
+
+
+def test_un_perdant_trop_jeune_reste_au_stop():
+    """Le log montrait des sorties 'preventives' 16 minutes apres l'ouverture. Sous
+    tm_min_age_h, c'est au stop de sortir un perdant, pas au LLM."""
+    o, meta = _orch_gestion([_pos(1, floating=-400.0)])     # -0.8R, mais tout frais
+    meta["1"]["ouvert_le"] = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+    o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "sortie preventive"}, meta)
+    assert o.broker.closes == []
+    assert "close_veto_gestion" in [k for k, _ in o.mem.events]
+
+
+def test_un_gagnant_reste_encaissable_meme_tout_frais():
+    """L'age minimum ne bride que les sorties perdantes : un vrai gagnant se prend quand on
+    veut, sinon on recree le defaut 'gains rendus'."""
+    o, meta = _orch_gestion([_pos(1, floating=700.0)])      # +1.4R
+    meta["1"]["ouvert_le"] = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "objectif atteint"}, meta)
+    assert o.broker.closes == [1]
+
+
+def test_les_garde_fous_tiennent_sans_risk_dollars():
+    """Sans `risk_dollars` (meta perdue au redemarrage), le R etait None et TOUS les
+    garde-fous de gestion s'eteignaient en silence. Repli geometrique : ils tiennent."""
+    # entree = prix courant du _Broker (1.1050) -> geometriquement ~0R : zone morte
+    p = dict(_pos(1, sl=1.1000), entry=1.1050)
+    o = _orchestrateur([p])
+    o.news.blackout_for = lambda s: {}
+    meta = {"1": {"ticket": 1}}                            # aucun risque memorise
+    assert round(o._floating_r(p, meta), 2) == 0.0         # repli geometrique, pas None
+    o._exec_close({"ticket": 1, "fraction": 1.0, "reason": "biais degrade"}, meta)
+    o._exec_modify({"ticket": 1, "sl": 1.1040, "reason": "break-even"}, {1: p}, meta)
+    assert o.broker.closes == [] and o.broker.modifs == []
+
+
+def test_le_trailing_nest_pas_une_porte_derobee_au_break_even():
+    """Le trailing deplace le SL sans passer par _exec_modify : un `activate_r` bas
+    contournait donc le garde-fou anti break-even premature."""
+    o, meta = _orch_gestion([_pos(1)])
+    o._exec_trail({"ticket": 1, "atr_mult": 2.0, "activate_r": 0.0, "enabled": True}, meta)
+    assert meta["1"]["trail"]["activate_r"] == o.cfg.desk.tm_lock_r
+    # le pilote deterministe, lui, arme ce qu'il veut
+    o._exec_trail({"ticket": 1, "atr_mult": 2.0, "activate_r": 0.0, "enabled": True}, meta,
+                  deterministe=True)
+    assert meta["1"]["trail"]["activate_r"] == 0.0
+
+
+def test_pas_d_ordre_a_blanc_sur_un_stop_deja_en_place():
+    """Le log renvoyait le meme SL au broker cycle apres cycle."""
+    o, meta = _orch_gestion([_pos(1, sl=1.0950, floating=600.0)])
+    o._exec_modify({"ticket": 1, "sl": 1.0950, "reason": "break-even"},
+                   {1: o.broker.pos[0]}, meta)
+    assert o.broker.modifs == []
 
 
 def test_un_gagnant_peut_etre_pris_partiellement():

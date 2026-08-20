@@ -40,6 +40,10 @@ log = logging.getLogger("web")
 _PRIVATE_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 _TAG_RE = re.compile(r"<(script|style|noscript|svg|head)[^>]*>.*?</\1>", re.S | re.I)
 _ANY_TAG_RE = re.compile(r"<[^>]+>")
+#: Plafond d'entrees du cache web (recherches + pages aspirees). Une entree porte le texte
+#: complet d'une page : sans plafond, la memoire du process ne redescend jamais.
+_CACHE_MAX = 200
+
 _WS_RE = re.compile(r"[ \t\r\f\v]+")
 _NL_RE = re.compile(r"\n{3,}")
 
@@ -131,7 +135,17 @@ class WebResearch:
 
     def _store(self, key: str, value: dict) -> dict:
         with self._lock:
-            self._cache[key] = (time.time(), value)
+            now = time.time()
+            self._cache[key] = (now, value)
+            # Le cache n'expulsait RIEN : sur un agent qui tourne des semaines, chaque page
+            # aspiree (texte complet) restait en memoire a vie. On purge les entrees
+            # perimees, puis on plafonne en FIFO (le dict garde l'ordre d'insertion).
+            perimes = [k for k, (ts, _) in self._cache.items()
+                       if now - ts >= self.cfg.cache_min * 60]
+            for k in perimes:
+                del self._cache[k]
+            while len(self._cache) > _CACHE_MAX:
+                del self._cache[next(iter(self._cache))]
         return value
 
     # --------------------------------------------------------------- recherche

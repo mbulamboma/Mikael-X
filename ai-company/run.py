@@ -49,7 +49,7 @@ from data.web import WebResearch
 from risk.ftmo import (FTMOEngine, AccountState, TradeProposal, TradeCosts,
                       currencies_of)
 from brain.memory import Memory
-from brain.autopilot import SafePilot
+from brain.autopilot import SafePilot, implied_r
 from brain.postmortem import PostMortem
 from brain import tools as T
 from desk import journal
@@ -61,6 +61,10 @@ from strategy.scoreboard import Scoreboard
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("run")
+
+#: Plafond du cache de bougies d'un cycle (en DataFrames). L'agent choisit librement ses
+#: symboles : sans borne, un cycle curieux tient des centaines de series en memoire.
+_BARS_CACHE_MAX = 120
 
 
 class SafeExit(Exception):
@@ -150,8 +154,31 @@ class Orchestrator:
             tf = self.cfg.timeframe
         key = (symbol.strip().upper(), tf)
         if key not in self._bars_cache:
+            # borne dure : l'agent peut balayer des centaines de symboles dans un meme
+            # cycle, et chaque entree est un DataFrame. On evince en FIFO plutot que de
+            # laisser le cache de cycle grossir sans limite.
+            if len(self._bars_cache) >= _BARS_CACHE_MAX:
+                self._bars_cache.pop(next(iter(self._bars_cache)), None)
             self._bars_cache[key] = self.broker.candles(key[0], tf, n)
         return self._bars_cache[key]
+
+    def _menage_market_watch(self):
+        """Referme les symboles que l'agent a explores pendant le cycle.
+
+        L'agent est libre de parcourir tout l'univers du broker (`list_symbols`,
+        `get_chart`) : chaque symbole consulte entre dans le Market Watch, et le TERMINAL
+        MT5 garde alors son historique en memoire. Sans ce menage, terminal64.exe grossit
+        de cycle en cycle jusqu'a saturer la machine. On garde la watchlist et tout
+        symbole portant une position ; le reste est relache."""
+        release = getattr(self.broker, "release_symbols", None)
+        if not callable(release):
+            return
+        try:
+            garder = {s.strip().upper() for s in self.cfg.symbols}
+            garder |= {p["symbol"].upper() for p in self.broker.positions(own_only=False)}
+            release(garder)
+        except Exception as e:                       # le menage ne doit jamais casser un cycle
+            log.debug("Menage du Market Watch impossible: %s", e)
 
     # ---- API exposee aux OUTILS du LLM (brain/tools.bind_live) -------------------
     # C'est ce qui rend l'agent libre : il choisit son symbole, son timeframe,
@@ -626,6 +653,10 @@ class Orchestrator:
             if tk:
                 price = tk["bid"] if p["direction"] == "buy" else tk["ask"]
             p2p = spec.get("price_to_pips", 0.0)
+            # 1R exprime en PRIX. `sl` bouge (break-even, trailing), `sl_initial` non : c'est
+            # la seule reference stable, celle qui evite au verrou de gain de deriver vers le
+            # prix d'entree cycle apres cycle. Repli sur le stop courant pour l'existant.
+            sl_ref = m.get("sl_initial") or p["sl"]
             out.append({
                 "ticket": p["ticket"], "symbol": p["symbol"], "direction": p["direction"],
                 "volume": p["volume"], "entry": p["entry"], "price_now": round(price, spec.get("digits", 5)),
@@ -637,6 +668,8 @@ class Orchestrator:
                 "dist_sl_pips": round(abs(price - p["sl"]) * p2p, 1) if p["sl"] else None,
                 "dist_tp_pips": round(abs(p["tp"] - price) * p2p, 1) if p["tp"] else None,
                 "mfe_R": m.get("mfe_R"), "mae_R": m.get("mae_R"),
+                "r_price": round(abs(p["entry"] - sl_ref), spec.get("digits", 5))
+                if sl_ref else None,
                 "age_h": round((now_srv - p["open_time"]).total_seconds() / 3600, 1)
                 if p.get("open_time") else None,
             })
@@ -669,10 +702,12 @@ class Orchestrator:
                 continue
             tk = self.broker.tick(p["symbol"])
             price = (tk["bid"] if p["direction"] == "buy" else tk["ask"]) if tk else p["entry"]
-            # activation par R (securiser le break-even d'abord)
-            risk = (m or {}).get("risk_dollars", 0.0)
-            floating_r = p.get("floating", 0.0) / risk if risk else tr.get("activate_r", 1.0)
-            if floating_r < tr.get("activate_r", 1.0):
+            # activation par R (securiser le break-even d'abord). Sans risque connu, l'ancien
+            # repli valait `activate_r` : le seuil etait donc TOUJOURS franchi et le trailing
+            # resserrait le stop des l'ouverture. On repasse par le calcul geometrique, et a
+            # defaut on s'abstient (ne jamais serrer un stop "au cas ou").
+            floating_r = self._floating_r(p, meta)
+            if floating_r is None or floating_r < tr.get("activate_r", 1.0):
                 continue
             if p["direction"] == "buy":
                 new_sl = round(price - dist, digits)
@@ -755,7 +790,7 @@ class Orchestrator:
                 if a["type"] == "modify":
                     self._exec_modify(a, pos_by_tk, meta, deterministe=True)
                 elif a["type"] == "trail":
-                    self._exec_trail(a, meta)
+                    self._exec_trail(a, meta, deterministe=True)
                 elif a["type"] == "close":
                     self._exec_close(a, meta, deterministe=True)
         return False
@@ -899,11 +934,33 @@ class Orchestrator:
 
     def _floating_r(self, p: dict, meta: dict) -> float | None:
         """Profit flottant d'une position broker exprime en R (risque initial), via open_meta.
-        None si le risque n'est pas connu (position hors agent, meta perdue)."""
+
+        Repli GEOMETRIQUE si `risk_dollars` est inconnu (meta perdue apres un redemarrage,
+        position heritee) : sans lui les garde-fous de gestion s'eteignaient EN SILENCE
+        (`fr is None` -> le LLM pouvait scratcher et resserrer a volonte). On deduit alors
+        le R de entree/stop/prix courant, comme le fait le pilote deterministe."""
         risk = (meta.get(str(p.get("ticket"))) or {}).get("risk_dollars", 0.0)
-        if not risk:
-            return None
-        return p.get("floating", 0.0) / risk
+        if risk:
+            return p.get("floating", 0.0) / risk
+        tk = self.broker.tick(p.get("symbol", ""))
+        price = (tk["bid"] if p.get("direction") == "buy" else tk["ask"]) if tk else None
+        return implied_r({"entry": p.get("entry"), "sl": p.get("sl"), "price_now": price,
+                          "direction": p.get("direction")})
+
+    def _age_h(self, p: dict, meta: dict) -> float | None:
+        """Age d'une position en heures. On prefere `ouvert_le` (vraie horloge UTC ecrite a
+        l'ouverture) a l'open_time du broker (heure SERVEUR etiquetee UTC), pour ne pas
+        rejouer le bug d'age negatif."""
+        iso = (meta.get(str(p.get("ticket"))) or {}).get("ouvert_le")
+        if iso:
+            try:
+                return (datetime.now(timezone.utc)
+                        - datetime.fromisoformat(iso)).total_seconds() / 3600
+            except ValueError:
+                pass
+        if p.get("open_time"):
+            return (self.server_now() - p["open_time"]).total_seconds() / 3600
+        return None
 
     def _exec_close(self, a: dict, meta: dict, deterministe: bool = False):
         tk = a["ticket"]; frac = a.get("fraction", 1.0)
@@ -911,18 +968,31 @@ class Orchestrator:
         # vrai gagnant) — on laisse le stop travailler. Le pilote deterministe (deterministe=True)
         # et un motif dur (black-out news) ne sont jamais brides.
         if self.cfg.desk.tm_guard and not deterministe:
+            d = self.cfg.desk
             p = next((x for x in self.broker.positions() if x["ticket"] == tk), None)
             fr = self._floating_r(p, meta) if p else None
-            if fr is not None and self.cfg.desk.tm_scratch_floor_r < fr < self.cfg.desk.tm_lock_r:
+            # un vrai gagnant (>= tm_lock_r) reste encaissable a tout moment : on ne bride que
+            # les sorties plates ou perdantes, celles qui font la "mort par mille coupures".
+            if fr is not None and fr < d.tm_lock_r:
                 bo = self.news.blackout_for(p["symbol"]) if self.cfg.news.enabled else {}
-                if not (bo or {}).get("active"):
-                    log.info("Cloture %s refusee (garde-fou gestion) : trade quasi plat a "
-                             "%.2fR (zone %.1f..%.1f) — on laisse le stop travailler, pas de "
-                             "scratch.", tk, fr, self.cfg.desk.tm_scratch_floor_r,
-                             self.cfg.desk.tm_lock_r)
+                age = self._age_h(p, meta)
+                if (bo or {}).get("active"):
+                    motif = ""                                  # motif dur : jamais bride
+                elif fr > d.tm_scratch_floor_r:
+                    motif = (f"trade quasi plat a {fr:.2f}R (zone {d.tm_scratch_floor_r:.1f}.."
+                             f"{d.tm_lock_r:.1f}) — on laisse le stop travailler, pas de scratch")
+                elif age is not None and age < d.tm_min_age_h:
+                    motif = (f"perdant a {fr:.2f}R mais ouvert depuis {age:.1f}h "
+                             f"(< {d.tm_min_age_h:.1f}h) — le trade n'a pas eu le temps de "
+                             f"travailler, c'est au stop de sortir")
+                else:
+                    motif = ""
+                if motif:
+                    log.info("Cloture %s refusee (garde-fou gestion) : %s.", tk, motif)
                     self.mem.log_event("close_veto_gestion",
                                        {"ticket": tk, "floating_R": round(fr, 2),
-                                        "reason": a.get("reason")})
+                                        "age_h": round(age, 1) if age is not None else None,
+                                        "motif": motif, "reason": a.get("reason")})
                     return
         res = self.broker.close_position(tk, frac, comment=str(a.get("reason", "AI-close"))[:24])
         log.info("CLOTURE ticket %s x%.2f -> %s", tk, frac, res.get("message"))
@@ -965,6 +1035,13 @@ class Orchestrator:
                 log.info("Modify %s refuse : SL trop large (risque %.0f$ > budget).", tk, risk)
                 self.mem.log_event("modify_veto", {"ticket": tk, "sl": new_sl, "risk": risk})
                 return
+        # ordre a blanc : le log montrait le meme SL renvoye au broker cycle apres cycle
+        # ("MODIFY ... sl=1.16742" repete). Inutile, et ca pollue l'historique de gestion.
+        digits = self._spec(p["symbol"]).get("digits", 5)
+        if (not new_sl or round(new_sl, digits) == round(p.get("sl") or 0.0, digits)) and \
+           (not new_tp or round(new_tp, digits) == round(p.get("tp") or 0.0, digits)):
+            log.debug("Modify %s ignore : stop et objectif deja a ces niveaux.", tk)
+            return
         res = self.broker.modify_position(tk, new_sl, new_tp)
         log.info("MODIFY ticket %s sl=%s tp=%s -> %s", tk, new_sl, new_tp, res.get("message"))
         self.mem.log_event("modify", {"ticket": tk, "sl": new_sl, "tp": new_tp,
@@ -978,7 +1055,7 @@ class Orchestrator:
                     m["tp"] = new_tp
                 self.mem.save_meta(meta)
 
-    def _exec_trail(self, a: dict, meta: dict):
+    def _exec_trail(self, a: dict, meta: dict, deterministe: bool = False):
         """Arme / desarme le trailing stop d'une position (config persistee dans open_meta)."""
         tk = a["ticket"]
         m = meta.setdefault(str(tk), {"ticket": tk})
@@ -986,8 +1063,18 @@ class Orchestrator:
             m.pop("trail", None)
             log.info("TRAILING desarme sur ticket %s.", tk)
         else:
+            # GARDE-FOU : le trailing deplace le SL en direct (il ne passe pas par
+            # _exec_modify) — un `activate_r` bas etait donc une porte derobee au
+            # break-even premature que _exec_modify refuse. On releve le seuil.
+            act = a.get("activate_r", 1.0)
+            act = act if isinstance(act, (int, float)) else 1.0
+            if self.cfg.desk.tm_guard and not deterministe and act < self.cfg.desk.tm_lock_r:
+                log.info("Trailing %s : activation relevee de %.2fR a %.2fR (garde-fou "
+                         "gestion) — pas de verrou de gain avant %.1fR.", tk, act,
+                         self.cfg.desk.tm_lock_r, self.cfg.desk.tm_lock_r)
+                act = self.cfg.desk.tm_lock_r
             m["trail"] = {"enabled": True, "atr_mult": a.get("atr_mult"),
-                          "pips": a.get("pips"), "activate_r": a.get("activate_r", 1.0),
+                          "pips": a.get("pips"), "activate_r": act,
                           "timeframe": a.get("timeframe") or self.cfg.timeframe}
             log.info("TRAILING arme sur ticket %s (%s).", tk,
                      f"{a['pips']:.0f} pips" if a.get("pips") else f"{a.get('atr_mult')}xATR")
@@ -1063,6 +1150,9 @@ class Orchestrator:
             meta[str(res["ticket"])] = {
                 "ticket": res["ticket"], "symbol": sym, "strategy": strat,
                 "direction": prop.direction, "entry": res["price"], "sl": prop.sl,
+                # `sl` bouge (break-even, trailing) ; `sl_initial` NON : c'est la seule
+                # reference stable de ce que vaut 1R en prix pour cette position.
+                "sl_initial": prop.sl,
                 "tp": prop.tp, "risk_dollars": rd.risk_dollars, "rr": rd.rr,
                 # --- traces pour le POST-MORTEM (apprentissage) ---
                 "rr_net": rd.rr_net, "lot": rd.lot, "regime": self._last_regime,
@@ -1407,6 +1497,12 @@ class Orchestrator:
                     break
                 except Exception as e:
                     log.exception("Erreur de cycle: %s", e)
+                finally:
+                    # hygiene memoire : on relache ce que le cycle a explore (Market Watch
+                    # cote terminal MT5, caches de cycle cote Python).
+                    self._menage_market_watch()
+                    self._bars_cache.clear()
+                    self._spec_cache.clear()
                 if not loop:
                     break
                 # Entre deux decisions du LLM, le WATCHDOG protege en continu :

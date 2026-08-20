@@ -60,13 +60,31 @@ def test_sl_urgence_en_vente_place_au_dessus():
     assert acts[0]["sl"] == round(1.1000 + 1.5 * 0.0100, 5)
 
 
-def test_break_even_a_partir_de_1R_puis_plus_de_recul():
-    acts = _pilot().actions([_pos(floating_R=1.2)], _account())
+def test_break_even_a_partir_de_1R_garde_un_coussin():
+    """Anti mort par mille coupures : a +1R le stop se verrouille JUSTE SOUS l'entree, pas
+    dessus — sinon le moindre recul de bruit scratche le trade a 0R avant que le trailing
+    (2xATR, utile a partir de ~+2R) n'ait pris la main."""
+    acts = _pilot().actions([_pos(floating_R=1.2, r_price=0.0050)], _account())
     modifs = [a for a in acts if a["type"] == "modify"]
-    assert modifs and modifs[0]["sl"] == 1.1000                  # stop ramene a l'entree
-    # stop deja au break-even -> plus de modify, seulement le trailing
-    acts2 = _pilot().actions([_pos(floating_R=1.2, sl=1.1000)], _account())
-    assert [a["type"] for a in acts2] == ["trail"]
+    assert modifs and modifs[0]["sl"] == 1.0990          # 1.1000 - 0.2 x 50 pips
+    assert modifs[0]["sl"] > 1.0950                      # mais le risque a bien fondu
+    # coussin a 0 -> on retrouve le break-even exact
+    exact = _pilot(be_buffer_r=0.0).actions([_pos(floating_R=1.2, r_price=0.0050)], _account())
+    assert [a["sl"] for a in exact if a["type"] == "modify"] == [1.1000]
+
+
+def test_le_verrou_de_gain_ne_se_rejoue_pas_a_chaque_cycle():
+    """Le stop deja verrouille ne doit pas regenerer un `modify` identique cycle apres cycle
+    (le log montrait le meme SL renvoye en boucle)."""
+    acts = _pilot().actions([_pos(floating_R=1.2, r_price=0.0050, sl=1.0990)], _account())
+    assert [a["type"] for a in acts] == ["trail"]
+
+
+def test_le_verrou_de_gain_n_eloigne_jamais_un_stop_deja_remonte():
+    """Si le trailing a deja porte le stop au-dessus de l'entree, le pilote ne le redescend
+    pas au niveau du coussin."""
+    acts = _pilot().actions([_pos(floating_R=2.5, r_price=0.0050, sl=1.1030)], _account())
+    assert all(a["type"] != "modify" for a in acts)
 
 
 def test_trailing_arme_une_seule_fois():

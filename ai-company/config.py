@@ -249,8 +249,19 @@ class SafeModeConfig:
     inspection manuelle.
     """
     breakeven_at_r: float = _f("SAFE_BE_AT_R", 1.0)          # stop au break-even des +1R
+    # COUSSIN DE BREAK-EVEN (en R du risque INITIAL). Un stop pose EXACTEMENT au prix
+    # d'entree ouvre un corridor mortel : entre +1R (break-even) et +2R (ou le trailing
+    # 2xATR reprend enfin la main), le moindre recul de bruit scratche le trade a 0R.
+    # On verrouille donc a `entree - coussin x R` : le risque tombe de 1R a 0.2R, mais le
+    # trade garde de quoi respirer. Mettre 0 pour retrouver le break-even exact.
+    be_buffer_r: float = _f("SAFE_BE_BUFFER_R", 0.2)
     trail_atr_mult: float = _f("SAFE_TRAIL_ATR", 2.0)        # trailing 2 x ATR
     trail_activate_r: float = _f("SAFE_TRAIL_ACTIVATE_R", 1.0)
+    # UNITE DE VOLATILITE du trailing. Par defaut le trailing suit `AGENT_TIMEFRAME` ; or en
+    # descendant l'analyse en H4 on divise aussi par ~2 la distance de suivi, et le trade se
+    # fait sortir sur du bruit. Fixer SAFE_TRAIL_TF=D1 garde un suivi de swing.
+    trail_timeframe: str = field(default_factory=lambda:
+                                 os.environ.get("SAFE_TRAIL_TF", "").strip().upper())
     missing_sl_atr: float = _f("SAFE_MISSING_SL_ATR", 1.5)   # SL d'urgence si aucun stop
     time_stop_days: float = _f("SAFE_TIME_STOP_DAYS", 10.0)  # position qui traine -> on sort
     time_stop_min_r: float = _f("SAFE_TIME_STOP_MIN_R", 0.3)
@@ -493,6 +504,11 @@ class DeskConfig:
     tm_guard: bool = field(default_factory=lambda: os.environ.get("DESK_TM_GUARD", "1") == "1")
     tm_lock_r: float = _f("DESK_TM_LOCK_R", 1.0)                    # +R requis pour resserrer/scratcher
     tm_scratch_floor_r: float = _f("DESK_TM_SCRATCH_FLOOR_R", -0.5) # en-dessous : sortie libre
+    # AGE MINIMUM avant une sortie discretionnaire PERDANTE. Le log montre des sorties
+    # "preventives" 16 minutes apres l'ouverture : le trade n'a jamais eu le temps de
+    # travailler. Sous cet age, seul le stop (ou un motif dur) sort un perdant ; un vrai
+    # gagnant (>= tm_lock_r) reste encashable a tout moment.
+    tm_min_age_h: float = _f("DESK_TM_MIN_AGE_H", 2.0)
 
     # TRACING PAS-A-PAS (cf. desk/trace.py) : chaque appel LLM du desk est journalise
     # (rol, modele, latence, taille, ok/erreur) dans state/traces/<cycle>.jsonl. C'est la

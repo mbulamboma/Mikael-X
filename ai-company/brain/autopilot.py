@@ -10,7 +10,8 @@ orientees survie FTMO :
   1. Protection du compte d'abord : si la perte du jour approche le stop agent
      (ou la perte totale le seuil doux), on ferme TOUT, sans discuter.
   2. Aucune position sans stop : SL d'urgence a N x ATR si le stop manque.
-  3. Securisation : stop au break-even des +1R.
+  3. Securisation : des +1R, stop verrouille JUSTE SOUS l'entree (coussin `be_buffer_r`)
+     plutot qu'exactement dessus — sinon le trade est scratche a 0R au premier recul.
   4. Trailing ATR arme sur chaque position pour verrouiller les gains.
   5. Time-stop : une position qui traine sans rien donner est fermee.
   6. JAMAIS d'ouverture.
@@ -128,18 +129,32 @@ class SafePilot:
             return [{"type": "close", "ticket": tk, "fraction": 1.0,
                      "reason": f"secours: time-stop {age_j:.1f}j sans progression"}]
 
-        # 3. break-even des +1R (une seule fois : uniquement si le stop est encore derriere)
+        # 3. break-even des +1R, AVEC COUSSIN. Un stop pose exactement a l'entree ouvre un
+        #    corridor mortel : le trailing 2xATR ne fait mieux qu'a partir de ~+2R, donc entre
+        #    +1R et +2R le trade est scratche a 0R au premier recul de bruit. On verrouille
+        #    a `entree - coussin x 1R` : le risque tombe de 1R a ~0.2R, le trade respire.
         if r is not None and r >= self.cfg.breakeven_at_r and sl:
-            derriere = sl < entry if p.get("direction") == "buy" else sl > entry
-            if derriere:
-                acts.append({"type": "modify", "ticket": tk, "sl": round(entry, digits),
-                             "tp": None, "reason": "secours: stop au break-even (+"
-                                                   f"{self.cfg.breakeven_at_r:.1f}R)"})
+            # 1R exprime en PRIX. On veut une reference STABLE : `r_price` (stop d'origine),
+            # sinon le profit courant ramene a 1R. Le repli `entree - stop` derive, lui, a
+            # chaque cycle une fois le stop remonte — il ne sert qu'en tout dernier recours.
+            unite = (_f(p.get("r_price"))
+                     or (abs(_f(p.get("price_now")) - entry) / abs(r) if r else 0.0)
+                     or abs(entry - sl))
+            coussin = max(0.0, self.cfg.be_buffer_r) * unite
+            cible = round(entry - coussin if p.get("direction") == "buy" else entry + coussin,
+                          digits)
+            # uniquement si ca REDUIT vraiment le risque (sinon on renverrait le meme ordre
+            # a chaque cycle, ou pire on eloignerait le stop deja remonte par le trailing)
+            mieux = cible > sl if p.get("direction") == "buy" else cible < sl
+            if mieux:
+                acts.append({"type": "modify", "ticket": tk, "sl": cible, "tp": None,
+                             "reason": f"secours: stop verrouille a -{self.cfg.be_buffer_r:.1f}R "
+                                       f"(+{self.cfg.breakeven_at_r:.1f}R atteint)"})
 
         # 4. trailing ATR arme si absent -> le suivi automatique fait le reste
         if not p.get("trailing"):
             acts.append({"type": "trail", "ticket": tk, "atr_mult": self.cfg.trail_atr_mult,
                          "pips": None, "activate_r": self.cfg.trail_activate_r,
-                         "timeframe": None, "enabled": True,
+                         "timeframe": self.cfg.trail_timeframe or None, "enabled": True,
                          "reason": "secours: trailing automatique arme"})
         return acts
